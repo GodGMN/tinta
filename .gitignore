@@ -9,3 +9,8 @@
 /engine/.build/
 /keys/
 /target/
+
+# Personal MCP config (Runewire API key). Never commit.
+/.mcp.json
+/opencode.json
+/.codex/config.toml

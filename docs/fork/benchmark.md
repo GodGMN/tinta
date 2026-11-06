@@ -297,10 +297,11 @@ scheduling only change time.
 
 ### What the numbers say for the engine
 
-- **ASR** is the bottleneck: 1787 CPU-s for one hour at 4 threads
-  (0.48 CPU-s per audio-s). Diarization adds 711 CPU-s.
+- **ASR** is the bottleneck: roughly 1800-2400 CPU-s for one hour at 4 threads
+  (0.48-0.64 CPU-s per audio-s; the higher figure is inside the contended
+  parallel run). Diarization adds about 711 CPU-s.
 - A 16 GB, 8-core CPU machine meets the bar with ~35% headroom. A 4-core
-  machine cannot: the ASR stage alone would need 7.5 minutes at 100% of all
+  machine cannot: the ASR stage alone needs about 7.5 minutes at 100% of all
   four cores, leaving nothing for diarization.
 - Peak memory is safe at 5.2 GB. Whole-file decoding without chunking is not:
   a 21 min file already peaks at 10.9 GB.

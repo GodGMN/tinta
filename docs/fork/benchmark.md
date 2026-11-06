@@ -186,6 +186,12 @@ Wall includes model load (cold load 5.0-5.9 s, warm 3.2 s for the 670 MB
 transducer; diarization loads in 0.6 s cold, 0.4 s warm), which is negligible
 except on the shortest meeting.
 
+Word-level timestamps exist on every run (`has_word_timestamps: true` in the
+result JSON): the transducer emits one timestamp and duration per token, and
+the harness folds them into 8,808 words with start/end for the 1 h meeting
+(2,205 for ES2002a, 1,834 for IS1000a). They line up with the audio: the first
+word of IN1014 starts at 20.6 s and the last at 3,683.4 s of 3,692.9 s.
+
 Quality on clean speech, for the comparison with FluidAudio's numbers:
 
 | Sample | Audio | WER | RTF |

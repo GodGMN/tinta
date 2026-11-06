@@ -24,7 +24,11 @@ jobs:
         run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
 
   core-macos:
-    runs-on: macos-latest
+    # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15
+    # minutes and were cancelled twice on 2026-11-06), so this uses the Intel
+    # image. The core crate is architecture independent; move this back to
+    # macos-latest when the arm64 queue recovers.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

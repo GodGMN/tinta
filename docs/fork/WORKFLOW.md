@@ -23,9 +23,15 @@ into a feature commit, so they can be dropped when the upstream PR is prepared.
 - Behavior: code, types and tests. Short comments for non-obvious reasons only.
 - Task history, implementation results and review evidence: Runewire comments and PRs.
 
-## Upstream conventions still apply
+## Versions and the changelog in the fork
 
-Follow the version and changelog rules at the top of `AGENTS.md` for every app change.
+Upstream bumps the version in four places in every commit (see the top of `AGENTS.md`).
+In the fork, parallel PRs would conflict on that, so:
+
+- Do not change the version in task PRs.
+- Add each user-facing change to a `## Unreleased` section at the top of `CHANGELOG.md`
+  (create it if missing), using upstream's Added/Changed/Fixed/Removed format and tone.
+- The version bump happens once, when the upstream PR is prepared.
 
 ## Git checkout ownership
 
@@ -42,7 +48,10 @@ Follow the version and changelog rules at the top of `AGENTS.md` for every app c
 1. Read the task with `get_task`; move it to `doing` with `update_task`.
 2. Create the worktree from the latest `origin/main`:
    `git worktree add /home/sergio/code/worktrees/tinta-fork/<task>-<slug> -b <type>/<task>/<slug> origin/main`,
-   then run `python3 scripts/setup_codex_mcp.py` in it before starting Codex there.
+   then run `python3 scripts/setup_codex_mcp.py` in it. It links the gitignored MCP
+   configs (`.mcp.json`, `opencode.json`, `.codex/config.toml`) from the primary checkout.
+   If you were started inside a worktree that T3 already prepared, use that worktree
+   and branch instead of creating another one.
 3. Implement. Run the focused tests you touched, then
    `cargo clippy --locked --all-targets -- -D warnings` for the crates you changed.
    Mac-only code cannot be built here; say so in the PR and rely on the macOS CI job.

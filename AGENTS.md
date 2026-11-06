@@ -44,8 +44,8 @@ The Runewire MCP config in this repo holds a personal API key. It is
 gitignored and must never be committed.
 
 Before starting Codex in a new worktree, run `python3 scripts/setup_codex_mcp.py`
-there to link its ignored `.codex/config.toml` to the primary checkout's private
-config. Do not move the key into global settings.
+there to link the ignored MCP configs (`.mcp.json`, `opencode.json`,
+`.codex/config.toml`) to the primary checkout's private copies. Do not move the key into global settings.
 
 Follow the fork workflow in [docs/fork/WORKFLOW.md](docs/fork/WORKFLOW.md):
 checkout ownership, worktrees, verification, review and merge rules.

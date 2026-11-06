@@ -33,9 +33,16 @@ The app runs one executable named `tinta-engine`:
 
 There is no environment variable or setting that overrides the path
 (`app/src-tauri/src/engine.rs:33-39`). A second engine must therefore be installed under
-that name, or the resolver must be changed in the app (which the "no app changes" goal
-forbids), or built to the development fallback path. This is a real constraint, not a
-convention.
+that name, or the resolver must be changed in the app, or built to the development
+fallback path. This is a real constraint, not a convention.
+
+**Windows needs an app change.** The resolver joins exactly `tinta-engine`
+(`engine.rs:36`), but a Windows bundle contains `tinta-engine.exe`, so the bundled check
+fails and the app falls back to the build machine's development path (`engine.rs:38`).
+A console-subsystem engine spawned without `CREATE_NO_WINDOW` would also open a console
+window. The "no app changes" goal therefore covers the wire protocol and the file formats
+only, not the process launch or packaging. (The app also does not build off macOS today:
+`tinta-core` depends on `security-framework` unconditionally.)
 
 Environment: the child inherits the app's environment. The app does not pass any
 arguments to the engine (`app/src-tauri/src/engine.rs:61-66`). The engine's own
@@ -171,7 +178,10 @@ made resumable from the files on disk rather than retried blindly.
 - Backoff: first wait 1 s, doubled after each run that lasted less than 60 s, capped at
   60 s; a run of at least 60 s resets the next wait to 1 s
   (`lib.rs:165-169`, `429-436`). A `ready` event records the start of the current run
-  (`lib.rs:402-405`).
+  (`lib.rs:402-405`), and it is the **only** thing that does: `next_restart_delay` resets
+  the wait only when a `ready` timestamp exists and is at least 60 s old (`lib.rs:430-435`).
+  **An engine must send `ready`**; one that never does gets restart waits that grow to
+  60 s and never reset.
 - There is **no heartbeat**, no `ping` supervision and no periodic health check. The app
   learns about a dead engine from stdout EOF (`engine.rs:90-94`), not from a timeout.
 
@@ -320,9 +330,10 @@ float are interchangeable where a number is expected. Extra parameters are ignor
 > {"id":3,"cmd":"stop","params":{}}
 < {"id":3,"ok":true,"result":{}}
 > {"id":4,"cmd":"finalize","params":{"dir":"/Users/sam/Library/Application Support/Tinta/meetings/m1","audio_key":"…"}}
-< {"event":"finalize_progress","stage":"transcription","fraction":0.5}
+< {"event":"finalize_progress","stage":"transcription","fraction":1.0}
 < {"event":"finalize_progress","stage":"diarization","fraction":0.0}
 < {"event":"finalize_progress","stage":"diarization","fraction":1.0}
+< {"event":"finalize_progress","stage":"transcription","fraction":1.0}
 < {"id":4,"ok":true,"result":{"tracks":{"remote":{"words":[{"w":"Let","s":4.2,"e":4.4}],"diarization":[{"speaker":"S1","s":4.0,"e":8.0}]},"mic":{"words":[]}},"duration":42.5,"language":"en"}}
 ```
 
@@ -466,7 +477,9 @@ No caller in the app (verified by searching `engine.call(` in `app/src-tauri/src
 | `url` | string | optional; `event.url.absoluteString` |
 | `notes` | string | optional, truncated to 20 000 characters (`Calendar.swift:14`, `113`) |
 
-Attendee (`Calendar.swift:102-109`, `122-130`): `name` (may be `""`), `email` (from a
+Attendee (`Calendar.swift:102-109`, `122-130`): `name` (**required** by the app's serde
+type, `crates/tinta-core/src/calendar.rs:27-28`; may be `""` but must be present, or the
+whole `calendar` reply fails to parse), `email` (from a
 `mailto:` URL, else `""`), `is_self` (bool), `status` (`"accepted"`, `"declined"`,
 `"tentative"`, `"pending"`, `"unknown"`).
 
@@ -586,7 +599,7 @@ call-app change (`lib.rs:489-497`), always with a wall-clock timestamp.
 | params | `dir: string` and `audio_key: string` (required), `max_speakers: int` (optional) (`Engine.swift:205-232`) |
 | result | `{"tracks": {"mic": TrackResult, "remote": TrackResult}, "duration": number, "language"?: string}` (`Engine.swift:229-231`) |
 | errors | chunk read/decrypt errors (`"invalid chunk <name>"` and CryptoKit failures), invalid key, model missing/hash mismatch (`ChunkStore.swift:102-123`; `Speech.swift:71-90`, `120-133`) |
-| events | `finalize_progress` for every transcription window, then for diarization (see [§4](#4-events)) |
+| events | `finalize_progress` in track order: remote transcription windows, remote diarization (only when the remote track has words), then mic transcription windows; the transcription fraction restarts at `1/n` for each track (`Engine.swift:214-226`; see [§4](#4-events)) |
 | notes | **Allowed while a recording is active** — the comment at `Engine.swift:206` states this, and nothing in the app prevents a new recording from starting while another meeting finalizes: `start_recording` checks only the active session and `started_at` (`lib.rs:231-240`), while the final pass is tracked per meeting id (`lib.rs:136`, `529-543`). Read-only on disk. Two `finalize` calls for different meetings may also overlap; the `Speech` actor serializes model work (`Speech.swift:56`, `180-217`), but a second engine should not assume sequential calls. The app sends `max_speakers` only when there are remote participants, equal to their count (`lib.rs:565-569`). Timeout 1 h. |
 
 `TrackResult` (`transcript.rs:8-30` is the consumer):
@@ -657,7 +670,7 @@ Behavioral details:
 | `call_started` | `app: string`, `name: string`, `since: int64 ms` | `CallWatcher.swift:88-92` | Adds an `AppCall` (`lib.rs:380-384`, `440-461`). |
 | `call_ended` | `app: string`, `name: string`, `left_at: int64 ms` | `CallWatcher.swift:83-87`, after 2 s without audio activity | Removes the call and may auto-stop the recording after a 3 s grace (`lib.rs:390-394`, `501-512`, `754-774`). |
 | `call_state` | `participants: [{id, name, is_self}]`, `speaking: [string]`, `mic_muted: bool \| null`, `app: string`, `t: int64 ms` | `CallWatcher.swift:96-111` + `CallReader.swift:18-25`; on change, or every 3 s while a call lasts | Updates participants, speaker events, the microphone state (`lib.rs:385-388`, `465-499`). `id` equals `name`; `mic_muted` may be `null`. |
-| `finalize_progress` | `stage: "transcription" \| "diarization"`, `fraction: number` | Transcription: after each window, `1/n … 1` (`Speech.swift:202`); diarization: `0.0` then `1.0` (`Speech.swift:211-213`) | Forwards with a meeting `id` added when exactly one final pass runs (`lib.rs:406-415`); UI progress bar (`app/src/MeetingView.tsx:124-127`). Fractions restart at 0 for diarization. |
+| `finalize_progress` | `stage: "transcription" \| "diarization"`, `fraction: number` | Transcription: after each window, `1/n … 1` (`Speech.swift:202`); diarization: `0.0` then `1.0` (`Speech.swift:211-213`) | Forwards with a meeting `id` added when exactly one final pass runs (`lib.rs:406-415`); UI progress bar (`app/src/MeetingView.tsx:124-127`). Order: remote transcription, remote diarization (skipped when the remote track has no words), then mic transcription; the transcription fraction restarts for each track and the bar can move backwards (`Engine.swift:214-226`). |
 | `summary_progress` | `fraction: number` | `Summary.swift:136` (0.9 before the final call), `164` (0.85·i/n per condensed part) | Same id injection and forwarding (`lib.rs:406-415`); UI bar (`app/src/Summary.tsx:63-65`). Not strictly monotonic. |
 
 The app-synthesized `engine_exit` (`engine.rs:94`) is not emitted by the engine; it is
@@ -773,7 +786,10 @@ From `engine/Sources/TintaEngine/ChunkStore.swift:4-13` and `71-88`:
   `Int16.max` on write (`ChunkStore.swift:56-57`); reading scales back by
   `1/Int16.max` (`ChunkStore.swift:130-135`).
 - The AES-GCM key is the 32-byte audio key (see [§7](#7-the-audio-key)). Each chunk is
-  sealed separately with a fresh nonce (`ChunkStore.swift:75-76`). CryptoKit's
+  sealed separately with a fresh nonce and **no associated data** (`AES.GCM.seal(pcm, using:
+  key)`, `ChunkStore.swift:75`; `AES.GCM.open(box, using: key)`, `ChunkStore.swift:116`).
+  The 16-byte header is not authenticated; an implementation that passes it as AAD cannot
+  read or write Mac-compatible chunks. CryptoKit's
   `SealedBox.combined` — the bytes stored from offset 16 — is nonce (12) ‖ ciphertext ‖
   tag (16), which is what `AES.GCM.SealedBox(combined:)` consumes at
   `ChunkStore.swift:115`.
@@ -1000,7 +1016,9 @@ Any error aborts the command and is returned as the reply's `error`; the app sho
 - `models_status` is fast and does not load models.
 - `install_models` is the only path that writes model files or uses the network.
 - Before using models, fail with a sentence that tells the user to install them, rather
-  than crashing or timing out (`Speech.swift:121`; `120-133`).
+  than crashing or timing out. The Swift engine's load fails with "models are not installed"
+  (`Speech.swift:121`) and its hash check with "... Install the models again."
+  (`Speech.swift:76`, `85`).
 - Model format, file names, hashes, and the model root are Mac-specific; a Rust engine may
   choose its own model set and directory, as long as `models_status.path` points at
   something it owns (the app sums its size for Settings, `commands.rs:563-572`).
@@ -1018,7 +1036,9 @@ calls Mac-only commands unconditionally:
 - `permissions`, `models_status`, `summary_status` on every bootstrap
   (`commands.rs:25-28`);
 - `calls` on every start and every engine restart (`lib.rs:917-932`, `964`);
-- `calendar` at startup and at least every 5 minutes (`calendar.rs:207-225`), and
+- `calendar` at startup and every 5 minutes after a successful read; after a **failed** read
+  `read_at` is not updated (`calendar.rs:72`), so the app retries on every 15 s tick
+  (`calendar.rs:20`, `216-222`), and each retry respawns a dead engine with no backoff; and
   `request_calendar` when the user asks;
 - `summary_status` before an automatic summary and `summarize` when the user asks
   (`lib.rs:589-593`, `605-645`);

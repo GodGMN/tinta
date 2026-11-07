@@ -471,16 +471,19 @@ fn largest_first(mut holes: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     holes
 }
 
-impl FinalPass for SpeechPass {
-    fn transcribe(&mut self, samples: &[f32], progress: &mut dyn FnMut(f64)) -> Result<Vec<Word>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
+impl SpeechPass {
+    /// Decodes an explicit piece plan with the same first pass and hole
+    /// re-decode as [`FinalPass::transcribe`]. `transcribe` builds the plan with
+    /// `group_pieces_with`; the task #23 harness passes a plan with speaker
+    /// splits so both run exactly the same decode path.
+    pub fn transcribe_pieces(
+        &mut self,
+        samples: &[f32],
+        segments: &[(usize, usize)],
+        pieces: Vec<(usize, usize)>,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<Vec<Word>> {
         self.check_installed()?;
-        let vad = self.vad()?;
-        let segments = vad_segments(&vad, samples);
-        drop(vad);
-        let pieces = group_pieces_with(&self.settings, samples, &segments);
         if pieces.is_empty() {
             return Ok(Vec::new());
         }
@@ -505,7 +508,7 @@ impl FinalPass for SpeechPass {
         if self.settings.gap_redecode_seconds > 0.0 {
             words = self.redecode_gaps(
                 samples,
-                &segments,
+                segments,
                 words,
                 progress,
                 last_fraction,
@@ -514,6 +517,20 @@ impl FinalPass for SpeechPass {
         }
         progress(1.0);
         Ok(words)
+    }
+}
+
+impl FinalPass for SpeechPass {
+    fn transcribe(&mut self, samples: &[f32], progress: &mut dyn FnMut(f64)) -> Result<Vec<Word>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.check_installed()?;
+        let vad = self.vad()?;
+        let segments = vad_segments(&vad, samples);
+        drop(vad);
+        let pieces = group_pieces_with(&self.settings, samples, &segments);
+        self.transcribe_pieces(samples, &segments, pieces, progress)
     }
 
     fn diarize(

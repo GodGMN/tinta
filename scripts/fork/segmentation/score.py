@@ -197,6 +197,37 @@ def single_stream_words(rows, oracle, overlap_seconds=0.2):
     return kept, len(dropped)
 
 
+def short_row_stats(rows, hypothesis, seconds=3.0):
+    """Deletions in short reference rows: isolated backchannels and one-word turns.
+
+    `empty` counts rows whose hypothesis normalizes to nothing, the case where a
+    backchannel is simply missing from the output; `ref_words` is what those
+    rows cost on the reference side.
+    """
+    stats = {
+        "rows": 0,
+        "empty_rows": 0,
+        "ref_words": 0,
+        "empty_ref_words": 0,
+        "errors": 0,
+        "del": 0,
+        "ins": 0,
+        "sub": 0,
+    }
+    for row in rows:
+        if row["end"] - row["begin"] >= seconds:
+            continue
+        text = hypothesis.get(row["id"], "")
+        item = counts(row["text"], text)
+        stats["rows"] += 1
+        for key in ("ref_words", "errors", "del", "ins", "sub"):
+            stats[key] += item[key]
+        if not whisper_tokens(text):
+            stats["empty_rows"] += 1
+            stats["empty_ref_words"] += len(whisper_tokens(row["text"]))
+    return stats
+
+
 def pairs(spec):
     return dict(item.split("=", 1) for item in spec.split(",") if item)
 
@@ -215,6 +246,13 @@ def main():
         "turns experiment's midpoint-joined list",
     )
     parser.add_argument("--out")
+    parser.add_argument(
+        "--short-seconds",
+        type=float,
+        default=3.0,
+        help="reference rows shorter than this are reported separately as "
+        "backchannels / one-word turns (0 disables the table)",
+    )
     args = parser.parse_args()
 
     rows = json.load(open(args.rows))
@@ -226,6 +264,7 @@ def main():
     all_oracle = []
     all_single = []
     all_pipeline = []
+    short_table = []
     print(f"\n### {args.label}\n")
     print(
         "| Meeting | Segments | Oracle per-turn | Oracle single stream | Pipeline | "
@@ -249,6 +288,8 @@ def main():
         all_oracle.extend(oracle_counts)
         all_single.extend(single_counts)
         all_pipeline.extend(pipeline_counts)
+        short = short_row_stats(meeting_rows, hypothesis, args.short_seconds)
+        short_table.append((meeting, short))
         result["per_meeting"][meeting] = {
             "segments": len(meeting_rows),
             "oracle": o,
@@ -283,6 +324,40 @@ def main():
         f"**{100 * (p['wer'] - s['wer']):+.1f}** | "
         f"{p['del']} / {p['ins']} / {p['sub']} | |"
     )
+    if args.short_seconds > 0:
+        total_short = {
+            "rows": 0,
+            "empty_rows": 0,
+            "ref_words": 0,
+            "empty_ref_words": 0,
+            "errors": 0,
+            "del": 0,
+            "ins": 0,
+            "sub": 0,
+        }
+        result["short_rows"] = {"seconds": args.short_seconds, "per_meeting": {}}
+        print()
+        print(
+            f"Rows shorter than {args.short_seconds:g} s (isolated backchannels and "
+            "one-word turns):"
+        )
+        print("| Meeting | Rows | Empty hypotheses | Ref words lost there | del / ins / sub |")
+        print("|---|---|---|---|---|")
+        for meeting, short in short_table:
+            result["short_rows"]["per_meeting"][meeting] = short
+            for key in total_short:
+                total_short[key] += short[key]
+            print(
+                f"| {meeting} | {short['rows']} | {short['empty_rows']} | "
+                f"{short['empty_ref_words']} | {short['del']} / {short['ins']} / {short['sub']} |"
+            )
+        result["short_rows"]["all"] = total_short
+        print(
+            f"| **All** | {total_short['rows']} | {total_short['empty_rows']} | "
+            f"{total_short['empty_ref_words']} | {total_short['del']} / "
+            f"{total_short['ins']} / {total_short['sub']} |"
+        )
+
     print(
         f"\n{args.label}: oracle {100 * o['wer']:.1f}% ({o['del']} del / {o['ins']} ins / "
         f"{o['sub']} sub, {o['ref_words']} ref words), single-stream oracle "

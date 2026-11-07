@@ -39,6 +39,13 @@ struct Args {
     /// A diarization result JSON: decode each speaker turn on its own instead of
     /// the VAD pieces, for the step 4 experiment.
     turns: Option<PathBuf>,
+    /// Run the engine's diarizer on the wav and write its turns, so the speaker
+    /// split experiment uses the shipped post-clustering path.
+    diarize: bool,
+    /// Split pieces at a diarized speaker change that falls inside a silence of
+    /// at least `split_gap` seconds, for the task #23 experiment.
+    split_turns: Option<PathBuf>,
+    split_gap: f32,
 }
 
 fn parse_args() -> Result<Args> {
@@ -47,6 +54,9 @@ fn parse_args() -> Result<Args> {
     let mut threads = 2;
     let mut window = None;
     let mut turns = None;
+    let mut diarize = false;
+    let mut split_turns = None;
+    let mut split_gap = 0.2f32;
     while let Some(flag) = args.next() {
         let mut value =
             || -> Result<String> { args.next().context(format!("{flag} needs a value")) };
@@ -56,6 +66,9 @@ fn parse_args() -> Result<Args> {
             "--variant" => variant = Some(value()?),
             "--output" => output = Some(PathBuf::from(value()?)),
             "--turns" => turns = Some(PathBuf::from(value()?)),
+            "--diarize" => diarize = true,
+            "--split-turns" => split_turns = Some(PathBuf::from(value()?)),
+            "--split-gap" => split_gap = value()?.parse().context("--split-gap is seconds")?,
             "--threads" => threads = value()?.parse().context("--threads is a number")?,
             "--window" => {
                 let raw = value()?;
@@ -76,6 +89,9 @@ fn parse_args() -> Result<Args> {
         threads,
         window,
         turns,
+        diarize,
+        split_turns,
+        split_gap,
     })
 }
 
@@ -241,6 +257,9 @@ fn main() -> Result<()> {
     if let Some(turns) = &args.turns {
         return decode_turns(&args, &manifest, threads, &samples, turns);
     }
+    if args.diarize {
+        return diarize_track(&args, &manifest, threads, &samples);
+    }
     let (variant, output) = (
         args.variant.context("--variant is required")?,
         args.output.context("--output is required")?,
@@ -257,7 +276,7 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let vad = VoiceActivityDetector::create(
         &vad_config(
-            vad_model,
+            vad_model.clone(),
             args.threads,
             crate::provider(&args.models_root)?,
             &settings,
@@ -267,6 +286,36 @@ fn main() -> Result<()> {
     .context("the VAD model did not load")?;
     let ranges = vad_segments(&vad, &samples);
     let pieces = group_pieces_with(&settings, &samples, &ranges);
+    let pieces = match &args.split_turns {
+        Some(path) => {
+            let turns: Vec<(f32, f32, usize)> = load_turns(path)?
+                .into_iter()
+                .map(|(start, end, speaker)| (start, end, speaker.max(0) as usize))
+                .collect();
+            // A second pass at the requested gap finds the silences the first
+            // pass bridged; only a speaker change inside one of those splits a
+            // piece.
+            let mut fine_config = vad_config(
+                vad_model,
+                args.threads,
+                crate::provider(&args.models_root)?,
+                &settings,
+            );
+            fine_config.silero_vad.min_silence_duration = args.split_gap;
+            let fine_vad = VoiceActivityDetector::create(&fine_config, VAD_BUFFER_SECONDS)
+                .context("the fine VAD did not load")?;
+            let fine_ranges = vad_segments(&fine_vad, &samples);
+            drop(fine_vad);
+            eprintln!(
+                "  fine VAD at {} s: {} regions (coarse {})",
+                args.split_gap,
+                fine_ranges.len(),
+                ranges.len()
+            );
+            split_at_speaker_changes(pieces, &ranges, &fine_ranges, &turns, args.split_gap)
+        }
+        None => pieces,
+    };
     drop(vad);
     let speech_seconds: usize = ranges.iter().map(|(start, end)| end - start).sum();
     let vad_seconds = started.elapsed().as_secs_f64();
@@ -287,16 +336,20 @@ fn main() -> Result<()> {
     );
 
     let started = Instant::now();
-    let mut pass = SpeechPass::with_settings(manifest, args.models_root.clone(), threads, settings);
+    let mut pass = SpeechPass::with_settings(
+        manifest.clone(),
+        args.models_root.clone(),
+        threads,
+        settings,
+    );
     let mut last_tenth = 0u32;
-    let words =
-        tinta_engine_rs::speech::FinalPass::transcribe(&mut pass, &samples, &mut |fraction| {
-            let tenth = (fraction * 10.0) as u32;
-            if tenth > last_tenth {
-                last_tenth = tenth;
-                eprintln!("  transcription {:.0} %", fraction * 100.0);
-            }
-        })?;
+    let words = pass.transcribe_pieces(&samples, &ranges, pieces.clone(), &mut |fraction| {
+        let tenth = (fraction * 10.0) as u32;
+        if tenth > last_tenth {
+            last_tenth = tenth;
+            eprintln!("  transcription {:.0} %", fraction * 100.0);
+        }
+    })?;
     let pass_seconds = started.elapsed().as_secs_f64();
     let piece_words: Vec<usize> = pieces
         .iter()
@@ -319,6 +372,10 @@ fn main() -> Result<()> {
         "wav": args.wav,
         "variant": variant,
         "settings": settings_json(&settings),
+        "speaker_split": args.split_turns.as_ref().map(|path| json!({
+            "turns": path.to_string_lossy(),
+            "gap_seconds": args.split_gap,
+        })),
         "threads": args.threads,
         "audio_seconds": samples.len() as f64 / SAMPLE_RATE as f64,
         "speech_seconds": speech_seconds as f64 / SAMPLE_RATE as f64,
@@ -352,6 +409,80 @@ fn main() -> Result<()> {
                 "speech_seconds": speech_seconds as f64 / SAMPLE_RATE as f64,
                 "max_speech_duration": settings.vad_max_speech_seconds,
             },
+        },
+    });
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output, serde_json::to_vec_pretty(&document)?)
+        .with_context(|| format!("cannot write {}", output.display()))?;
+    eprintln!("wrote {}", output.display());
+    Ok(())
+}
+
+/// Runs the engine's own diarizer (`SpeechPass::diarize`, which includes the
+/// task #20 post-clustering by voice) and writes its turns in the shape
+/// `--turns` reads. The speaker split experiment must use this path, not the
+/// over-clustered front end of task #18.
+fn diarize_track(
+    args: &Args,
+    manifest: &Manifest,
+    threads: Threads,
+    samples: &[f32],
+) -> Result<()> {
+    let output = args.output.clone().context("--output is required")?;
+    let started = Instant::now();
+    let mut pass = SpeechPass::with_settings(
+        manifest.clone(),
+        args.models_root.clone(),
+        threads,
+        Settings::default(),
+    );
+    let mut last_tenth = 0u32;
+    let segments =
+        tinta_engine_rs::speech::FinalPass::diarize(&mut pass, samples, None, &mut |fraction| {
+            let tenth = (fraction * 10.0) as u32;
+            if tenth > last_tenth {
+                last_tenth = tenth;
+                eprintln!("  diarization {:.0} %", fraction * 100.0);
+            }
+        })?;
+    let wall = started.elapsed().as_secs_f64();
+    let speakers = segments
+        .iter()
+        .map(|segment| segment.speaker.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    eprintln!(
+        "diarize {}: {} speakers, {} segments, {:.0} s",
+        args.wav,
+        speakers,
+        segments.len(),
+        wall
+    );
+    let document = json!({
+        "wav": args.wav,
+        "command": "diarize",
+        "threads": args.threads,
+        "audio_seconds": samples.len() as f64 / SAMPLE_RATE as f64,
+        "diarization": {
+            "num_speakers": speakers,
+            "num_segments": segments.len(),
+            "process_seconds": wall,
+            "segments": segments
+                .iter()
+                .map(|segment| json!({
+                    // `--turns` reads a numeric speaker; the engine labels are
+                    // "S1", "S2", ... so strip the prefix.
+                    "speaker": segment.speaker
+                        .trim_start_matches('S')
+                        .parse::<i64>()
+                        .unwrap_or(0)
+                        .saturating_sub(1),
+                    "start": segment.s,
+                    "end": segment.e,
+                }))
+                .collect::<Vec<_>>(),
         },
     });
     if let Some(parent) = output.parent() {
@@ -486,6 +617,101 @@ fn load_turns(path: &PathBuf) -> Result<Vec<(f32, f32, i64)>> {
         joined.push((start, end, speaker));
     }
     Ok(joined)
+}
+
+/// The speaker active at `seconds`, or the nearest turn's speaker when no turn
+/// covers the instant. Turns can overlap, and a shared boundary then has both
+/// at distance zero; `prefer_earlier` says which side the lookup is for (the
+/// left edge of a silence belongs to the turn that just spoke).
+fn speaker_at(turns: &[(f32, f32, usize)], seconds: f32, prefer_earlier: bool) -> Option<usize> {
+    let mut best: Option<(f32, f32, usize)> = None;
+    for &(start, end, speaker) in turns {
+        let candidate = (
+            if seconds < start {
+                start - seconds
+            } else if seconds > end {
+                seconds - end
+            } else {
+                0.0
+            },
+            -start,
+            speaker,
+        );
+        let better = match best {
+            None => true,
+            Some(current) => match candidate.0.partial_cmp(&current.0) {
+                Some(std::cmp::Ordering::Less) => true,
+                Some(std::cmp::Ordering::Equal) => {
+                    if prefer_earlier {
+                        candidate.1 > current.1
+                    } else {
+                        candidate.1 < current.1
+                    }
+                }
+                _ => false,
+            },
+        };
+        if better {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, speaker)| speaker)
+}
+
+/// Splits the planned pieces at diarized speaker changes that fall inside a
+/// silence of at least `split_gap_seconds`. Task #23 experiment (b): measured
+/// and not adopted (it moves WER by less than 0.1 points, see
+/// `docs/fork/asr-experiments.md`), so the rule lives here, not in the engine.
+///
+/// `fine_ranges` is a second VAD pass whose `min_silence_duration` is the
+/// requested gap, so every gap between two consecutive ranges is one such
+/// silence. `speech` is the first pass's ranges: the boundary must lie inside
+/// one of them, which is the only place a pause was bridged. A boundary
+/// between two separate first-pass runs is already a cut in the plan.
+fn split_at_speaker_changes(
+    pieces: Vec<(usize, usize)>,
+    speech: &[(usize, usize)],
+    fine_ranges: &[(usize, usize)],
+    turns: &[(f32, f32, usize)],
+    split_gap_seconds: f32,
+) -> Vec<(usize, usize)> {
+    let rate = SAMPLE_RATE as f32;
+    let min_gap = (split_gap_seconds.max(0.0) * SAMPLE_RATE as f32) as usize;
+    let mut out = Vec::with_capacity(pieces.len());
+    for (start, end) in pieces {
+        let mut cuts: Vec<usize> = Vec::new();
+        for pair in fine_ranges.windows(2) {
+            let (left_end, right_start) = (pair[0].1, pair[1].0);
+            if right_start <= left_end || right_start - left_end < min_gap {
+                continue;
+            }
+            if left_end <= start || right_start >= end {
+                continue;
+            }
+            if !speech
+                .iter()
+                .any(|&(a, b)| a <= left_end && right_start <= b)
+            {
+                continue;
+            }
+            let left = speaker_at(turns, left_end as f32 / rate, true);
+            let right = speaker_at(turns, right_start as f32 / rate, false);
+            if left.is_some() && right.is_some() && left != right {
+                cuts.push((left_end + right_start) / 2);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut position = start;
+        for cut in cuts {
+            if cut > position && cut < end {
+                out.push((position, cut));
+                position = cut;
+            }
+        }
+        out.push((position, end));
+    }
+    out
 }
 
 /// Step 4 experiment: decode each diarized speaker turn on its own, allowing

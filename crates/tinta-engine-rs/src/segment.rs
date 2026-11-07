@@ -119,8 +119,8 @@ fn split_run(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
 /// Every piece starts at its own speech start minus the pre-roll, never at 0:
 /// a track whose first speech is at 5 minutes must not produce a 0–60 s piece.
 /// A piece over the hard cap is split at the quietest points, never truncated,
-/// so no speech region is ever left out. [`covers_speech`] checks that invariant
-/// in debug builds and in the tests.
+/// so no speech region is ever left out: [`covers_speech`] asserts that
+/// invariant on every call, and the tests check the awkward cases directly.
 pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let max_piece = samples(MAX_PIECE_SECONDS);
     let join_gap = samples(JOIN_GAP_SECONDS);
@@ -150,7 +150,7 @@ pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, u
         }
         pieces.extend(split_to_cap(audio, start, end));
     }
-    debug_assert!(
+    assert!(
         covers_speech(&pieces, segments),
         "the decode pieces leave a VAD speech region uncovered"
     );

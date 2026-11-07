@@ -1,4 +1,8 @@
 import Foundation
+
+// FoundationModels exists only in the macOS 26 SDK. The build that CI compiles with an older
+// SDK runs without summaries, like a Mac below macOS 26, and reports them as unavailable.
+#if canImport(FoundationModels)
 import FoundationModels
 
 /// Meeting summaries with the Apple on-device language model. Nothing leaves the Mac.
@@ -192,3 +196,18 @@ private struct Writer {
         return out
     }
 }
+#else
+
+/// Summaries need the Apple on-device model, which this SDK does not have.
+enum Summarizer {
+    static let modelName = "Apple on-device model"
+
+    static func status() -> [String: Any] {
+        ["available": false, "reason": "Summaries need macOS 26 or later."]
+    }
+
+    static func summarize(_ params: [String: Any]) async throws -> [String: Any] {
+        throw EngineError("Summaries need macOS 26 or later.")
+    }
+}
+#endif

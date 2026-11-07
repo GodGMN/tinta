@@ -5,6 +5,9 @@
 ### Added
 - On Windows and Linux, Tinta keeps the key of the library in the key store of the system: Windows Credential Manager, GNOME Keyring, or KWallet. The meetings and recordings of a library stay readable after Tinta restarts.
 
+### Changed
+- On Windows and Linux, Tinta never creates a new key when a library already exists. If the system key store does not have the key, Tinta asks you to unlock your keyring instead of making the library unreadable.
+
 ## 0.9.3 (2026-10-21)
 
 ### Fixed

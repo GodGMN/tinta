@@ -1,10 +1,15 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+use anyhow::Context;
 use hkdf::Hkdf;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use rand::RngCore;
 use sha2::Sha256;
 
 /// The service of the master key in the system key store.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const SERVICE: &str = "com.usetinta.tinta";
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const ACCOUNT: &str = "library-master-key";
 
 /// The service of the master key in versions before 0.4.0.
@@ -75,7 +80,7 @@ impl Keys {
     /// Manager. The item has the same service and account as the macOS Keychain item.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn load_or_create() -> Result<Self> {
-        Self::load_or_create_with(&SystemStore)
+        Self::load_or_create_in(&crate::paths::data_dir(), &SystemStore)
     }
 
     /// A non-macOS build for a platform without a secure store. It refuses to create a key,
@@ -91,27 +96,81 @@ impl Keys {
         ))
     }
 
-    /// Uses a store for the master key. Only a clear "no entry" result creates a key: any other
-    /// failure would replace a key that is still there, and make the library unreadable.
+    /// Uses a store for the master key. Two instances must not both create a key, so the whole
+    /// read/create/write runs under an exclusive lock of the library folder. Only a clear "no
+    /// entry" result creates a key, and only when the library is still empty: any other failure,
+    /// or an existing library without a stored key, would make the library unreadable.
     #[cfg(any(target_os = "linux", target_os = "windows", test))]
-    fn load_or_create_with(store: &dyn KeyStore) -> Result<Self> {
+    fn load_or_create_in(library_dir: &std::path::Path, store: &dyn KeyStore) -> Result<Self> {
+        let _lock = lock_library(library_dir)?;
         let value = match store.get()? {
             Some(value) => value,
             None => {
+                if has_existing_data(library_dir) {
+                    return Err(anyhow!(
+                        "The key for your existing library was not found. Unlock your keyring \
+                         (GNOME Keyring, KWallet, KeePassXC) and open Tinta again."
+                    ));
+                }
                 let mut key = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut key);
-                let value = hex::encode(key);
-                store.set(&value)?;
-                value
+                let written = hex::encode(key);
+                store.set(&written)?;
+                // A racing writer, or a store that accepted the write but dropped it, must win:
+                // the database must use exactly the key that the store now holds.
+                store.get()?.ok_or_else(|| {
+                    anyhow!("the system key store did not keep the new library key")
+                })?
             }
         };
-        Self::derive(&hex::decode(&value).context("invalid master key in the system key store")?)
+        Self::derive(&decode_master_key(&value)?)
     }
 
     /// Test keys that never touch the Keychain.
     pub fn for_tests() -> Self {
         Self::derive(&[7u8; 32]).expect("derive")
     }
+}
+
+/// Decodes the stored hex key and requires exactly 32 bytes. A short or empty value must never
+/// be used (or replaced): the store may hold it because another app wrote the item.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn decode_master_key(value: &str) -> Result<[u8; 32]> {
+    let master = hex::decode(value).context("invalid master key in the system key store")?;
+    master.try_into().map_err(|_| {
+        anyhow!("invalid master key in the system key store (expected 32 bytes)")
+    })
+}
+
+/// True when the library already holds encrypted data: the database, or recorded audio.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn has_existing_data(dir: &std::path::Path) -> bool {
+    if dir.join("library.db").exists() {
+        return true;
+    }
+    let Ok(meetings) = std::fs::read_dir(dir.join("meetings")) else {
+        return false;
+    };
+    meetings.flatten().any(|meeting| {
+        std::fs::read_dir(meeting.path().join("audio"))
+            .map(|mut audio| audio.next().is_some())
+            .unwrap_or(false)
+    })
+}
+
+/// Holds an exclusive lock on the library folder until the returned file is dropped.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn lock_library(dir: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).context("cannot create the library folder")?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("key.lock"))
+        .context("cannot open the library key lock file")?;
+    file.lock().context("cannot lock the library folder")?;
+    Ok(file)
 }
 
 /// Reads the master key item of a service. Only a missing item gives `None`. Any other error,
@@ -146,13 +205,7 @@ impl KeyStore for SystemStore {
     fn get(&self) -> Result<Option<String>> {
         let entry =
             keyring::Entry::new(SERVICE, ACCOUNT).context("cannot open the system key store")?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(anyhow!(
-                "cannot read the library key from the system key store: {error}"
-            )),
-        }
+        read_password(&entry)
     }
 
     fn set(&self, value: &str) -> Result<()> {
@@ -162,6 +215,19 @@ impl KeyStore for SystemStore {
             .map_err(|error| {
                 anyhow!("cannot store the library key in the system key store: {error}")
             })
+    }
+}
+
+/// Maps the errors of the real key store. Only `NoEntry` means the item is absent; a locked or
+/// unreachable store, an ambiguous match, and a malformed value are all errors.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn read_password(entry: &keyring::Entry) -> Result<Option<String>> {
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(anyhow!(
+            "cannot read the library key from the system key store: {error}"
+        )),
     }
 }
 
@@ -235,36 +301,119 @@ mod tests {
         }
     }
 
+    fn library() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp library")
+    }
+
+    fn stored_master(value: &str) -> [u8; 32] {
+        hex::decode(value).expect("hex").try_into().expect("32 bytes")
+    }
+
     #[test]
     fn first_run_creates_and_stores_a_key() {
+        let dir = library();
         let store = MockStore::empty();
-        let keys = Keys::load_or_create_with(&store).expect("load or create");
+        let keys = Keys::load_or_create_in(dir.path(), &store).expect("load or create");
         let stored = store.value().expect("a new key is stored");
         assert_eq!(store.writes(), 1);
         assert_eq!(stored.len(), 64, "the master key is 32 bytes of hex");
         assert!(stored.chars().all(|c| c.is_ascii_hexdigit()));
-        let master = hex::decode(&stored).expect("hex");
-        assert_eq!(
-            keys.database,
-            Keys::derive(&master).expect("derive").database
-        );
+        assert_eq!(keys.database, Keys::derive(&stored_master(&stored)).expect("derive").database);
     }
 
     #[test]
     fn second_run_reuses_the_stored_key() {
+        let dir = library();
         let stored = "ab".repeat(32);
         let store = MockStore::with_value(&stored);
-        let keys = Keys::load_or_create_with(&store).expect("load");
+        let keys = Keys::load_or_create_in(dir.path(), &store).expect("load");
         assert_eq!(store.writes(), 0);
         assert_eq!(store.value().as_deref(), Some(stored.as_str()));
-        let expected = Keys::derive(&hex::decode(&stored).expect("hex")).expect("derive");
+        let expected = Keys::derive(&stored_master(&stored)).expect("derive");
         assert_eq!(keys.audio, expected.audio);
     }
 
     #[test]
+    fn existing_library_with_a_stored_key_loads() {
+        let dir = library();
+        std::fs::write(dir.path().join("library.db"), b"encrypted library").expect("library");
+        let stored = "cd".repeat(32);
+        let store = MockStore::with_value(&stored);
+        let keys = Keys::load_or_create_in(dir.path(), &store).expect("load");
+        assert_eq!(store.writes(), 0);
+        assert_eq!(keys.database, Keys::derive(&stored_master(&stored)).expect("derive").database);
+    }
+
+    #[test]
+    fn existing_library_without_a_key_errors() {
+        let dir = library();
+        std::fs::write(dir.path().join("library.db"), b"encrypted library").expect("library");
+        let store = MockStore::empty();
+        let error = Keys::load_or_create_in(dir.path(), &store)
+            .err()
+            .expect("an existing library must not get a new key");
+        assert!(error.to_string().contains("key for your existing library"));
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.value(), None);
+    }
+
+    #[test]
+    fn existing_audio_without_a_key_errors() {
+        let dir = library();
+        let audio = dir.path().join("meetings").join("m1").join("audio");
+        std::fs::create_dir_all(&audio).expect("audio dir");
+        std::fs::write(audio.join("0.wav"), b"encrypted audio").expect("audio");
+        let store = MockStore::empty();
+        let error = Keys::load_or_create_in(dir.path(), &store)
+            .err()
+            .expect("existing recordings must not get a new key");
+        assert!(error.to_string().contains("key for your existing library"));
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.value(), None);
+    }
+
+    #[test]
+    fn malformed_stored_value_errors_without_writing() {
+        let dir = library();
+        let store = MockStore::with_value("not hex");
+        let error = Keys::load_or_create_in(dir.path(), &store)
+            .err()
+            .expect("a malformed key must not create a key");
+        assert!(error.to_string().contains("invalid master key"));
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.value().as_deref(), Some("not hex"));
+    }
+
+    #[test]
+    fn empty_stored_value_errors_without_writing() {
+        let dir = library();
+        let store = MockStore::with_value("");
+        let error = Keys::load_or_create_in(dir.path(), &store)
+            .err()
+            .expect("an empty key must not be used");
+        assert!(error.to_string().contains("expected 32 bytes"));
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.value().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn short_stored_value_errors_without_writing() {
+        let dir = library();
+        let short = "ab".repeat(31);
+        let store = MockStore::with_value(&short);
+        let error = Keys::load_or_create_in(dir.path(), &store)
+            .err()
+            .expect("a 31-byte key must not be used");
+        assert!(error.to_string().contains("expected 32 bytes"));
+        assert_eq!(store.writes(), 0);
+        assert_eq!(store.value().as_deref(), Some(short.as_str()));
+    }
+
+    #[test]
     fn locked_store_errors_without_writing() {
+        let dir = library();
         let store = MockStore::with_read_error("the key store is locked");
-        let error = Keys::load_or_create_with(&store)
+        let error = Keys::load_or_create_in(dir.path(), &store)
             .err()
             .expect("a locked store must not create a key");
         assert!(error.to_string().contains("locked"));
@@ -274,8 +423,9 @@ mod tests {
 
     #[test]
     fn unavailable_store_errors_without_writing() {
+        let dir = library();
         let store = MockStore::with_read_error("no Secret Service is running");
-        let error = Keys::load_or_create_with(&store)
+        let error = Keys::load_or_create_in(dir.path(), &store)
             .err()
             .expect("an unavailable store must not create a key");
         assert!(error.to_string().contains("Secret Service"));
@@ -284,24 +434,130 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stored_value_errors_without_writing() {
-        let store = MockStore::with_value("not hex");
-        let error = Keys::load_or_create_with(&store)
-            .err()
-            .expect("a malformed key must not create a key");
-        assert!(error.to_string().contains("invalid master key"));
-        assert_eq!(store.writes(), 0);
-        assert_eq!(store.value().as_deref(), Some("not hex"));
-    }
-
-    #[test]
     fn store_write_failure_errors() {
+        let dir = library();
         let store = MockStore::with_write_error("access denied");
-        let error = Keys::load_or_create_with(&store)
+        let error = Keys::load_or_create_in(dir.path(), &store)
             .err()
             .expect("a failed write must fail");
         assert!(error.to_string().contains("access denied"));
         assert_eq!(store.writes(), 0);
         assert_eq!(store.value(), None);
     }
+
+    #[test]
+    fn dropped_write_errors_instead_of_using_the_lost_key() {
+        struct DroppingStore(MockStore);
+
+        impl KeyStore for DroppingStore {
+            fn get(&self) -> Result<Option<String>> {
+                self.0.get()
+            }
+
+            fn set(&self, _value: &str) -> Result<()> {
+                *self.0.writes.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let dir = library();
+        let store = DroppingStore(MockStore::empty());
+        let error = Keys::load_or_create_in(dir.path(), &store)
+            .err()
+            .expect("a store that drops the write must fail");
+        assert!(error.to_string().contains("did not keep"));
+        assert_eq!(store.0.writes(), 1);
+        assert_eq!(store.0.value(), None);
+    }
+
+    #[test]
+    fn two_threads_create_one_key() {
+        use std::sync::Arc;
+
+        let dir = library();
+        let store = Arc::new(MockStore::empty());
+        let path = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    Keys::load_or_create_in(&path, store.as_ref()).expect("load or create")
+                })
+            })
+            .collect();
+        let keys: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert_eq!(store.writes(), 1, "only one instance creates the key");
+        assert_eq!(keys[0].database, keys[1].database);
+        assert_eq!(keys[0].audio, keys[1].audio);
+        let stored = store.value().expect("stored key");
+        assert_eq!(keys[0].database, Keys::derive(&stored_master(&stored)).expect("derive").database);
+    }
+
+    #[test]
+    fn the_lock_waits_for_the_holder() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = library();
+        let held = lock_library(dir.path()).expect("lock");
+        let path = dir.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _lock = lock_library(&path).expect("lock");
+            sender.send(()).expect("send");
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a second instance must wait for the lock"
+        );
+        drop(held);
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the lock is released");
+        thread.join().expect("thread");
+    }
+
+    /// Exercises the mapping of the real `keyring` errors, using its mock credential builder.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn with_mock_error(error: Option<keyring::Error>) -> Result<Option<String>> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        let entry = keyring::Entry::new(SERVICE, ACCOUNT).expect("mock entry");
+        if let Some(error) = error {
+            let mock: &keyring::mock::MockCredential =
+                entry.get_credential().downcast_ref().expect("mock credential");
+            mock.set_error(error);
+        }
+        read_password(&entry)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn only_no_entry_means_the_key_is_absent() {
+        assert_eq!(
+            with_mock_error(None).expect("no entry").as_deref(),
+            None,
+            "NoEntry maps to absent"
+        );
+
+        let errors = [
+            keyring::Error::PlatformFailure("no session bus".into()),
+            keyring::Error::NoStorageAccess("the collection is locked".into()),
+            keyring::Error::BadEncoding(vec![0xff, 0xfe]),
+            keyring::Error::Ambiguous(vec![
+                Box::new(keyring::mock::MockCredential::default())
+            ]),
+            keyring::Error::TooLong("service".to_string(), 10),
+            keyring::Error::Invalid("service".to_string(), "bad".to_string()),
+        ];
+        for error in errors {
+            assert!(
+                with_mock_error(Some(error)).is_err(),
+                "only NoEntry may mean the key is absent"
+            );
+        }
+    }
+
 }

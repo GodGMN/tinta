@@ -63,3 +63,17 @@ jobs:
         run: cargo test --locked -p tinta-core
       - name: Clippy
         run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+
+  tntc-swift-fixture:
+    # CryptoKit is macOS-only, so this job writes chunks with the Swift code path and
+    # checks that the Rust reader decrypts them byte for byte.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Write Swift TNTC fixture
+        run: swift engine/scripts/make-tntc-fixture.swift "$RUNNER_TEMP/tntc-fixture"
+      - name: Read the Swift fixture from Rust
+        env:
+          TINTA_TNTC_FIXTURE_DIR: ${{ runner.temp }}/tntc-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored

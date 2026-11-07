@@ -8,6 +8,17 @@
 //!
 //! The microphone track is filtered against speaker echo after transcription,
 //! with the pure decision ported in [`crate::echo`].
+//!
+//! # Memory
+//!
+//! A track at the 12 h codec cap is 691,200,000 samples, 2.76 GB as f32. Both
+//! tracks are alive while the microphone is transcribed, so the peak is about
+//! **5.5 GB of audio** plus the models (under 1 GB), not the 7 GB the first
+//! version used: [`read_track`] now decrypts one 5 s chunk at a time (160 KB of
+//! i16) instead of holding every decrypted chunk next to the f32 track. The
+//! remote buffer is dropped as soon as the echo filter has read it, and the mic
+//! buffer right after. The whole pass holds the model lock while it reads, so a
+//! second queued finalize does not hold another 5.5 GB while it waits.
 
 use anyhow::Result;
 use serde_json::{json, Map, Value};
@@ -29,8 +40,6 @@ pub fn finalize(
     max_speakers: Option<usize>,
     out: &Output,
 ) -> Result<Value> {
-    let remote = read_track(dir, key, Track::Remote)?;
-    let mic = read_track(dir, key, Track::Mic)?;
     let mut emit = |stage: &str, fraction: f64| {
         let _ = out.event(
             "finalize_progress",
@@ -38,15 +47,20 @@ pub fn finalize(
         );
     };
     // Two final passes for different meetings may overlap; the model lock makes
-    // them wait for each other instead of loading the recognizer twice.
-    with_models(|| finalize_tracks(pass, &remote, &mic, max_speakers, &mut emit))
+    // them wait for each other instead of loading the recognizer twice. The lock
+    // is taken before the tracks are read, so the waiting pass holds no audio.
+    with_models(|| {
+        let remote = read_track(dir, key, Track::Remote)?;
+        let mic = read_track(dir, key, Track::Mic)?;
+        finalize_tracks(pass, remote, mic, max_speakers, &mut emit)
+    })
 }
 
 /// The testable core: takes the two tracks and emits progress through `emit`.
 pub fn finalize_tracks(
     pass: &mut dyn FinalPass,
-    remote: &[f32],
-    mic: &[f32],
+    remote: Vec<f32>,
+    mic: Vec<f32>,
     max_speakers: Option<usize>,
     emit: &mut dyn FnMut(&str, f64),
 ) -> Result<Value> {
@@ -54,21 +68,25 @@ pub fn finalize_tracks(
     let mut tracks = Map::new();
     let mut all_text = String::new();
 
-    let remote_words = pass.transcribe(remote, &mut |fraction| emit("transcription", fraction))?;
+    let remote_words = pass.transcribe(&remote, &mut |fraction| emit("transcription", fraction))?;
     all_text.push_str(&joined(&remote_words));
     all_text.push(' ');
     let mut remote_entry = json!({ "words": words_json(&remote_words) });
     if !remote_words.is_empty() {
         // Silent audio has no speakers, and the diarizer can fail on it.
-        let segments = pass.diarize(remote, max_speakers, &mut |fraction| {
+        let segments = pass.diarize(&remote, max_speakers, &mut |fraction| {
             emit("diarization", fraction)
         })?;
         remote_entry["diarization"] = segments_json(&segments);
     }
     tracks.insert("remote".to_string(), remote_entry);
 
-    let mic_words = pass.transcribe(mic, &mut |fraction| emit("transcription", fraction))?;
-    let mic_words = echo::filter(mic, remote, mic_words);
+    let mic_words = pass.transcribe(&mic, &mut |fraction| emit("transcription", fraction))?;
+    let mic_words = echo::filter(&mic, &remote, mic_words);
+    // The remote samples are not needed once the echo decision is made; at 12 h
+    // this releases 2.76 GB before the language guess and the result are built.
+    drop(remote);
+    drop(mic);
     all_text.push_str(&joined(&mic_words));
     all_text.push(' ');
     tracks.insert(
@@ -172,8 +190,8 @@ mod tests {
         let mut events = Vec::new();
         let result = finalize_tracks(
             &mut pass,
-            &remote_samples,
-            &mic_samples,
+            remote_samples,
+            mic_samples,
             None,
             &mut |stage, fraction| events.push((stage.to_string(), fraction)),
         )
@@ -246,7 +264,7 @@ mod tests {
             vec![word("echo", 0.0, 1.0), word("speech", 1.0, 2.0)],
             1,
         );
-        let result = finalize_tracks(&mut pass, &remote, &mic, None, &mut |_, _| {}).unwrap();
+        let result = finalize_tracks(&mut pass, remote, mic, None, &mut |_, _| {}).unwrap();
         let words = result["tracks"]["mic"]["words"].as_array().unwrap();
         assert_eq!(words.len(), 1);
         assert_eq!(words[0]["w"], "speech");
@@ -256,8 +274,14 @@ mod tests {
     fn a_failing_mic_transcription_fails_the_command() {
         let mut pass = fake(Vec::new(), Vec::new(), 1);
         pass.fail_mic = true;
-        let error =
-            finalize_tracks(&mut pass, &[0.0; 16], &[0.0; 16], None, &mut |_, _| {}).unwrap_err();
+        let error = finalize_tracks(
+            &mut pass,
+            vec![0.0; 16],
+            vec![0.0; 16],
+            None,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("microphone transcription failed"));

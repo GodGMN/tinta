@@ -283,13 +283,13 @@ impl Engine {
         let root = self.models_root.clone();
         let threads = self.threads;
         std::thread::spawn(move || {
-            let result = (|| -> Result<Value> {
+            let result = catching("the final pass stopped unexpectedly", || {
                 let dir = param_string(&params, "dir")?;
                 let key = audio_key(&params)?;
                 let max_speakers = param_usize(&params, "max_speakers");
                 let mut pass = SpeechPass::new(manifest, root, threads);
                 crate::finalize::finalize(&mut pass, Path::new(&dir), &key, max_speakers, &out)
-            })();
+            });
             reply(&out, &id, result);
         });
         Ok(())
@@ -302,12 +302,12 @@ impl Engine {
         let id = request.id.clone();
         let params = request.params.clone();
         std::thread::spawn(move || {
-            let result = (|| -> Result<Value> {
+            let result = catching("the import stopped unexpectedly", || {
                 let dir = param_string(&params, "dir")?;
                 let key = audio_key(&params)?;
                 let path = param_string(&params, "path")?;
                 crate::import::import_audio(Path::new(&dir), &key, Path::new(&path), &out)
-            })();
+            });
             reply(&out, &id, result);
         });
         Ok(())
@@ -386,6 +386,16 @@ fn audio_key(params: &Map<String, Value>) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid audio key"))
+}
+
+/// Runs a worker body and turns a panic into an error reply. Section 2.5 requires
+/// an answer for every request: without this a panic in sherpa-onnx, symphonia or
+/// rubato would leave the app waiting for its 60-minute timeout.
+fn catching<T>(message: &str, job: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("{message}")),
+    }
 }
 
 fn reply(out: &Output, id: &Value, result: Result<Value>) {
@@ -620,6 +630,16 @@ mod tests {
         assert_eq!(reply["id"], 8);
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"], "missing parameter: dir");
+    }
+
+    #[test]
+    fn a_panicking_worker_still_answers_with_an_error() {
+        let result = catching(
+            "the final pass stopped unexpectedly",
+            || -> Result<Value> { panic!("sherpa-onnx panicked") },
+        );
+        let error = result.unwrap_err().to_string();
+        assert_eq!(error, "the final pass stopped unexpectedly");
     }
 
     /// Builds a request line with serde, so a Windows path's backslashes are

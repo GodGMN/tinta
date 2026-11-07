@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::audio::{AudioDecoder, Resampler48, SAMPLE_RATE};
 use crate::protocol::Output;
-use tinta_core::chunks::{ChunkWriter, Track};
+use tinta_core::chunks::{ChunkWriter, Track, MAX_TRACK_SAMPLES};
 
 pub fn import_audio(dir: &Path, key: &[u8; 32], path: &Path, out: &Output) -> Result<Value> {
     let mut decoder = AudioDecoder::open(path)?;
@@ -39,12 +39,14 @@ pub fn import_audio(dir: &Path, key: &[u8; 32], path: &Path, out: &Output) -> Re
             Some(resampler) => resampler.push(&chunk, &mut output)?,
             None => output.extend_from_slice(&chunk),
         }
+        ensure_within_limit(index, output.len())?;
         append(&mut writer, &output, &mut index, out);
         output.clear();
     }
     if let Some(resampler) = resampler.as_mut() {
         resampler.finish(&mut output, input_frames)?;
     }
+    ensure_within_limit(index, output.len())?;
     append(&mut writer, &output, &mut index, out);
     if let Err(error) = writer.flush() {
         let _ = out.event(
@@ -53,6 +55,18 @@ pub fn import_audio(dir: &Path, key: &[u8; 32], path: &Path, out: &Output) -> Re
         );
     }
     Ok(json!({ "duration": index as f64 / SAMPLE_RATE as f64 }))
+}
+
+/// Rejects an import that would pass the 12 hour track limit. `read_track` uses
+/// the same cap, so without this check the import would succeed and `finalize`
+/// would later fail with a misleading "chunk header is corrupt".
+fn ensure_within_limit(index: i64, samples: usize) -> Result<()> {
+    if index + samples as i64 > MAX_TRACK_SAMPLES {
+        bail!(
+            "the audio is longer than the 12 hour track limit; split or trim the file before importing it"
+        );
+    }
+    Ok(())
 }
 
 /// Appends resampled samples and advances the meeting clock. A write failure is
@@ -73,6 +87,7 @@ fn append(writer: &mut ChunkWriter, samples: &[f32], index: &mut i64, out: &Outp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use tinta_core::chunks::{read_track, CHUNK_SAMPLES};
 
@@ -105,6 +120,92 @@ mod tests {
         let chunks = std::fs::read_dir(dir.path().join("audio/remote")).unwrap();
         assert_eq!(chunks.count(), 1);
         assert_eq!(CHUNK_SAMPLES, 80_000);
+    }
+
+    /// Zero-crossing frequency estimate, enough for a clean sine.
+    fn dominant_frequency(samples: &[f32]) -> f32 {
+        let mut crossings = 0;
+        for pair in samples.windows(2) {
+            if (pair[0] < 0.0 && pair[1] >= 0.0) || (pair[0] >= 0.0 && pair[1] < 0.0) {
+                crossings += 1;
+            }
+        }
+        crossings as f32 * SAMPLE_RATE as f32 / (2.0 * samples.len() as f32)
+    }
+
+    fn write_wav(dir: &Path, name: &str, rate: u32, seconds: f32) -> PathBuf {
+        let count = (rate as f32 * seconds) as usize;
+        let samples: Vec<f32> = (0..count)
+            .map(|index| (index as f32 / rate as f32 * 300.0 * std::f32::consts::TAU).sin() * 0.25)
+            .collect();
+        let path = dir.join(name);
+        std::fs::write(&path, crate::audio::wav_at(&samples, rate)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_44k_import_is_resampled_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let path = write_wav(source.path(), "tone-44k.wav", 44_100, 2.0);
+        let out = Output::new(std::io::sink());
+        let result = import_audio(dir.path(), &key(), &path, &out).unwrap();
+        assert_eq!(result["duration"], 2.0);
+        let track = read_track(dir.path(), &key(), Track::Remote).unwrap();
+        assert_eq!(track.len(), 32_000);
+        let frequency = dominant_frequency(&track[400..31_600]);
+        assert!((frequency - 300.0).abs() < 5.0, "frequency {frequency}");
+    }
+
+    #[test]
+    fn a_48k_import_is_resampled_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let path = write_wav(source.path(), "tone-48k.wav", 48_000, 2.0);
+        let out = Output::new(std::io::sink());
+        let result = import_audio(dir.path(), &key(), &path, &out).unwrap();
+        assert_eq!(result["duration"], 2.0);
+        let track = read_track(dir.path(), &key(), Track::Remote).unwrap();
+        assert_eq!(track.len(), 32_000);
+        let frequency = dominant_frequency(&track[400..31_600]);
+        assert!((frequency - 300.0).abs() < 5.0, "frequency {frequency}");
+    }
+
+    /// The fixture is a 2 s, 44.1 kHz mono MP3 made with
+    /// `ffmpeg -f lavfi -i "sine=frequency=300:sample_rate=44100:duration=2"
+    /// -ac 1 -c:a libmp3lame -b:a 64k -write_xing 1`.
+    /// Gapless trimming removes the 1105-sample encoder delay and the padding,
+    /// so the timeline matches the 2 s source. Without it the track is about
+    /// 25-40 ms longer and every word time shifts against Swift.
+    #[test]
+    fn a_short_mp3_keeps_its_source_timeline() {
+        let dir = TempDir::new().unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone-2s-44k.mp3");
+        let out = Output::new(std::io::sink());
+        let result = import_audio(dir.path(), &key(), &path, &out).unwrap();
+        let duration = result["duration"].as_f64().unwrap();
+        assert!(
+            (duration - 2.0).abs() <= 0.002,
+            "duration {duration} is not the 2 s source"
+        );
+        let track = read_track(dir.path(), &key(), Track::Remote).unwrap();
+        let expected = 32_000i64;
+        assert!(
+            (track.len() as i64 - expected).abs() <= 32,
+            "length {} is not the 2 s source (32,000 samples)",
+            track.len()
+        );
+        let frequency = dominant_frequency(&track[400..31_600]);
+        assert!((frequency - 300.0).abs() < 5.0, "frequency {frequency}");
+    }
+
+    #[test]
+    fn an_import_past_the_twelve_hour_limit_is_rejected() {
+        assert!(ensure_within_limit(MAX_TRACK_SAMPLES - 16, 16).is_ok());
+        let error = ensure_within_limit(MAX_TRACK_SAMPLES, 1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("12 hour"), "{message}");
+        assert!(!message.contains("corrupt"), "{message}");
     }
 
     #[test]

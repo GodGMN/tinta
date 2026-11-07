@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- The desktop app builds for Windows and Linux. Those builds cannot open the library yet, so Tinta says so when it starts.
+
 ## 0.9.3 (2026-10-21)
 
 ### Fixed

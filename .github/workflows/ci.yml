@@ -13,6 +13,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  app-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares. The
+      # macOS build script makes them; a check only needs the files to exist.
+      - name: Create placeholder sidecars
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          for name in tinta-engine tinta-mcp tinta-native-host; do
+            touch "app/src-tauri/binaries/$name-$triple"
+          done
+      # Clippy builds the app in development mode, which uses devUrl, but build the frontend
+      # too so that a release-style build finds dist/.
+      - name: Build the frontend
+        working-directory: app
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Clippy
+        run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+
+  app-macos:
+    # The Intel image for the same capacity reason as `core-macos`. This compiles the macOS
+    # platform module, so it proves that the Mac code still builds.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares.
+      - name: Create placeholder sidecars
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          for name in tinta-engine tinta-mcp tinta-native-host; do
+            touch "app/src-tauri/binaries/$name-$triple"
+          done
+      - name: Clippy
+        run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+
+  app-windows:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: C:\vcpkg
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but builds against OpenSSL. vcpkg provides it for MSVC.
+      - name: Install OpenSSL
+        run: vcpkg install openssl:x64-windows
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares.
+      - name: Create placeholder sidecars
+        shell: pwsh
+        run: |
+          $triple = (rustc -vV | Select-String -Pattern '^host: ').Line.Split(' ')[1]
+          New-Item -ItemType Directory -Force -Path app/src-tauri/binaries | Out-Null
+          foreach ($name in @('tinta-engine', 'tinta-mcp', 'tinta-native-host')) {
+            New-Item -ItemType File -Force -Path "app/src-tauri/binaries/$name-$triple.exe" | Out-Null
+          }
+      - name: Check
+        run: cargo check --locked -p tinta --all-targets
+
   core-linux:
     runs-on: ubuntu-latest
     steps:

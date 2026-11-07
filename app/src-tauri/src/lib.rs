@@ -1,10 +1,7 @@
-mod bubble;
 mod calendar;
 mod commands;
 mod engine;
-mod migrate;
-mod notify;
-mod overview;
+mod platform;
 mod socket;
 mod system;
 
@@ -190,14 +187,14 @@ impl AppState {
 
     pub fn self_name(&self) -> String {
         let stored = self.db.lock().unwrap().setting("self_name").ok().flatten();
-        stored.unwrap_or_else(system::full_name)
+        stored.unwrap_or_else(platform::full_name)
     }
 
     pub fn emit(&self, event: &str, payload: Value) {
         if let Some(app) = &self.app {
             // The bubble follows the recording state.
             if event == "recording" {
-                bubble::sync(app, !payload.is_null());
+                platform::bubble::sync(app, !payload.is_null());
             }
             let _ = app.emit(event, payload);
         }
@@ -685,7 +682,7 @@ impl AppState {
                 "mic_state" => ext.mic_muted = message["muted"].as_bool(),
                 "ping" => {}
                 // Only the current extension sends "hello", so no extension uses the old host name.
-                "hello" => system::remove_old_native_host(),
+                "hello" => platform::remove_old_native_host(),
                 "meeting_ended" => {
                     ended = code.clone().or_else(|| ext.meeting_code.clone());
                     ext.mic_muted = None;
@@ -838,7 +835,7 @@ impl AppState {
             }
         };
         *db = moved;
-        system::exclude_from_backup(&target);
+        platform::exclude_from_backup(&target);
         for name in ["library.db", "library.db-wal", "library.db-shm"] {
             let _ = std::fs::remove_file(current.join(name));
         }
@@ -931,13 +928,29 @@ pub fn watch_calls(delay: Duration) {
     });
 }
 
+/// Loads the master key of the library. The non-macOS key store comes in a later change;
+/// until then the app stops with a clear message instead of creating a library that it
+/// could not open again. The library key storage is a separate task (#10).
+#[cfg(target_os = "macos")]
+fn load_keys() -> Result<Keys> {
+    Keys::load_or_create()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_keys() -> Result<Keys> {
+    bail!(
+        "Tinta cannot open its encrypted library on this platform yet. \
+         Windows and Linux support is still in development."
+    )
+}
+
 /// Opens the library, starts the engine client and the app socket, and starts the calendar, recovery, and retention.
 pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
     let data = paths::data_dir();
     std::fs::create_dir_all(&data)?;
     std::fs::create_dir_all(paths::base_dir())?;
-    system::exclude_from_backup(&data);
-    let keys = Keys::load_or_create()?;
+    platform::exclude_from_backup(&data);
+    let keys = load_keys()?;
     let db = Db::open(&paths::database_path(), &keys)?;
     let engine = Engine::new(Arc::new(|event| {
         if let Some(state) = STATE.get() {
@@ -965,7 +978,7 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
     calendar::watch();
     // Test runs use their own data folder and must not change the Chrome configuration.
     if std::env::var_os("TINTA_DATA_DIR").is_none() {
-        let _ = system::install_native_host();
+        let _ = platform::install_native_host();
     }
     socket::serve(state.clone())?;
 
@@ -996,7 +1009,7 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
 
 pub fn run() {
     let context = tauri::generate_context!();
-    migrate::run(&context.config().identifier);
+    platform::migrate::run(&context.config().identifier);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -1004,13 +1017,13 @@ pub fn run() {
             if let Ok(resources) = tauri::Manager::path(app).resource_dir() {
                 system::update_extension(&resources.join("extension"));
             }
-            overview::watch();
+            platform::overview::watch();
             Ok(())
         })
         .on_window_event(|window, event| {
             if window.label() == "main" && matches!(event, tauri::WindowEvent::Focused(_)) {
                 let recording = STATE.get().is_some_and(|s| s.active.lock().unwrap().is_some());
-                bubble::sync(tauri::Manager::app_handle(window), recording);
+                platform::bubble::sync(tauri::Manager::app_handle(window), recording);
             }
         })
         .invoke_handler(commands::handler())

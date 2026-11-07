@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub const NATIVE_HOST_NAME: &str = "com.usetinta.tinta";
@@ -40,13 +41,108 @@ const CHROMIUM: [Chromium; 3] = [
     },
 ];
 
-/// The helper binaries that the app trusts: the ones next to the app executable. The Cargo
-/// target directory is the same folder in development, so it needs no separate entry.
+/// The folder of the stable helper copies when the app runs from an AppImage.
+///
+/// An AppImage mounts itself below `/tmp/.mount_XXXXXX`, which changes on every launch and
+/// disappears when the app quits, so a manifest or an MCP configuration cannot point into it.
+/// The copies live in a folder keyed by the app version, and the `.deb` keeps using
+/// `/usr/bin`. `None` when `$APPIMAGE` is unset: a normal install needs no copies.
+fn appimage_bin_dir() -> Option<PathBuf> {
+    appimage_bin_dir_from(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn appimage_bin_dir_from(
+    appimage: Option<&OsStr>,
+    data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    appimage.filter(|value| !value.is_empty())?;
+    let data = data_home
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))?;
+    Some(
+        data.join("Tinta")
+            .join("bin")
+            .join(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+/// The file name of a helper, without a directory.
+fn helper_file(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The helper binary that the app registers and shows: a stable copy in the data folder when
+/// the app runs from an AppImage, and the sibling of the app executable otherwise.
+///
+/// The copy is made once per app version, so the Chrome native host manifest and the MCP path
+/// that the app shows keep working after the AppImage exits. A failed copy falls back to the
+/// sibling, which still works while the instance runs.
+pub fn helper_path(name: &str) -> PathBuf {
+    let sibling = super::other::sibling_helper_path(name);
+    match appimage_bin_dir() {
+        Some(dir) => helper_in_appimage(name, &sibling, &dir),
+        None => sibling,
+    }
+}
+
+fn helper_in_appimage(name: &str, sibling: &Path, dir: &Path) -> PathBuf {
+    let destination = dir.join(helper_file(name));
+    if destination.exists() {
+        return destination;
+    }
+    match copy_helper(sibling, &destination) {
+        Ok(()) => destination,
+        Err(_) => sibling.to_path_buf(),
+    }
+}
+
+fn copy_helper(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("the helper copy has no parent folder"))?;
+    std::fs::create_dir_all(parent).context("cannot create the helper folder")?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+        .context("cannot set the mode of the helper folder")?;
+    // Copy next to the destination and rename, so a second instance never reads a half copy.
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("helper"),
+        std::process::id()
+    ));
+    std::fs::copy(source, &temporary).context("cannot copy the helper")?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
+        .context("cannot set the mode of the helper")?;
+    std::fs::rename(&temporary, destination).context("cannot move the helper copy into place")?;
+    Ok(())
+}
+
+/// The helper binaries that the app trusts: the ones next to the app executable, plus the
+/// stable copies when the app runs from an AppImage (the running helper is that copy). The
+/// Cargo target directory is the same folder in development, so it needs no separate entry.
 pub fn allowed_helpers() -> Vec<PathBuf> {
-    std::env::current_exe()
+    let mut allowed = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(tinta_core::peer::helpers_in))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(dir) = appimage_bin_dir() {
+        for path in tinta_core::peer::helpers_in(&dir) {
+            if !allowed.contains(&path) {
+                allowed.push(path);
+            }
+        }
+    }
+    allowed
 }
 
 /// Accepts a peer only if it runs as this user and its executable is one of the helper
@@ -142,7 +238,7 @@ fn write_host_manifest(dir: &Path, name: &str, helper: &Path) -> Result<PathBuf>
 /// Writes the native host manifest in every browser that this user runs. Called on each start,
 /// so the absolute helper path follows an update of the app.
 pub fn install_native_host() -> Result<PathBuf> {
-    let helper = super::other::helper_path("tinta-native-host");
+    let helper = helper_path("tinta-native-host");
     // Chrome needs an absolute path, and the canonical one keeps working when the install
     // folder is a symbolic link.
     let helper = helper.canonicalize().unwrap_or(helper);
@@ -266,5 +362,78 @@ mod tests {
                 dir.path().join("tinta-mcp")
             ]
         );
+    }
+
+    #[test]
+    fn an_appimage_gets_a_versioned_helper_folder() {
+        let dir = appimage_bin_dir_from(
+            Some(OsStr::new("/tmp/.mount_tinta/AppRun")),
+            Some(OsStr::new("/data")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/data/Tinta/bin").join(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn an_appimage_falls_back_to_the_home_data_folder() {
+        let dir = appimage_bin_dir_from(
+            Some(OsStr::new("/tmp/.mount_tinta/AppRun")),
+            None,
+            Some(OsStr::new("/home/me")),
+        )
+        .unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/me/.local/share/Tinta/bin").join(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn without_an_appimage_the_sibling_is_the_helper() {
+        assert_eq!(appimage_bin_dir_from(None, Some(OsStr::new("/data")), None), None);
+        assert_eq!(
+            appimage_bin_dir_from(Some(OsStr::new("")), Some(OsStr::new("/data")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_data_home_is_ignored() {
+        assert_eq!(
+            appimage_bin_dir_from(
+                Some(OsStr::new("/tmp/.mount_tinta/AppRun")),
+                Some(OsStr::new("relative")),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_appimage_helper_is_copied_once_with_the_helper_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("tinta-mcp");
+        std::fs::write(&source, b"first build").unwrap();
+        let destination_dir = dir.path().join("bin").join("0.9.3");
+
+        let path = helper_in_appimage("tinta-mcp", &source, &destination_dir);
+        assert_eq!(path, destination_dir.join("tinta-mcp"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"first build");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+
+        // The copy is made once per version: a later start keeps the file already there.
+        std::fs::write(&source, b"second build").unwrap();
+        assert_eq!(
+            helper_in_appimage("tinta-mcp", &source, &destination_dir),
+            path
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first build");
     }
 }

@@ -48,12 +48,23 @@ pub fn full_name() -> String {
 }
 
 /// A helper binary next to the app executable, or in the Cargo target directory in development.
-pub fn helper_path(name: &str) -> PathBuf {
+pub fn sibling_helper_path(name: &str) -> PathBuf {
     let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(&file)))
         .unwrap_or_else(|| PathBuf::from(file))
+}
+
+/// The helper binary that the app registers and shows. A Linux AppImage keeps stable copies in
+/// the data folder, because its mount path changes on every launch; elsewhere the sibling of the
+/// app executable is already stable.
+#[cfg(target_os = "linux")]
+pub use super::linux::helper_path;
+
+#[cfg(not(target_os = "linux"))]
+pub fn helper_path(name: &str) -> PathBuf {
+    sibling_helper_path(name)
 }
 
 /// Chrome starts the Meet extension host from a manifest that differs on each platform.

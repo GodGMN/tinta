@@ -289,13 +289,14 @@ Linux and leaves `scripts/build.sh` and the macOS config alone.
 `/tmp/.mount_XXXXXX/usr/bin`, which changes on every launch and disappears when the app
 quits, so the Chrome native host manifest and the MCP command cannot point there.
 
-When `$APPIMAGE` is set, the app copies `tinta-engine`, `tinta-mcp` and
-`tinta-native-host` once to `$XDG_DATA_HOME/Tinta/bin/<version>/` (default
-`~/.local/share/Tinta/bin/<version>/`), mode 0755, and returns those paths from
-`helper_path()` and `engine_path()`. The peer check reads the helper files from the same
-folder, so the copy is also what the app allows to connect to its socket. The folder is
-keyed by the app version, so an update writes a new copy and the old one can still run
-until it exits; a regular `.deb` install keeps using `/usr/bin`.
+When `$APPIMAGE` is set, the app copies `tinta-mcp` and `tinta-native-host` once to
+`$XDG_DATA_HOME/Tinta/bin/<version>/` (default `~/.local/share/Tinta/bin/<version>/`),
+mode 0755, and `helper_path()` returns those paths; the Chrome native host manifest and the
+MCP path in Settings then point at a stable file. The Linux peer check adds the same folder
+to the helpers that may connect to the app socket, because the running helper is that copy.
+The folder is keyed by the app version, so an update writes a new copy and the old one can
+still run until it exits; a regular `.deb` install keeps using `/usr/bin`. The engine is
+started by the app itself, so its path inside the AppImage mount is fine and is not copied.
 
 ## Not on Linux yet
 

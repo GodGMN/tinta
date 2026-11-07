@@ -14,15 +14,20 @@ speaker-embedding models. Nothing in the ASR path changes.
 
 **Result: the no-collar DER on the four AMI test meetings drops from
 21.5-41.7% (mean 28.4%) to 14.1-28.9% (mean 18.6%) with the same segmenter and
-the same CAMPPlus embeddings.** Three of the four meetings land at 14.1-16.5%,
-the speaker count is right on 4/4, and the cluster labelling reaches the
-oracle-mapping bound on every meeting (16.5 vs 16.6%, 14.8 vs 15.3%, 14.1 vs
-14.0%, 28.9 vs 28.5%). There is no clustering gap left to recover on these
-meetings; what remains is the segmenter, the reference definition and the
-speaker embeddings.
+the same CAMPPlus embeddings.** Three of the four meetings land at 14.1-16.5%
+and the speaker count is right on 4/4. The final DER is within 0.5 points of the
+many-to-one oracle of the **raw** over-clustered partition on all four meetings
+(16.5 vs 16.6%, 14.8 vs 15.3%, 14.1 vs 14.0%, 28.9 vs 28.5%). That oracle is a
+fair reference for "how much of the remaining error is clustering", but it is
+not a lower bound on turn-level reassignment: the final output beats it on
+ES2004b and IS1009b. Confusion falls to 2.1-11.0%; what remains is the front
+end, the reference definition and the speaker embeddings.
 
-The English WeSpeaker ResNet34 does **not** beat CAMPPlus here: 20.2% mean and
-2/4 speaker counts, against 18.6% and 4/4. CAMPPlus stays the engine default.
+The English WeSpeaker ResNet34 is **not shown to be better** here: 20.2% mean
+and 2/4 speaker counts (it ties on ES2004b and TS3003b, loses on IS1009b and
+EN2002a), against 18.6% and 4/4. Its embedding passes also cost **82-133 CPU-s
+per meeting** against 30-62 CPU-s for CAMPPlus, which is the stronger reason to
+keep CAMPPlus.
 
 ## What changed
 
@@ -38,21 +43,26 @@ pipeline over-clusters and then repairs the partition:
 2. **Merge by centroid.** Every cluster gets a duration-weighted centroid of its
    turn embeddings. The closest pair of centroids is merged while the cosine
    distance stays below `merge_distance`, recomputing the centroid after each
-   merge. Two optional stopping rules: `protect_share` refuses to merge two
-   clusters that both hold more than that share of the speech (the "minimum
-   speech share" rule), and `min_share` bounds the dissolve step below.
+   merge. A cached distance matrix is updated only in the merged row; a long
+   meeting does not recompute every pair's dot product on every round.
 3. **Reassign by voice, never by time.** Clusters holding less than `min_share`
-   of the speech are dissolved and each of their turns goes to the kept centroid
-   it is closest to in embedding space. The old benchmark reassigned those
-   segments to whichever large cluster was nearest in time; that is what put a
-   216-252 s split of one speaker into a neighbour.
+   of the diarized segment time are dissolved and each of their turns goes to
+   the kept centroid it is closest to in embedding space. The old benchmark
+   reassigned those segments to whichever large cluster was nearest in time;
+   that is what put a 216-252 s split of one speaker into a neighbour. The share
+   is a fraction of the summed unit durations, so overlapped units count twice
+   and gaps of up to 0.5 s inside a unit count as speech.
 
 The whole algorithm is `recluster(&[Unit], &Options) -> Outcome` in
 `scripts/fork/bench/src/clustering.rs`: a pure function over
 `(embedding, seconds, initial cluster)`, no I/O, no model handles, no fixed
-speaker count. It is meant to move into `crates/tinta-engine-rs` unchanged. It
-has unit tests for merging, keeping speakers apart, "nearest voice, not nearest
-time", the speech-share guard and empty input.
+speaker count. It is meant to move into `crates/tinta-engine-rs`; the unit
+builder is part of the recipe but still lives in `main.rs` (see "For the
+engine"). It handles failed embeddings without panicking: a zero, empty or
+non-finite embedding is excluded from the centroids and its unit joins the
+largest final cluster. Unit tests cover merging, keeping speakers apart,
+"nearest voice, not nearest time", the cached distance matrix, NaN and failed
+embeddings, empty input, and golden extracts of the cached embeddings.
 
 Units, not segments: consecutive segments of the same cluster less than 0.5 s
 apart are joined into one *unit* before embedding, so a 0.3 s fragment never
@@ -60,9 +70,13 @@ gets an embedding of its own (an embedding needs a few hundred ms of voice).
 
 Cost: the step needs one embedding per turn, which sherpa-onnx's diarization API
 does not expose, so the harness computes them again. Measured as process CPU at
-2 threads: **30-62 CPU-s per 27-37 min meeting, +15-30% on top of the
-diarization stage** (150-300 CPU-s). In the engine the same pass would produce
-the per-turn embeddings the clustering needs, so the step itself is free.
+2 threads: **30-62 CPU-s per 27-37 min meeting, +14-33% on top of the
+diarization stage**. The two measured pairs are IS1008b 30.4/222.9 CPU-s (14%)
+and EN2002a 61.9/187.8 (33%); the other runs fall between. The ES2004b
+CAMPPlus embedding pass was never measured (its bootstrap file is missing), so
+it is not part of that range. In the engine the same pass can produce the
+per-turn embeddings the clustering needs from a lower-level pipeline; with
+sherpa-onnx's high-level diarization API it is an extra pass, not free.
 
 ### Embedding model
 
@@ -111,34 +125,37 @@ minutes of audio and 150-300 CPU-s, and the host is shared with another
 project. The four cover all four families in the test list (ES, IS, TS, EN) and
 146 minutes of audio.
 
-In this split TS3003b, ES2011c and IS1008b are training meetings for pyannote
-segmentation 3.0, so that model has seen them. That is a property of the
-published setup; it makes the numbers comparable to the published ones.
+None of these six meetings is in the setup's `lists/train.meetings.txt`:
+IS1008b and ES2011c are dev (validation) meetings and the other four are test.
+The earlier benchmark document's note that **TS3007b and ES2003b** are training
+meetings applies to those two meetings, not to the ones used here.
 
 ## Scoring
 
 `scripts/fork/bench/score.py`:
 
 - `der_pyannote`: `pyannote.metrics` `DiarizationErrorRate` over the full-file
-  UEM from the setup's `.uem`, `skip_overlap=False`, collar 0 s primary and
-  0.25 s next to it. Miss, false alarm and confusion are reported separately,
-  each divided by reference speech time.
+  UEM from the setup's `.uem`, `skip_overlap=False`. Primary is collar 0 s.
+  pyannote's `collar=0.25` is a **0.25 s total** collar, i.e. **+/-0.125 s**;
+  +/-0.25 s is `collar=0.5`. Both are reported next to the no-collar number.
+  Miss, false alarm and confusion are reported separately, each divided by
+  reference speech time.
 - `oracle`: maps every hypothesis cluster to the reference speaker it overlaps
   most (many-to-one, several clusters may map to one speaker) and re-scores.
-  This is the bound on what relabelling the existing clusters can achieve. It is
-  reported for the raw clusters and for the final output.
+  This is a reference for what relabelling the existing clusters achieves, not
+  a lower bound: reassigning individual turns can beat it. It is reported for
+  the raw clusters and for the final output.
 - Speaker-count accuracy: final cluster count against the reference count, per
   meeting and per model. No `num_clusters` is ever passed to sherpa-onnx
   (`--num-speakers -1`).
 
 ## Tuning on dev
 
-The only knobs are `merge_distance` and `min_share` (`protect_share` and
-`min_loyalty` were tested and are disabled; see below). The sweep ran on the two
-dev meetings only, against the dev RTTMs, 0.10-0.35 in steps of 0.05 and 0-5% of
-speech:
+The only knobs are `merge_distance` and `min_share`. The sweep ran on the two
+dev meetings only, against the dev RTTMs, 0.10-0.30 in steps of 0.05 and
+2/3/5% of speech; `diarization.sh sweep` reproduces that grid.
 
-Both dev meetings, baseline over-clustering at 0.7, no loyalty guard:
+Both dev meetings, baseline over-clustering at 0.7:
 
 | `merge_distance` | `min_share` | CAMPPlus mean DER | WeSpeaker mean DER | speakers, CAMPPlus (IS1008b / ES2011c) |
 |---|---|---|---|---|
@@ -148,54 +165,80 @@ Both dev meetings, baseline over-clustering at 0.7, no loyalty guard:
 | **0.15** | **3%** | **17.4%** | **17.8%** | **4/4, 4/4** |
 | 0.15 | 5% | 17.4% | 17.8% | 4/4, 4/4 |
 | 0.20 | 2% | 17.5% | 18.3% | 4/4, 4/4 |
-| 0.20 | 3% | 17.5% | 18.3% | 4/4, 5/4 |
+| 0.20 | 3% | 17.5% | 18.3% | 4/4, 4/4 |
 | 0.25 | 3% | 34.5% | 34.4% | 4/4, **2/4** |
 | 0.30 | 3% | 43.1% | 56.2% | 4/4, **1/4** |
 
 `min_share` above 2% is what fixes ES2011c: at 2% a 2.1% cluster survives and
 the count is 5. The dev surface is flat between `merge_distance` 0.10 and 0.20
-(17.4-17.9% mean, correct count everywhere) and between 3% and 9% of speech;
-0.25 already collapses ES2011c to 2 speakers (57% DER) and 0.30 to one. The
-frozen choice is
+(17.4-17.9% mean, correct count everywhere) and flat between 2% and 5% of
+speech for CAMPPlus; the 5-9% band was only swept for WeSpeaker. The frozen
+choice is
 
 | Setting | Value |
 |---|---|
 | over-clustering `threshold` | 0.7 |
 | `merge_distance` | **0.15** (cosine distance between centroids) |
 | `min_share` | **3%** of speech |
-| `protect_share` | 0 (off) |
-| `min_loyalty` | 0 (off) |
 | `num_speakers` | -1 (never fixed) |
+
+These are the code defaults (`Options::default()` and the `postcluster` CLI).
 
 The tie between 0.15 and 0.20 is broken towards the smaller distance: merging
 two speakers costs ~25 DER points, failing to merge a split costs ~1, so the
 conservative side is worth a tenth of a point.
 
-Two extra guards were implemented and measured but did **not** help, so they are
-off by default:
+Two more stopping rules were implemented and measured in the first pass, then
+**removed from the code** rather than kept as dead knobs:
 
-- `min_loyalty` dissolves a cluster when fewer than that fraction of its own
-  turns are nearest to its own centroid. On CAMPPlus it fails exactly where it
+- `min_loyalty` dissolved a cluster when fewer than that fraction of its own
+  turns were nearest to its own centroid. On CAMPPlus it failed exactly where it
   should help: at `merge_distance` 0.25 the fourth speaker of ES2004b maps to
   85% one reference speaker but only 41% of its turns are individually nearest
-  to its own centroid, so loyalty 0.5 dissolves a real speaker (3 clusters,
-  27.6% DER, against 16.8% with the guard off). At the frozen 0.15/3% it happens
-  to be inert on ES2004b, but it adds no safety, so it stays at 0.
+  to its own centroid, so loyalty 0.5 dissolved a real speaker (3 clusters,
+  27.6% DER, against 16.8% with the guard off). At the frozen 0.15/3% it is
+  inert on ES2004b. That decision used ES2004b, a test meeting; see the
+  held-out note below.
 - `protect_share` (never merge two clusters that both exceed a speech share)
-  does nothing the distance threshold does not already do on these meetings,
+  did nothing the distance threshold did not already do on these meetings,
   because the closest pair is rarely two large clusters before the threshold is
   already too high.
 
-Both stay in `Options` because they are the stopping rules the engine may need
-for other data, but the frozen defaults are 0.
+## Held-out discipline (what was touched when)
+
+The test meetings were not untouched before the freeze, and the artifact
+timestamps cannot prove the freeze order:
+
+- `score-raw-ES2004b` and `oracle-raw-ES2004b` are from 02:58, before any dev
+  sweep. ES2004b was scored before tuning.
+- The first test outputs (`pc/bootstrap-{IS1009b,EN2002a,TS3003b}-campplus`,
+  03:11-03:45) were produced at the **old defaults** (0.25 / 2% / loyalty 0.5)
+  and are not the numbers in this document. The frozen test runs are the
+  `m0.15-s0.03` files at 03:48.
+- The dev CAMPPlus files behind the dev table were rewritten at 04:30-04:35,
+  *after* those test runs. A pre-test dev sweep existed at 03:1x-03:3x but was
+  overwritten, so its exact contents cannot be re-checked. The WeSpeaker dev
+  sweep (05:00-05:02) also ran after the WeSpeaker test runs (04:58).
+- The `min_loyalty` decision described above used ES2004b (test) results at
+  `merge_distance` 0.25. The guard was removed, not tuned in.
+
+The impact looks low because the test surface is flat around the frozen point
+(see the sensitivity table): the settings within +/-0.05 and +/-1% of speech
+move the test mean by at most ~1.1 points. Next time the frozen configuration
+should be committed before any test run, and the sweep artifacts kept.
+
+The split itself is clean: dev and test meetings are disjoint, and
+`dev.speakers.txt` ∩ `test.speakers.txt` is empty. No reference information
+reaches the system: `--num-speakers -1`, threshold 0.7, no speaker count or
+labels are passed, and the UEMs are whole-file (0 to the audio end).
 
 ## Results
 
 Frozen settings from the dev table above, run once per test meeting. `raw` is
 the over-clustered output at threshold 0.7 with no post-processing; `+ time
 filter` is task #2's method (dissolve clusters under 2% and reassign by temporal
-proximity); `post-cluster` is the new step. Oracle is the many-to-one mapping
-bound of the clusters in that column of the table.
+proximity); `post-cluster` is the new step. Oracle maps the clusters in that
+column to their best reference speaker.
 
 ### Ablation: which step does the work
 
@@ -220,7 +263,7 @@ One row per model and meeting. Both models start from the **same**
 over-clustered partition (see "Why the model comparison uses a shared partition"
 below), so the `raw` rows are identical.
 
-| Meeting | Model | Variant | Clusters | DER no collar | DER 0.25 collar | miss / FA / conf | Oracle |
+| Meeting | Model | Variant | Clusters | DER no collar | DER +/-0.125 s | miss / FA / conf | Oracle |
 |---|---|---|---|---|---|---|---|
 | ES2004b | CAMPPlus | raw th 0.7 | 30 | 22.4% | 17.6% | 9.1 / 4.4 / 8.9 | 16.6% |
 | ES2004b | CAMPPlus | + time filter | 6 | 21.5% | 16.9% | 9.1 / 4.4 / 8.9 | 16.6% |
@@ -252,7 +295,7 @@ below), so the `raw` rows are identical.
 Reference count from the RTTM; the pipeline is never told it. Before
 post-clustering the raw counts were 28-60, and task #2's time filter got 5-6.
 
-### Oracle mapping bound
+### Oracle mapping on the raw clusters
 
 | Model | Meeting | Raw DER (clusters) | Raw oracle | Final DER (clusters) | Final oracle |
 |---|---|---|---|---|---|
@@ -265,12 +308,37 @@ post-clustering the raw counts were 28-60, and task #2's time filter got 5-6.
 | WeSpeaker | TS3003b | 25.0% (28) | 14.0% | 13.8% (4) | 13.8% |
 | WeSpeaker | EN2002a | 45.5% (60) | 28.5% | 32.5% (5) | 29.3% |
 
-On CAMPPlus the final DER is within 0.4 points of the oracle bound of the same
-output on all four meetings, and at or below the oracle bound of the *raw*
-clusters on three of four. Reassigning individual turns by voice is
-finer-grained than mapping whole clusters, which is why ES2004b (16.5) and
-IS1009b (14.8) beat their own raw-cluster oracle (16.6 and 15.3). **The
-cluster-merging failure the first review identified is closed.**
+On CAMPPlus the final DER is within **0.5 points** of the raw-cluster oracle on
+all four meetings. It is *below* that oracle on ES2004b (16.5 vs 16.6) and
+IS1009b (14.8 vs 15.3), because reassigning individual turns by voice is
+finer-grained than mapping whole clusters; that also shows the oracle is not a
+lower bound. TS3003b is 0.1 point above it, EN2002a 0.4. The clustering failure
+the first review identified is no longer the dominant error on these meetings.
+
+The row for the *final* output in the raw-oracle table is not independent
+evidence: with four clusters mapping to four distinct reference speakers, the
+many-to-one mapping is just the 1:1 mapping, so final DER and final oracle are
+the same number. Only the raw-oracle comparison says something about how much
+clustering error is left.
+
+### Sensitivity around the frozen point
+
+Re-scoring cached embeddings, reporting only (this was not used to tune the
+frozen value, and no model was re-run). Each cell is DER at `min_share` 2/3/4%;
+`(5)` marks a five-speaker output, `(2 spk)` a collapse.
+
+| Meeting | 0.10 | 0.15 | 0.20 | 0.25 |
+|---|---|---|---|---|
+| ES2004b | 18.7 (5) / 16.5 / 16.5 | 16.5 x3 | 16.5 x3 | 16.8 |
+| IS1009b | 14.8 | 14.8 | 15.0 | 15.0 |
+| TS3003b | 14.1 | 14.1 | 14.1 | 14.3 |
+| EN2002a | 31.7 (5) / 31.7 (5) / 28.8 | 28.9 | 29.0 | **53.1 (2 spk)** |
+| ES2011c (dev) | 24.8 (5) / 23.0 / 23.0 | 23.9 (5) / 22.9 / 22.9 | 23.1 | **57.2 (2 spk)** |
+
+Moving `merge_distance` by +/-0.05 and `min_share` by +/-1 point moves the test
+mean by at most about **+1.1 points** (0.10 / 2%). Below 0.15 the method fails
+gently, with one extra speaker; at 0.25 it fails hard, collapsing EN2002a and
+the dev ES2011c to 2 speakers. 0.15 keeps a 0.10 margin on the hard side.
 
 ### Why the model comparison uses a shared partition
 
@@ -283,8 +351,9 @@ over-clustering threshold per model would need a full diarization run per model
 per meeting (25 minutes each on this host), so the comparison holds the
 partition fixed instead: both models start from the same CAMPPlus turns at 0.7
 and only the embeddings used by the merge and reassign steps differ. That
-isolates the question the task asks — which embedding recovers the speaker
-structure better from the same over-clustered input.
+isolates the question the task asks -- which embedding recovers the speaker
+structure better from the same over-clustered input -- and it is not a test of
+a full WeSpeaker pipeline.
 
 The consequence for the engine: 0.7 is a safe default **for CAMPPlus only**. If
 the engine ever swaps in another embedding model it must re-tune (or estimate)
@@ -293,23 +362,66 @@ the over-clustering threshold; the merge distance does not transfer either, but
 
 ### What is left
 
-- **EN2002a at 28.9%** is the outlier and its oracle bound is 28.5%, so no
-  relabelling of these segments can improve it. Its reference has 27.4%
-  overlapped speech and the pipeline labels 39.5 min of speech where the
-  `only_words` reference has 31.6 min: backchannels and vocal sounds that the
-  reference excludes become false alarms, and overlapped speech becomes misses
-  (12.2%) and confusion (11.0%). It also has the worst raw clustering of the
-  four (60 clusters, 54-69% purity on the top clusters).
-- **The 0.25 s collar removes 4-5 points** on every meeting (16.5 -> 12.2,
-  14.8 -> 10.3, 14.1 -> 10.0, 28.9 -> 24.2). That is boundary jitter from the
-  segmenter's 1 s hop, not a speaker error.
+- **EN2002a at 28.9%** is the outlier and its raw-cluster oracle is 28.5%, so
+  little of it is clustering. Its reference has 27.4% overlapped speech and the
+  pipeline labels 39.5 min of speech where the `only_words` reference has
+  31.6 min: backchannels and vocal sounds that the reference excludes become
+  false alarms, and overlapped speech becomes misses (12.2%) and confusion
+  (11.0%). It also has the worst raw clustering of the four (60 clusters,
+  54-69% purity on the top clusters).
+- **The +/-0.125 s collar removes 4-5 points** on every meeting (16.5 -> 12.2,
+  14.8 -> 10.3, 14.1 -> 10.0, 28.9 -> 24.2). At the usual **+/-0.25 s**
+  (pyannote `collar=0.5`) the same runs score **ES2004b 9.2%, IS1009b 7.3%,
+  TS3003b 7.5%, EN2002a 20.8%**. That is boundary jitter from the segmenter's
+  1 s hop, not a speaker error.
 - **False alarm stays at 3-7%** because the segmenter labels non-word vocal
   sounds as speech and the `only_words` reference does not.
 - **WeSpeaker leaves 5.9%/7.8% clusters on IS1009b/EN2002a.** Those are splits
   of a real speaker at a distance its compressed space does not reach, and the
   dev meetings have no cluster in the 3-9% band to tune `min_share` against, so
   the frozen 3% keeps them. Raising `min_share` for WeSpeaker on test would be
-  tuning on test; the honest result is the table above.
+  tuning on test; the honest result is the table above -- WeSpeaker is not
+  shown to be better (2 of 4 tie), and its embedding pass costs 82-133 CPU-s
+  per meeting against 30-62 for CAMPPlus.
+- **The 3% rule has a real risk: it erases a genuine speaker who holds less
+  than 3% of the diarized segment time.** Any speaker under that share is
+  dissolved into a neighbour by embedding, however distinct their voice. The
+  AMI meetings here all have four roughly balanced speakers and do not test
+  this. A user-facing merge/split/rename override is still required for
+  meetings with quiet participants.
+
+## For the engine
+
+The engine port (`crates/tinta-engine-rs`, task #9) should carry exactly this:
+
+1. **`recluster` with two settings**: centroid merge at `merge_distance = 0.15`
+   plus dissolve/reassign at `min_share = 0.03`. No loyalty guard, no
+   protect-share guard; they are absent from the code now. Make 0.15/3% the
+   API defaults, not an opt-in.
+2. **The unit builder from `main.rs`**, which is part of the recipe:
+   - join segments of the same cluster with gaps of 0.5 s or less, capped at
+     15 s;
+   - pad units shorter than 0.8 s symmetrically before embedding;
+   - compute one embedding per unit.
+   The thresholds were tuned on these units, not on raw segments.
+3. **State the coupling in the API docs**: 0.7 over-clustering and 0.15/3% are
+   valid **for CAMPPlus only**. Any other embedding model needs its own
+   over-clustering threshold and its own merge distance.
+4. **Hardening**:
+   - keep a distance matrix between rounds instead of recomputing all pairs
+     (done here);
+   - make NaN-safe comparisons and never panic on a non-finite embedding
+     (done here);
+   - send failed-embedding units to the largest cluster (done here);
+   - log, and ideally expose to the UI, when the dissolve drops a large share
+     of the speech or collapses many clusters to one, so the merge/split/rename
+     override can be offered (not implemented);
+   - compute `min_share` on non-overlapped time, or document that it is a share
+     of summed unit durations with overlap counted twice (documented here).
+5. **Per-turn embeddings**: the high-level sherpa diarization API does not
+   expose them. Plan either an extra embedding pass, measured at +14-33% of
+   diarization CPU, or a lower-level pipeline that keeps the per-turn
+   embeddings.
 
 ## Reproduction
 
@@ -330,13 +442,14 @@ cd scripts/fork/bench && cargo build --release -j2 && cargo test --release -j2 &
 scripts/fork/bench/diarization.sh raw
 
 # 2. sweep the settings on the dev meetings only
+#    (merge 0.10-0.30 in steps of 0.05, min_share 2/3/5%)
 scripts/fork/bench/diarization.sh sweep
 
-# 3. frozen settings on the test meetings (4 runs per model; the defaults in
-#    the script are already 0.15 / 3% / no loyalty guard)
+# 3. frozen settings on the test meetings (4 runs per model; the script and the
+#    code defaults are already 0.15 / 3%)
 scripts/fork/bench/diarization.sh test
 
-# 4. oracle mapping bound, raw clusters and final output
+# 4. oracle mapping, raw clusters and final output
 scripts/fork/bench/diarization.sh oracle
 
 # 5. the tables above
@@ -357,13 +470,13 @@ nice -n 19 scripts/fork/bench/target/release/tinta-bench postcluster \
   --wav "$ROOT/data/ES2004b.Mix-Headset.wav" \
   --diar "$ROOT/results/diar-ES2004b-campplus.json" \
   --embedding "$ROOT/models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx" \
-  --threads 2 --spin 0 --merge-threshold 0.15 --min-share 0.03 --min-loyalty 0 \
+  --threads 2 --spin 0 --merge-threshold 0.15 --min-share 0.03 \
   --embeddings "$ROOT/results/emb-ES2004b-campplus.json" \
-  --output "$ROOT/results/pc-ES2004b-campplus-m0.15-l0-s0.03.json"
+  --output "$ROOT/results/pc-ES2004b-campplus-m0.15-s0.03.json"
 
 "$ROOT/venv/bin/python" scripts/fork/bench/score.py score \
   --ref "$ROOT/results/ref-ES2004b.json" \
-  --result "$ROOT/results/pc-ES2004b-campplus-m0.15-l0-s0.03.json" \
+  --result "$ROOT/results/pc-ES2004b-campplus-m0.15-s0.03.json" \
   --small-cluster-fraction 0 \
   --out "$ROOT/results/score-pc-ES2004b.json"
 
@@ -378,30 +491,42 @@ The reference JSON is built from the pinned RTTM with
 `diarization.sh` (`build_refs`) does it for every meeting from the setup
 directory.
 
+The golden fixtures in `scripts/fork/bench/tests/data/` are generated from the
+cached embeddings with
+`ROOT=... python3 scripts/fork/bench/make_golden_fixtures.py`; they are about
+3-5 KB each, contain no audio, one selected unit embedding per row and the
+reference speaker of that unit. The reference tag is used only to check that
+the pinned assignment is one label per speaker and never by the algorithm.
+`cargo test` pins the speaker counts, the exact label sequence and that
+partition.
+
 ## Remaining gap and what to do next
 
-1. **The clustering step is solved for these four meetings.** Raising the DER
-   further needs a better front end, not a better merge. The next lever is the
-   segmenter's boundary precision (the 0.25 s collar is worth 4-5 points) and its
-   false alarms on non-word vocal sounds (3-7%).
+1. **Clustering is no longer the main lever on these four meetings.** The final
+   DER is within 0.5 points of the raw-cluster oracle. Raising it further needs
+   a better front end: the segmenter's boundary precision (the +/-0.125 s
+   collar is worth 4-5 points) and its false alarms on non-word vocal sounds
+   (3-7%).
 2. **EN2002a is a front-end/reference problem.** A meeting with 27% overlap and
    many backchannels is scored against `only_words`, so the ceiling is about
    28%. Do not tune the clustering on it; report it separately.
 3. **Five or more speakers, and recordings with a long silence, are untested.**
-   The AMI meetings here all have four. The algorithm has no speaker-count prior,
-   but `min_share` is a share of *speech*, so a speaker who talks very little is
-   the first thing it would dissolve — the user override (merge/split/rename)
-   still matters.
-4. **The engine must expose the per-turn embeddings** so that step 3 is free;
-   with sherpa-onnx's high-level diarization API it costs one extra embedding
-   pass (+15-30% of the stage, 30-62 CPU-s per meeting).
+   The AMI meetings here all have four. The algorithm has no speaker-count
+   prior, and `min_share` is a share of *speech*, so a real speaker with less
+   than 3% of the speech is the first thing it dissolves -- the user override
+   (merge/split/rename) still matters.
+4. **The engine must expose the per-turn embeddings** so that step 3 costs no
+   extra pass; with sherpa-onnx's high-level diarization API it costs one extra
+   embedding pass (+14-33% of the stage, 30-62 CPU-s per meeting).
 
 ## Files
 
 | Path | Purpose |
 |---|---|
 | `scripts/fork/bench/src/clustering.rs` | the post-clustering function + unit tests |
-| `scripts/fork/bench/src/main.rs` | new `postcluster` subcommand (embeddings + merge) |
+| `scripts/fork/bench/src/main.rs` | new `postcluster` subcommand (embeddings, units, merge) |
+| `scripts/fork/bench/tests/data/golden-*.json` | small cached-embedding extracts pinned by tests |
+| `scripts/fork/bench/make_golden_fixtures.py` | regenerates the golden extracts from the cache |
 | `scripts/fork/bench/score.py` | `ref-rttm`, `oracle`, `--uem` |
 | `scripts/fork/bench/sweep_diar.py` | dev-only settings sweep on cached embeddings |
 | `scripts/fork/bench/diarization.sh` | raw runs, sweep, test runs, oracle |
@@ -415,8 +540,8 @@ Results, embeddings caches, logs and audio live in
 
 - Four of the sixteen test meetings, and two dev meetings. The host is shared
   with another project and one diarization run takes 10-30 minutes of wall time
-  at `nice 19` and two threads; more meetings would not change the conclusion
-  (the oracle bound is already reached) but would tighten the mean.
+  at `nice 19` and two threads; more meetings would tighten the mean and
+  exercise the 3% risk, not change the clustering conclusion on these four.
 - The reference is `only_words`, so non-word vocal sounds count as false alarms.
   That inflates DER by a few points on the meeting with the most backchannels
   (EN2002a). The same reference is used for every model and every variant.

@@ -995,8 +995,6 @@ fn run_postcluster(
         "embedding_model": embedding,
         "merge_distance": opts.merge_distance,
         "min_share": opts.min_share,
-        "min_loyalty": opts.min_loyalty,
-        "protect_share": opts.protect_share,
         "unit_gap": unit_gap,
         "unit_max": unit_max,
         "min_unit": min_unit,
@@ -1006,6 +1004,7 @@ fn run_postcluster(
         "merges": outcome.merges,
         "dissolved": outcome.dissolved,
         "reassigned": outcome.reassigned,
+        "failed_units": outcome.failed_units,
         "shares": shares.iter().map(|(l, s)| json!({"speaker": l, "seconds": s, "share": if total > 0.0 { s / total } else { 0.0 }})).collect::<Vec<_>>(),
         "embedding_seconds": embedding_seconds,
         "embeddings_reused": reused,
@@ -1126,10 +1125,8 @@ fn main() {
 
     if args.cmd == "postcluster" {
         let opts = ClusterOptions {
-            merge_distance: args.f32_or("merge-threshold", 0.25),
-            min_share: args.f32_or("min-share", 0.02),
-            min_loyalty: args.f32_or("min-loyalty", 0.5),
-            protect_share: args.f32_or("protect-share", 0.0),
+            merge_distance: args.f32_or("merge-threshold", 0.15),
+            min_share: args.f32_or("min-share", 0.03),
         };
         let block = run_postcluster(
             &args.req("diar"),
@@ -1159,12 +1156,11 @@ fn main() {
                 "merges": block["merges"],
                 "dissolved": block["dissolved"],
                 "reassigned": block["reassigned"],
+                "failed_units": block["failed_units"],
                 "units": block["units"],
                 "shares": block["shares"],
                 "merge_distance": block["merge_distance"],
                 "min_share": block["min_share"],
-                "min_loyalty": block["min_loyalty"],
-                "protect_share": block["protect_share"],
                 "embedding_seconds": block["embedding_seconds"],
                 "embeddings_reused": block["embeddings_reused"],
                 "stage_seconds": block["stage_seconds"],
@@ -1176,8 +1172,7 @@ fn main() {
                 "threshold": serde_json::Value::Null,
                 "merge_distance": block["merge_distance"],
                 "min_share": block["min_share"],
-                "min_loyalty": block["min_loyalty"],
-                "protect_share": block["protect_share"],
+                "failed_units": block["failed_units"],
                 "clusters_before": block["clusters_before"],
                 "process_seconds": block["stage_seconds"],
                 "rtf": block["stage_seconds"].as_f64().unwrap_or(0.0) / audio_s,

@@ -44,9 +44,9 @@ embedding_for() {
 # the embeddings (see docs/fork/diarization.md).
 PARTITION_TAG="${PARTITION_TAG:-campplus}"
 
-# Frozen after the dev sweep; see docs/fork/diarization.md.
+# Frozen after the dev sweep; the code defaults match these. See
+# docs/fork/diarization.md.
 MERGE="${MERGE:-0.15}"
-LOYALTY="${LOYALTY:-0}"
 SHARE="${SHARE:-0.03}"
 
 # Reference JSON from the pinned BUT RTTM. The setup's own test/dev lists decide
@@ -94,7 +94,7 @@ run_raw() {
           --wav "$wav" --diar "$raw" \
           --embedding "$(embedding_for "$model")" \
           --threads "$THREADS" --spin 0 \
-          --merge-threshold "$MERGE" --min-share "$SHARE" --min-loyalty "$LOYALTY" \
+          --merge-threshold "$MERGE" --min-share "$SHARE" \
           --embeddings "$emb" \
           --output "$ROOT/results/pc/bootstrap-$meeting-$model.json" \
           >"$ROOT/logs/emb-$meeting-$model.out" 2>&1
@@ -108,24 +108,23 @@ sweep() {
   "$PY" "$BENCH/scripts/fork/bench/sweep_diar.py" \
     --meetings "$(echo $DEV | tr ' ' ',')" \
     --diar-tag "$PARTITION_TAG" \
-    --merge 0.15,0.20,0.25,0.30,0.35 \
-    --loyalty 0,0.3,0.5 \
-    --min-share 0.0,0.01,0.02,0.03 \
+    --merge 0.10,0.15,0.20,0.25,0.30 \
+    --min-share 0.02,0.03,0.05 \
     --table "$ROOT/results/sweep.md"
 }
 
-run_one() { # meeting model merge loyalty share
-  local meeting="$1" model="$2" merge="$3" loyalty="$4" share="$5"
+run_one() { # meeting model merge share
+  local meeting="$1" model="$2" merge="$3" share="$4"
   local wav="$ROOT/data/$meeting.Mix-Headset.wav"
   local raw
   raw="$(partition_for "$meeting")"
   local emb="$ROOT/results/emb-$meeting-$model.json"
-  local name="pc-$meeting-$model-m${merge}-l${loyalty}-s${share}"
+  local name="pc-$meeting-$model-m${merge}-s${share}"
   nice -n 19 "$BIN" postcluster \
     --wav "$wav" --diar "$raw" \
     --embedding "$(embedding_for "$model")" \
     --threads "$THREADS" --spin 0 \
-    --merge-threshold "$merge" --min-share "$share" --min-loyalty "$loyalty" \
+    --merge-threshold "$merge" --min-share "$share" \
     --embeddings "$emb" \
     --output "$ROOT/results/$name.json" >"$ROOT/logs/$name.out" 2>&1
   "$PY" "$SCORE" score \
@@ -138,7 +137,7 @@ run_one() { # meeting model merge loyalty share
 
 run_test() {
   for model in $MODELS; do
-    for meeting in $TEST; do run_one "$meeting" "$model" "$MERGE" "$LOYALTY" "$SHARE"; done
+    for meeting in $TEST; do run_one "$meeting" "$model" "$MERGE" "$SHARE"; done
   done
 }
 
@@ -147,7 +146,7 @@ run_oracle() {
     for meeting in $TEST; do
       local raw
       raw="$(partition_for "$meeting")"
-      local fin="$ROOT/results/pc-$meeting-$model-m${MERGE}-l${LOYALTY}-s${SHARE}.json"
+      local fin="$ROOT/results/pc-$meeting-$model-m${MERGE}-s${SHARE}.json"
       "$PY" "$SCORE" oracle --ref "$ROOT/results/ref-$meeting.json" \
         --result "$raw" --out "$ROOT/results/oracle-raw-$meeting-$model.json" >/dev/null
       "$PY" "$SCORE" oracle --ref "$ROOT/results/ref-$meeting.json" \
@@ -158,7 +157,7 @@ run_oracle() {
 
 tables() {
   "$PY" "$BENCH/scripts/fork/bench/diarization_tables.py" \
-    --merge "$MERGE" --loyalty "$LOYALTY" --share "$SHARE" \
+    --merge "$MERGE" --share "$SHARE" \
     --models "$(echo $MODELS | tr ' ' ',')" \
     --meetings "$(echo $TEST | tr ' ' ',')" \
     --out "$ROOT/results/tables.md"

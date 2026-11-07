@@ -5,7 +5,7 @@ Reads the runs produced by `diarization.sh` in $ROOT/results and prints:
 
   1. model x clustering variant, per test meeting (DER, collar, speakers).
   2. speaker-count accuracy per model and configuration.
-  3. the oracle mapping bound (raw clusters vs final clusters).
+  3. the oracle mapping of the raw and final clusters (a reference, not a bound).
 """
 import argparse
 import json
@@ -50,9 +50,8 @@ def pct(v):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--merge", type=float, default=0.25)
-    ap.add_argument("--loyalty", type=float, default=0.0)
-    ap.add_argument("--share", type=float, default=0.02)
+    ap.add_argument("--merge", type=float, default=0.15)
+    ap.add_argument("--share", type=float, default=0.03)
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--meetings", required=True)
     ap.add_argument("--out", default=None)
@@ -65,7 +64,7 @@ def main():
     lines.append("### Model x clustering")
     lines.append("")
     lines.append(
-        "| Meeting | Model | Variant | Clusters | DER no collar | DER 0.25 s collar "
+        "| Meeting | Model | Variant | Clusters | DER no collar | DER +/-0.125 s "
         "| miss / FA / conf | Oracle DER |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
@@ -77,7 +76,7 @@ def main():
             ref = os.path.join(ROOT, "results", f"ref-{meeting}.json")
             final = os.path.join(
                 ROOT, "results",
-                f"pc-{meeting}-{model}-m{args.merge:g}-l{args.loyalty:g}-s{args.share:g}.json",
+                f"pc-{meeting}-{model}-m{args.merge:g}-s{args.share:g}.json",
             )
             raw = raw_source(meeting, model, final)
             # Raw over-clustered output, scored the way task #2 scored it.
@@ -131,7 +130,7 @@ def main():
         lines.append(f"| {model} | **all** | | | | | **{ok}/{total}** |")
 
     lines.append("")
-    lines.append("### Oracle mapping bound")
+    lines.append("### Oracle mapping (raw clusters vs final)")
     lines.append("")
     lines.append("| Model | Meeting | Raw DER (clusters) | Raw oracle | Final DER (clusters) | Final oracle |")
     lines.append("|---|---|---|---|---|---|")
@@ -140,7 +139,7 @@ def main():
             ref = os.path.join(ROOT, "results", f"ref-{meeting}.json")
             final = os.path.join(
                 ROOT, "results",
-                f"pc-{meeting}-{model}-m{args.merge:g}-l{args.loyalty:g}-s{args.share:g}.json",
+                f"pc-{meeting}-{model}-m{args.merge:g}-s{args.share:g}.json",
             )
             raw = raw_source(meeting, model, final)
             r0 = score(ref, raw, os.path.join(ROOT, "results", f"score-table-raw0-{meeting}-{model}.json"), 0.0)

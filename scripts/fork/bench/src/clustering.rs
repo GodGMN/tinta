@@ -10,13 +10,21 @@
 //! 2. Clusters are merged agglomeratively, closest centroid pair first, while
 //!    the cosine distance between the two centroids stays below
 //!    `merge_distance`.
-//! 3. Clusters that still hold less than `min_share` of the speech are
-//!    dissolved; each of their units goes to the centroid it is closest to in
-//!    embedding space. That is the important part: a tiny cluster is a piece of
-//!    somebody's voice, not the speaker who happens to talk next to it.
+//! 3. Clusters that still hold less than `min_share` of the diarized segment
+//!    time are dissolved; each of their units goes to the centroid it is
+//!    closest to in embedding space. That is the important part: a tiny cluster
+//!    is a piece of somebody's voice, not the speaker who happens to talk next
+//!    to it.
 //!
 //! The whole thing is a pure function over (embedding, seconds) pairs so it can
-//! move into `crates/tinta-engine-rs` unchanged.
+//! move into `crates/tinta-engine-rs` unchanged. The frozen settings
+//! ([`Options::default`]) are tuned on CAMPPlus embeddings extracted from an
+//! over-clustered partition at threshold 0.7; another embedding model needs its
+//! own over-clustering threshold and its own merge distance.
+//!
+//! Two stopping rules from the first experiment, a loyalty guard and a
+//! "protect large clusters from merging" guard, measured as useless and were
+//! removed rather than carried as dead knobs.
 
 /// One unit of speech with the embedding of its audio. A unit is a run of
 /// segments that the front end already believes is one speaker turn; it is the
@@ -28,6 +36,8 @@ pub struct Unit {
     /// Cluster id from the over-clustered front end.
     pub cluster: usize,
     /// Speaker embedding of the unit audio, any length. It is normalized here.
+    /// A zero or non-finite vector marks a failed extraction; such a unit is
+    /// not used for any centroid and joins the largest final cluster.
     pub embedding: Vec<f32>,
 }
 
@@ -41,32 +51,27 @@ impl Unit {
 pub struct Options {
     /// Cosine distance between two centroids below which they are merged.
     pub merge_distance: f32,
-    /// Clusters holding less than this share of the speech are dissolved and
-    /// their units are reassigned by embedding. 0 disables the step.
+    /// Clusters holding less than this share of the diarized segment time are
+    /// dissolved and their units are reassigned by embedding. 0 disables the
+    /// step. The share is computed over the summed unit durations, so
+    /// overlapping units count twice and gaps of up to the unit-join limit
+    /// inside a unit count as speech.
     pub min_share: f32,
-    /// A cluster whose own units are nearest to another centroid more than
-    /// `1 - min_loyalty` of the time is a mixed bag, not a speaker; it is
-    /// dissolved and its units are reassigned by embedding. 0 disables it.
-    pub min_loyalty: f32,
-    /// Two clusters that both hold at least this share of the speech are never
-    /// merged, whatever their distance. 0 disables the guard. This is the
-    /// "never merge two people who both talk a lot" stopping rule.
-    pub protect_share: f32,
 }
 
 impl Default for Options {
+    /// The frozen recipe from the task #18 dev sweep. These are also the
+    /// defaults of the `postcluster` command and the values the engine should
+    /// ship. Valid for CAMPPlus at an over-clustering threshold of 0.7.
     fn default() -> Self {
-        // Tuned on AMI dev only; see docs/fork/diarization.md.
         Options {
-            merge_distance: 0.25,
-            min_share: 0.02,
-            min_loyalty: 0.5,
-            protect_share: 0.0,
+            merge_distance: 0.15,
+            min_share: 0.03,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Outcome {
     /// Final cluster label for every input unit, in input order.
     pub labels: Vec<usize>,
@@ -78,26 +83,48 @@ pub struct Outcome {
     pub dissolved: usize,
     /// Number of units reassigned by embedding after the dissolve.
     pub reassigned: usize,
+    /// Number of units whose embedding was empty, zero or non-finite. They
+    /// were excluded from the clustering and assigned to the largest cluster.
+    pub failed_units: usize,
 }
 
-fn l2_normalize(v: &mut [f32]) {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-12 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
+/// L2-normalize in place. Returns false when the vector cannot be used: empty,
+/// containing a non-finite value (a failed model call) or all zeros.
+fn l2_normalize(v: &mut [f32]) -> bool {
+    if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
+        return false;
     }
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if !norm.is_finite() || norm <= 1e-6 {
+        return false;
+    }
+    for x in v.iter_mut() {
+        *x /= norm;
+    }
+    true
 }
 
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    // Both inputs are L2-normalized, so this is 1 - cos.
+    if a.len() != b.len() {
+        return f32::INFINITY;
+    }
+    // Both inputs are L2-normalized, so this is 1 - cos. A NaN from a broken
+    // embedding is treated as "infinitely far apart", never as a close match.
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    (1.0 - dot).max(0.0)
+    if !dot.is_finite() {
+        return f32::INFINITY;
+    }
+    (1.0 - dot).clamp(0.0, 2.0)
 }
 
 /// Duration-weighted, L2-normalized centroid of `members`.
 fn centroid(units: &[Unit], members: &[usize]) -> Vec<f32> {
-    let dim = units.first().map(|u| u.embedding.len()).unwrap_or(0);
+    // Use a member's dimension, not the first input unit's: the first unit may
+    // be a failed extraction with an empty embedding.
+    let dim = members
+        .first()
+        .map(|&i| units[i].embedding.len())
+        .unwrap_or(0);
     let mut acc = vec![0.0f32; dim];
     let mut total = 0.0f32;
     for &i in members {
@@ -124,34 +151,48 @@ struct Cluster {
 
 /// Over-clustered `units` -> a small, stable set of speaker labels.
 pub fn recluster(units: &[Unit], opts: &Options) -> Outcome {
-    let empty = Outcome {
-        labels: Vec::new(),
-        clusters_before: 0,
-        clusters_after: 0,
-        merges: 0,
-        dissolved: 0,
-        reassigned: 0,
-    };
     if units.is_empty() {
-        return empty;
+        return Outcome::default();
     }
+
+    // Distinct initial cluster ids, including clusters that only hold failed
+    // units, so the caller can see what the front end produced.
+    let mut ids: Vec<usize> = units.iter().map(|u| u.cluster).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let clusters_before = ids.len();
 
     let mut normalized: Vec<Unit> = units.to_vec();
-    for u in normalized.iter_mut() {
-        l2_normalize(&mut u.embedding);
+    let mut valid = vec![false; normalized.len()];
+    for (i, u) in normalized.iter_mut().enumerate() {
+        valid[i] = l2_normalize(&mut u.embedding);
     }
     let units = &normalized[..];
+    let failed_units = valid.iter().filter(|v| !**v).count();
 
-    // Group the units by the front end's cluster id.
+    // Group the usable units by the front end's cluster id.
     let mut by_cluster: Vec<(usize, Vec<usize>)> = Vec::new();
     for (i, u) in units.iter().enumerate() {
+        if !valid[i] {
+            continue;
+        }
         match by_cluster.iter_mut().find(|(c, _)| *c == u.cluster) {
             Some((_, m)) => m.push(i),
             None => by_cluster.push((u.cluster, vec![i])),
         }
     }
     by_cluster.sort_by_key(|(c, _)| *c);
-    let clusters_before = by_cluster.len();
+
+    if by_cluster.is_empty() {
+        // Nothing usable: one speaker, as good a guess as any.
+        return Outcome {
+            labels: vec![0; units.len()],
+            clusters_before,
+            clusters_after: 1,
+            failed_units,
+            ..Outcome::default()
+        };
+    }
 
     let mut live: Vec<Cluster> = by_cluster
         .into_iter()
@@ -166,83 +207,98 @@ pub fn recluster(units: &[Unit], opts: &Options) -> Outcome {
         })
         .collect();
 
-    let total: f32 = live.iter().map(|c| c.seconds).sum::<f32>().max(1e-6);
+    let total: f32 = units.iter().map(|u| u.seconds()).sum::<f32>().max(1e-6);
+    let n = live.len();
     let mut merges = 0usize;
 
-    // Agglomerative merge: closest centroid pair first, stop at the threshold.
-    while live.len() > 1 {
+    // Cached centroid distances. The merge loop reads this matrix; after a
+    // merge only the surviving cluster's row/column is recomputed, so a long
+    // meeting does not pay O(k^3 * d) dot products.
+    let mut dist = vec![vec![f32::INFINITY; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = cosine_distance(&live[i].centroid, &live[j].centroid);
+            dist[i][j] = d;
+            dist[j][i] = d;
+        }
+    }
+    let mut active = vec![true; n];
+    let mut active_count = n;
+
+    while active_count > 1 {
         let mut best = (0usize, 0usize, f32::INFINITY);
-        for i in 0..live.len() {
-            for j in (i + 1)..live.len() {
-                let d = cosine_distance(&live[i].centroid, &live[j].centroid);
-                if d < best.2 {
-                    best = (i, j, d);
+        for i in 0..n {
+            if !active[i] {
+                continue;
+            }
+            for j in (i + 1)..n {
+                if !active[j] {
+                    continue;
+                }
+                // total_cmp orders a NaN as greater than everything, so a
+                // broken distance can never win the merge.
+                if dist[i][j].total_cmp(&best.2) == std::cmp::Ordering::Less {
+                    best = (i, j, dist[i][j]);
                 }
             }
         }
         let (i, j, d) = best;
-        if d >= opts.merge_distance {
+        if d.total_cmp(&opts.merge_distance) != std::cmp::Ordering::Less {
             break;
         }
-        if opts.protect_share > 0.0 {
-            let threshold = opts.protect_share * total;
-            if live[i].seconds >= threshold && live[j].seconds >= threshold {
-                break;
+        let (keep, gone) = (i.min(j), i.max(j));
+        let moved = std::mem::take(&mut live[gone].members);
+        live[keep].members.extend(moved);
+        live[keep].members.sort_unstable();
+        live[keep].seconds += live[gone].seconds;
+        live[keep].centroid = centroid(units, &live[keep].members);
+        active[gone] = false;
+        active_count -= 1;
+        for k in 0..n {
+            if active[k] && k != keep {
+                let d = cosine_distance(&live[keep].centroid, &live[k].centroid);
+                dist[keep][k] = d;
+                dist[k][keep] = d;
             }
         }
-        let (keep, gone) = (i.min(j), i.max(j));
-        let moved = live.remove(gone);
-        live[keep].members.extend(moved.members);
-        live[keep].members.sort_unstable();
-        live[keep].seconds += moved.seconds;
-        live[keep].centroid = centroid(units, &live[keep].members);
         merges += 1;
     }
 
-    // Dissolve clusters that cannot stand for a speaker on their own: too small
-    // a share of the speech, or so incoherent that most of their own units are
-    // closer to another cluster's centroid (a mixed bag of a split). Each of
-    // their units goes to the centroid it is closest to in embedding space.
-    // Never by time, and the largest cluster is always kept, so the step can
-    // never produce zero speakers.
+    let kept: Vec<usize> = (0..n).filter(|&i| active[i]).collect();
+    let mut labels = vec![usize::MAX; units.len()];
+    for (label, &k) in kept.iter().enumerate() {
+        for &m in &live[k].members {
+            labels[m] = label;
+        }
+    }
+
+    // Dissolve clusters that hold too little speech to stand for a speaker on
+    // their own. Each of their units goes to the centroid it is closest to in
+    // embedding space. Never by time, and the largest cluster is always kept,
+    // so the step can never produce zero speakers.
     let mut dissolved = 0usize;
     let mut reassigned = 0usize;
-    let mut labels = label_sequence(units, &live);
-    if live.len() > 1 && (opts.min_share > 0.0 || opts.min_loyalty > 0.0) {
-        let largest = live
+    if kept.len() > 1 && opts.min_share > 0.0 {
+        let largest = kept
             .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.seconds.partial_cmp(&b.1.seconds).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            .max_by(|a, b| live[**a].seconds.total_cmp(&live[**b].seconds))
+            .copied()
+            .unwrap_or(kept[0]);
         let threshold = opts.min_share * total;
-        let drop: Vec<usize> = (0..live.len())
-            .filter(|&i| {
-                if i == largest {
-                    return false;
-                }
-                if live[i].seconds < threshold {
-                    return true;
-                }
-                if opts.min_loyalty > 0.0 {
-                    let own = live[i]
-                        .members
-                        .iter()
-                        .filter(|&&m| nearest_cluster(units, &live, m) == i)
-                        .count();
-                    (own as f32 / live[i].members.len().max(1) as f32) < opts.min_loyalty
-                } else {
-                    false
-                }
-            })
+        let drop: Vec<usize> = kept
+            .iter()
+            .copied()
+            .filter(|&i| i != largest && live[i].seconds < threshold)
             .collect();
         if !drop.is_empty() {
             dissolved = drop.len();
-            let keep: Vec<usize> = (0..live.len()).filter(|i| !drop.contains(i)).collect();
-            let mut out = vec![0usize; units.len()];
+            let keep: Vec<usize> = kept.iter().copied().filter(|i| !drop.contains(i)).collect();
+            // Rebuild the kept labels first: their compressed positions are
+            // not the original live-vector positions, and the reassigned units
+            // below are labelled with those compressed positions.
             for (label, &k) in keep.iter().enumerate() {
                 for &m in &live[k].members {
-                    out[m] = label;
+                    labels[m] = label;
                 }
             }
             for &k in &drop {
@@ -250,22 +306,47 @@ pub fn recluster(units: &[Unit], opts: &Options) -> Outcome {
                     let mut best = (0usize, f32::INFINITY);
                     for (label, &other) in keep.iter().enumerate() {
                         let d = cosine_distance(&units[m].embedding, &live[other].centroid);
-                        if d < best.1 {
+                        if d.total_cmp(&best.1) == std::cmp::Ordering::Less {
                             best = (label, d);
                         }
                     }
-                    out[m] = best.0;
+                    labels[m] = best.0;
                     reassigned += 1;
                 }
             }
-            labels = out;
+        }
+    }
+
+    // Failed extractions carry no voice information. Give them to the largest
+    // final cluster instead of letting a zero vector pick the lowest cluster id
+    // (every distance to a zero vector is 1.0).
+    if failed_units > 0 {
+        let mut totals: Vec<(usize, f32)> = Vec::new();
+        for (u, &l) in units.iter().zip(&labels) {
+            if l == usize::MAX {
+                continue;
+            }
+            match totals.iter_mut().find(|(k, _)| *k == l) {
+                Some((_, t)) => *t += u.seconds(),
+                None => totals.push((l, u.seconds())),
+            }
+        }
+        let largest = totals
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(l, _)| *l)
+            .unwrap_or(0);
+        for l in labels.iter_mut() {
+            if *l == usize::MAX {
+                *l = largest;
+            }
         }
     }
 
     // Renumber by speech time, largest speaker first, so the output is stable.
     let mut order: Vec<(usize, f32)> = speech_shares(units, &labels);
-    order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-    let mut remap: Vec<usize> = vec![usize::MAX; units.len()];
+    order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut remap: Vec<usize> = vec![usize::MAX; kept.len()];
     let mut rank = 0usize;
     for (label, _) in order {
         if remap[label] == usize::MAX {
@@ -283,31 +364,12 @@ pub fn recluster(units: &[Unit], opts: &Options) -> Outcome {
         merges,
         dissolved,
         reassigned,
+        failed_units,
     }
 }
 
-fn nearest_cluster(units: &[Unit], live: &[Cluster], m: usize) -> usize {
-    let mut best = (0usize, f32::INFINITY);
-    for (i, c) in live.iter().enumerate() {
-        let d = cosine_distance(&units[m].embedding, &c.centroid);
-        if d < best.1 {
-            best = (i, d);
-        }
-    }
-    best.0
-}
-
-fn label_sequence(units: &[Unit], live: &[Cluster]) -> Vec<usize> {
-    let mut out = vec![0usize; units.len()];
-    for (label, c) in live.iter().enumerate() {
-        for &m in &c.members {
-            out[m] = label;
-        }
-    }
-    out
-}
-
-/// Total speech seconds per final label, sorted largest first, for reporting.
+/// Total speech seconds per final label, sorted smallest first. Labels must be
+/// valid indices; callers renumber afterwards if they need a stable order.
 pub fn speech_shares(units: &[Unit], labels: &[usize]) -> Vec<(usize, f32)> {
     let mut totals: Vec<(usize, f32)> = Vec::new();
     for (u, &l) in units.iter().zip(labels) {
@@ -316,13 +378,15 @@ pub fn speech_shares(units: &[Unit], labels: &[usize]) -> Vec<(usize, f32)> {
             None => totals.push((l, u.seconds())),
         }
     }
-    totals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    totals.sort_by(|a, b| a.1.total_cmp(&b.1));
     totals
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::collections::{HashMap, HashSet};
 
     fn unit(start: f32, end: f32, cluster: usize, emb: Vec<f32>) -> Unit {
         Unit {
@@ -334,22 +398,36 @@ mod tests {
     }
 
     #[test]
+    fn defaults_are_the_frozen_recipe() {
+        let o = Options::default();
+        assert_eq!(o.merge_distance, 0.15);
+        assert_eq!(o.min_share, 0.03);
+    }
+
+    #[test]
     fn merges_identical_centroids() {
         // Two clusters with the same direction must collapse into one.
         let units = vec![
             unit(0.0, 5.0, 0, vec![1.0, 0.0, 0.0]),
             unit(5.0, 10.0, 1, vec![1.0, 0.01, 0.0]),
         ];
-        let out = recluster(
-            &units,
-            &Options {
-                merge_distance: 0.3,
-                ..Options::default()
-            },
-        );
+        let out = recluster(&units, &Options::default());
         assert_eq!(out.clusters_after, 1);
         assert_eq!(out.merges, 1);
         assert_eq!(out.labels, vec![0, 0]);
+    }
+
+    #[test]
+    fn merging_updates_the_distance_matrix() {
+        // Twelve near-identical clusters: every merge changes the surviving
+        // centroid, so a stale matrix row would stop short of one cluster.
+        let units: Vec<Unit> = (0..12)
+            .map(|i| unit(i as f32, i as f32 + 1.0, i, vec![1.0, 0.001 * i as f32, 0.0]))
+            .collect();
+        let out = recluster(&units, &Options::default());
+        assert_eq!(out.clusters_after, 1);
+        assert_eq!(out.merges, 11);
+        assert!(out.labels.iter().all(|&l| l == 0));
     }
 
     #[test]
@@ -358,13 +436,7 @@ mod tests {
             unit(0.0, 5.0, 0, vec![1.0, 0.0, 0.0]),
             unit(5.0, 10.0, 1, vec![0.0, 1.0, 0.0]),
         ];
-        let out = recluster(
-            &units,
-            &Options {
-                merge_distance: 0.3,
-                ..Options::default()
-            },
-        );
+        let out = recluster(&units, &Options::default());
         assert_eq!(out.clusters_after, 2);
         assert_eq!(out.merges, 0);
     }
@@ -385,8 +457,6 @@ mod tests {
             &Options {
                 merge_distance: 0.15,
                 min_share: 0.15,
-                min_loyalty: 0.0,
-                ..Options::default()
             },
         );
         assert_eq!(out.dissolved, 1);
@@ -397,21 +467,38 @@ mod tests {
     }
 
     #[test]
-    fn never_merges_two_large_clusters_when_protected() {
+    fn nan_embedding_does_not_panic_and_joins_largest_cluster() {
+        // The NaN unit is first on purpose: the centroid dimension must come
+        // from a cluster member, not from units[0].
         let units = vec![
-            unit(0.0, 10.0, 0, vec![1.0, 0.0]),
-            unit(10.0, 20.0, 1, vec![0.95, 0.31]),
+            unit(0.0, 3.0, 2, vec![f32::NAN, 0.0]),
+            unit(3.0, 23.0, 0, vec![1.0, 0.0]),
+            unit(23.0, 33.0, 1, vec![0.0, 1.0]),
+            unit(33.0, 36.0, 3, vec![]),
+            unit(36.0, 40.0, 4, vec![0.0, 0.0]),
         ];
-        let out = recluster(
-            &units,
-            &Options {
-                merge_distance: 0.9,
-                protect_share: 0.3,
-                ..Options::default()
-            },
-        );
+        let out = recluster(&units, &Options::default());
+        assert_eq!(out.failed_units, 3);
         assert_eq!(out.clusters_after, 2);
-        assert_eq!(out.merges, 0);
+        // The 20 s cluster is the largest; failed units join its label.
+        assert_eq!(out.labels[1], 0);
+        assert_eq!(out.labels[0], out.labels[1]);
+        assert_eq!(out.labels[3], out.labels[1]);
+        assert_eq!(out.labels[4], out.labels[1]);
+        assert_ne!(out.labels[2], out.labels[1]);
+    }
+
+    #[test]
+    fn all_failed_embeddings_give_one_cluster() {
+        let units = vec![
+            unit(0.0, 1.0, 0, vec![0.0, 0.0]),
+            unit(1.0, 2.0, 1, vec![]),
+        ];
+        let out = recluster(&units, &Options::default());
+        assert_eq!(out.clusters_before, 2);
+        assert_eq!(out.clusters_after, 1);
+        assert_eq!(out.failed_units, 2);
+        assert_eq!(out.labels, vec![0, 0]);
     }
 
     #[test]
@@ -419,5 +506,134 @@ mod tests {
         let out = recluster(&[], &Options::default());
         assert_eq!(out.clusters_after, 0);
         assert!(out.labels.is_empty());
+    }
+
+    /// Minimal standard-base64 decoder for the i8 fixtures (no new dependency).
+    fn decode_i8(s: &str) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for c in s.bytes() {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => break,
+                _ => continue,
+            };
+            buf = (buf << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((buf >> bits) & 0xff) as u8);
+            }
+        }
+        out.iter().map(|&b| (b as i8) as f32 / 127.0).collect()
+    }
+
+    struct Golden {
+        name: String,
+        units: Vec<Unit>,
+        references: Vec<String>,
+        expected: Value,
+    }
+
+    fn golden(raw: &str) -> Golden {
+        let v: Value = serde_json::from_str(raw).expect("golden json");
+        let units = v["units"]
+            .as_array()
+            .expect("units")
+            .iter()
+            .map(|u| Unit {
+                start: u["start"].as_f64().unwrap() as f32,
+                end: u["end"].as_f64().unwrap() as f32,
+                cluster: u["cluster"].as_u64().unwrap() as usize,
+                embedding: decode_i8(u["embedding"].as_str().expect("embedding")),
+            })
+            .collect();
+        let references = v["units"]
+            .as_array()
+            .expect("units")
+            .iter()
+            .map(|u| u["reference"].as_str().unwrap_or("").to_string())
+            .collect();
+        Golden {
+            name: v["meeting"].as_str().unwrap_or("?").to_string(),
+            units,
+            references,
+            expected: v["expected"].clone(),
+        }
+    }
+
+    fn assert_golden(raw: &str) {
+        let g = golden(raw);
+        let out = recluster(&g.units, &Options::default());
+        let e = &g.expected;
+        assert_eq!(
+            out.clusters_before,
+            e["clusters_before"].as_u64().unwrap() as usize,
+            "{} clusters_before",
+            g.name
+        );
+        assert_eq!(
+            out.clusters_after,
+            e["clusters_after"].as_u64().unwrap() as usize,
+            "{} clusters_after",
+            g.name
+        );
+        assert_eq!(
+            out.merges,
+            e["merges"].as_u64().unwrap() as usize,
+            "{} merges",
+            g.name
+        );
+        assert_eq!(
+            out.dissolved,
+            e["dissolved"].as_u64().unwrap() as usize,
+            "{} dissolved",
+            g.name
+        );
+        let labels: Vec<usize> = e["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(out.labels, labels, "{} labels", g.name);
+
+        // The pinned labels must be a clean partition of the reference
+        // speakers: one label per speaker and no label mixing two speakers.
+        let mut by_label: HashMap<usize, HashSet<&str>> = HashMap::new();
+        let mut by_ref: HashMap<&str, HashSet<usize>> = HashMap::new();
+        for (label, reference) in out.labels.iter().zip(&g.references) {
+            by_label.entry(*label).or_default().insert(reference);
+            by_ref.entry(reference.as_str()).or_default().insert(*label);
+        }
+        assert!(
+            by_label.values().all(|s| s.len() == 1),
+            "{}: a label mixes reference speakers",
+            g.name
+        );
+        assert!(
+            by_ref.values().all(|s| s.len() == 1),
+            "{}: a reference speaker is split across labels",
+            g.name
+        );
+    }
+
+    // Small extracts of the cached CAMPPlus per-unit embeddings from
+    // evidence/tinta-fork/18/results. Each unit's embedding is quantized to i8
+    // (scale = its max absolute value) and base64-encoded; the extract and the
+    // expected output are documented in docs/fork/diarization.md.
+    #[test]
+    fn golden_es2004b_cached_extract() {
+        assert_golden(include_str!("../tests/data/golden-ES2004b.json"));
+    }
+
+    #[test]
+    fn golden_es2011c_cached_extract() {
+        assert_golden(include_str!("../tests/data/golden-ES2011c.json"));
     }
 }

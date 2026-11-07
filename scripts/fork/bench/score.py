@@ -11,9 +11,11 @@ Subcommands:
   table               markdown summary from several score JSON files
 
 DER is pyannote.metrics DiarizationErrorRate over the full file (a UEM from 0 to
-the audio end). Primary is collar 0 s with overlapping speech counted; the
-0.25 s collar number is reported next to it. WER is reported with the legacy
-normalizer and with Whisper's EnglishTextNormalizer, both with del/ins/sub.
+the audio end). Primary is collar 0 s with overlapping speech counted. Both
+collar variants are reported next to it: pyannote's `collar=0.25` is a 0.25 s
+total collar, i.e. +/-0.125 s; +/-0.25 s is `collar=0.5`. WER is reported with
+the legacy normalizer and with Whisper's EnglishTextNormalizer, both with
+del/ins/sub.
 
 Requires: numpy, scipy, rapidfuzz, pyannote.metrics, whisper-normalizer
 (see docs/fork/benchmark.md).
@@ -657,19 +659,23 @@ def score_one(args):
         def der_block(hyp_segs):
             primary = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.0, skip_overlap=False)
             collar = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.25, skip_overlap=False)
+            collar250 = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.5, skip_overlap=False)
             no_ovl = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.0, skip_overlap=True)
-            return primary, collar, no_ovl
+            return primary, collar, collar250, no_ovl
 
-        primary, collar, no_ovl = der_block(segs)
-        f_primary, f_collar, f_no_ovl = der_block(filtered)
+        primary, collar, collar250, no_ovl = der_block(segs)
+        f_primary, f_collar, f_collar250, f_no_ovl = der_block(filtered)
         out["der"] = primary["der"]
         out["der_detail"] = primary
         out["der_collar025"] = collar["der"]
         out["der_collar025_detail"] = collar
+        out["der_collar050"] = collar250["der"]
+        out["der_collar050_detail"] = collar250
         out["der_no_overlap"] = no_ovl["der"]
         out["der_filtered"] = f_primary["der"]
         out["der_filtered_detail"] = f_primary
         out["der_filtered_collar025"] = f_collar["der"]
+        out["der_filtered_collar050"] = f_collar250["der"]
         out["der_filtered_no_overlap"] = f_no_ovl["der"]
         out["small_cluster_fraction"] = args.small_cluster_fraction
         out["small_clusters"] = [str(x) for x in dropped]

@@ -191,7 +191,7 @@ This repository does not include the models. Tinta downloads them at pinned revi
 
 The self-test builds a synthetic meeting with the macOS voices. It runs processing, name matching, export, the MCP tools, undo, the trash, and audio retention. It uses its own data folder and does not touch your library. Install the speech models before you run it.
 
-The interface preview accepts these views after `index.html`: `#setup`, `#meeting`, `#recording`, `#settings`, `#mcp`, `#onboarding` (with the intro), and `#onboarding-welcome`, `#onboarding-models`, `#onboarding-microphone`, `#onboarding-meet`, or `#onboarding-done`. Production builds do not include the sample data.
+The interface preview accepts these views after `index.html`: `#setup`, `#meeting`, `#recording`, `#settings`, `#mcp`, `#onboarding` (with the intro), and `#onboarding-welcome`, `#onboarding-models`, `#onboarding-microphone`, `#onboarding-meet`, or `#onboarding-done`. Add `#caps-none` to preview an engine that reports every optional capability as `false`. Production builds do not include the sample data.
 
 See the [test guide](docs/TESTING.md) for a first real meeting.
 

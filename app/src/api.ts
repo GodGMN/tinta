@@ -123,6 +123,46 @@ export type AppCall = {
 /** A calendar on this Mac. `hidden` is true when the user hides its events in Tinta. */
 export type CalendarInfo = { id: string; title: string; color: string; account: string; hidden: boolean };
 
+/**
+ * The features that the engine supports. The app turns off everything that reports false.
+ * An engine that predates the field reports nothing, and supports all of them.
+ */
+export type Capabilities = {
+  /** Record the audio of the whole system. */
+  capture_system_audio: boolean;
+  /** Record the audio of one app. */
+  capture_app_audio: boolean;
+  /** Detect calls in desktop meeting apps, such as Zoom and Microsoft Teams. */
+  calls_detection: boolean;
+  /** Read the names, the speaker, and the mute state from a call window. */
+  call_reader: boolean;
+  /** Read the calendars, for the next meetings and the reminders. */
+  calendar: boolean;
+  /** Write a summary of a meeting. */
+  summaries: boolean;
+  /** Remove the echo of the meeting audio from the microphone. */
+  echo_cancellation: boolean;
+  /** Import an audio file as a meeting. */
+  import_audio: boolean;
+};
+
+/** The features of an engine that does not report capabilities, which is the Mac engine before the field. */
+export const ALL_CAPABILITIES: Capabilities = {
+  capture_system_audio: true,
+  capture_app_audio: true,
+  calls_detection: true,
+  call_reader: true,
+  calendar: true,
+  summaries: true,
+  echo_cancellation: true,
+  import_audio: true,
+};
+
+/** The capabilities of the engine for this window. An engine without the field supports all of them. */
+export function capabilitiesOf(boot: Bootstrap | null | undefined): Capabilities {
+  return boot?.capabilities ?? ALL_CAPABILITIES;
+}
+
 export type Attendee = { name: string; email: string; is_self: boolean; status: string };
 
 /** A video call link in a calendar event. `code` is the Meet meeting code. */
@@ -170,6 +210,8 @@ export type Bootstrap = {
   meeting_reminders: boolean;
   /** The bundle ID of the browser for call links, or "default" for the default browser of macOS. */
   call_browser: string;
+  /** The features of the engine. The window turns off the rest. */
+  capabilities: Capabilities;
   accessibility: boolean;
   summaries: { available: boolean; reason?: string };
   filevault: boolean;
@@ -214,6 +256,8 @@ export const RETENTION_DAYS = [0, 1, 2, 3, 7, 14, 21, 30];
 
 export const api = {
   bootstrap: () => invoke<Bootstrap>("bootstrap"),
+  /** The features of the engine, which may change after a restart. */
+  capabilities: () => invoke<Capabilities>("capabilities"),
   setSetting: (key: string, value: string) => invoke<void>("set_setting", { key, value }),
   installModels: () => invoke<unknown>("install_models"),
   requestMicrophone: () => invoke<{ granted: boolean }>("request_microphone"),

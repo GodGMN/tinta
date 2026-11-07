@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- The desktop app builds for Windows and Linux. Those builds cannot open the encrypted library yet, so Tinta explains why in a dialog and then closes.
+
+### Changed
+- Tinta hides the features that the engine cannot provide, and says why in one short line: the calendars and reminders, the names from Zoom and Microsoft Teams, the detected calls, the summaries, and the audio import. The Mac app keeps all of them.
+
+### Fixed
+- **Record this call** on Home is disabled with a short reason when the engine cannot capture the meeting audio, instead of failing when you click it.
+
 ## 0.9.3 (2026-10-21)
 
 ### Fixed

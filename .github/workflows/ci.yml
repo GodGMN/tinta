@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares. The
+      # macOS build script makes them; a check only needs the files to exist.
+      - name: Create placeholder sidecars
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          for name in tinta-engine tinta-mcp tinta-native-host; do
+            touch "app/src-tauri/binaries/$name-$triple"
+          done
+      # Clippy builds the app in development mode, which uses devUrl, but build the frontend
+      # too so that a release-style build finds dist/.
+      - name: Build the frontend
+        working-directory: app
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Clippy
+        run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+
+  app-macos:
+    # The Intel image for the same capacity reason as `core-macos`. This compiles the macOS
+    # platform module, so it proves that the Mac code still builds, but only for
+    # x86_64-apple-darwin: `scripts/build.sh` ships aarch64-apple-darwin, so switch this
+    # back to macos-15/macos-latest before upstreaming.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      # FoundationModels exists only in the macOS 26 SDK. The image ships Xcode 26 next to
+      # an older default, so select the newest 26.x before the Swift build.
+      - name: Use Xcode 26
+        run: |
+          echo "Installed Xcode versions:"
+          ls -d /Applications/Xcode_*.app
+          xcode="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$xcode" ]; then
+            echo "::error::No Xcode 26 found in /Applications. The engine needs the macOS 26 SDK to build FoundationModels."
+            exit 1
+          fi
+          echo "Selecting $xcode"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares.
+      - name: Create placeholder sidecars
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          for name in tinta-engine tinta-mcp tinta-native-host; do
+            touch "app/src-tauri/binaries/$name-$triple"
+          done
+      - name: Clippy
+        run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+      # The app runs this engine on macOS. Building it here compiles the Swift code of the
+      # engine too, which the Rust jobs cannot check.
+      - name: Build the Swift engine
+        working-directory: engine
+        run: swift build -c release
+
+  app-windows:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: C:\vcpkg
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but builds against OpenSSL. vcpkg provides it for MSVC, and
+      # libsqlite3-sys wants the prefix in OPENSSL_DIR. The build takes most of the job
+      # time, so keep the installed tree between runs, keyed on the port version.
+      - name: Read the vcpkg OpenSSL port version
+        id: openssl
+        shell: pwsh
+        run: |
+          $port = Get-Content C:\vcpkg\ports\openssl\vcpkg.json -Raw | ConvertFrom-Json
+          $version = @($port.version, $port.'version-string', $port.'version-semver', $port.'version-date') |
+            Where-Object { $_ } | Select-Object -First 1
+          $revision = if ($port.'port-version') { $port.'port-version' } else { 0 }
+          "key=vcpkg-openssl-$version-$revision-x64-windows" >> $env:GITHUB_OUTPUT
+      - name: Cache OpenSSL
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: ${{ steps.openssl.outputs.key }}
+      - name: Install OpenSSL
+        run: vcpkg install openssl:x64-windows
+      - name: Point SQLCipher at OpenSSL
+        shell: pwsh
+        run: echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares.
+      - name: Create placeholder sidecars
+        shell: pwsh
+        run: |
+          $triple = (rustc -vV | Select-String -Pattern '^host: ').Line.Split(' ')[1]
+          New-Item -ItemType Directory -Force -Path app/src-tauri/binaries | Out-Null
+          foreach ($name in @('tinta-engine', 'tinta-mcp', 'tinta-native-host')) {
+            New-Item -ItemType File -Force -Path "app/src-tauri/binaries/$name-$triple.exe" | Out-Null
+          }
+      - name: Check
+        run: cargo check --locked -p tinta --all-targets
+
+  core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but compiles against the system OpenSSL.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+
+  core-macos:
+    # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15
+    # minutes and were cancelled twice on 2026-11-06), so this uses the Intel
+    # image. The core crate is architecture independent; move this back to
+    # macos-latest when the arm64 queue recovers.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings

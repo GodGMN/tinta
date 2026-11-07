@@ -50,47 +50,61 @@ On Linux the Meet extension and the MCP server reach the app the same way as on 
 - Both helpers, and the app, use `tinta_core::paths::socket_path()`.
 
 The socket lives in a folder of its own, `$XDG_RUNTIME_DIR/tinta/tinta.sock`, so that only
-this user can enter the folder. The app creates the folder with mode 0700 (and fixes the
-mode on each start) and the socket with mode 0600. When `XDG_RUNTIME_DIR` is unset or
-relative, the socket stays in the data folder as on macOS. `TINTA_DATA_DIR` (used by tests
-and the self-test) always keeps the socket in that data folder. macOS keeps its existing
-path.
+this user can enter the folder. The app creates the folder with mode 0700 (without a
+following chmod) and the socket with mode 0600. It then checks, with `lstat`, that the
+folder is a real folder (not a symbolic link), belongs to this user and still has mode
+0700; anything else stops the app with a clear error. When `XDG_RUNTIME_DIR` is unset or
+relative, the app and both helpers use `/run/user/<uid>/tinta` when that folder exists and
+belongs to the user, and otherwise the data folder as on macOS (which the app then creates
+with mode 0700 and checks the same way). `TINTA_DATA_DIR` (used by tests and the self-test)
+always keeps the socket in that data folder. All three processes call the one
+`tinta_core::paths::socket_path()`, so a helper started without `XDG_RUNTIME_DIR` (ssh,
+cron, a system unit) still finds the socket that the desktop app listens on. macOS keeps
+its existing path.
 
 ## Peer authentication
 
 macOS checks the code signature of the helper with `codesign`. Linux has no equivalent that
-works for an unsigned development build, so the app checks two things with
+works for an unsigned development build, so the app checks with
 `crates/tinta-core/src/peer.rs`:
 
-1. `SO_PEERCRED` on the accepted socket gives the user ID and the process ID of the peer.
-   The user ID must be the effective user ID of the app. The kernel fills this value, so a
-   process cannot claim it.
-2. `/proc/<pid>/exe` gives the executable of that process. The kernel resolves it, and it
-   keeps working when the helper replaces its file, so the path cannot be spoofed from the
-   peer side. Both this path and the allowed paths are canonicalized, and the peer must
-   match one of `tinta-native-host` and `tinta-mcp` next to the app executable. In
-   development that folder is the Cargo target directory.
+1. `SO_PEERCRED` on the accepted socket gives the user ID and the process ID that the
+   kernel recorded at `connect()`. The user ID must be the effective user ID of the app, so
+   another user cannot connect.
+2. `/proc/<pid>/exe` is the kernel's link to the file that the process runs. The app stats
+   that link, which follows it to the running inode, and compares the file identity (device
+   and inode) with the files of `tinta-native-host` and `tinta-mcp` next to the app
+   executable. In development that folder is the Cargo target directory.
+3. When the kernel supports `SO_PEERPIDFD` (Linux 6.5 and later), the app pins the
+   connecting process with the returned pidfd and checks after reading the executable that
+   the process is still alive, so a reused pid cannot answer the check. On older kernels it
+   falls back to the pid from `SO_PEERCRED`.
 
-Every error refuses the connection: the process is gone, `/proc` is hidden by a sandbox,
-`readlink` is denied, or a path does not resolve. The Windows build has no app socket yet
-and stays fail closed; named pipes come with the Windows work.
+A helper whose file an update replaced reads `/opt/.../tinta-mcp (deleted)`, and the app
+refuses it. That is the correct fail-closed behaviour: the running old helper gets
+"Refused" until the browser or the MCP client starts it again from the new file.
 
-### Why this is weaker than the macOS check
+Every error refuses the connection: the process is gone, `/proc` is hidden by a sandbox, a
+read is denied, or the identity does not match a helper file. The Windows build has no app
+socket yet and stays fail closed; named pipes come with the Windows work.
 
-The Linux check trusts the path of the binary. A process that runs as the same user and can
-replace `tinta-native-host` or `tinta-mcp` in the install folder is accepted; the check
-would not notice the different file. macOS detects that with the signature.
+### What the check covers, and what it does not
 
-This is acceptable because the check does not protect a privilege boundary:
+The check answers one question: is the process that connected running the helper file that
+this app installed next to itself? It is not a sandbox and it does not verify who built
+that file.
 
-- Another user cannot connect: the folder is 0700, the socket is 0600, and the user ID must
-  match.
-- A web page or another browser extension cannot start the native host. Chrome starts it
-  only for the extension ID in the manifest's `allowed_origins`.
-- Replacing the installed helper needs write access to the install folder, which belongs to
-  root. A path that matches a development build is the developer's own build output.
-- A process that already runs as this user can read the meeting library and the app's
-  settings directly, so the socket gives it nothing that it could not already reach.
+- Covered: another user cannot connect (0700 folder, 0600 socket, and the user ID from the
+  kernel must match). A random program that runs as this user is refused because it runs a
+  different file. A helper file that an update replaced is refused (see above). A web page
+  or another browser extension cannot start the native host, because Chrome starts it only
+  for the extension ID in the manifest's `allowed_origins`, and replacing an installed
+  helper needs write access to the install folder, which belongs to root.
+- Not covered: code that already runs as this user can fork after it connects and hand the
+  socket to the child while the parent execs the real helper; it can inject into a real
+  helper with `LD_PRELOAD` or `ptrace`; it can read the meeting library and the app's
+  settings directly. Same-user code is the trust boundary here, as on many Linux desktop
+  apps, and the socket gives it nothing that it could not already reach.
 
 ## Not on Linux yet
 
@@ -99,3 +113,9 @@ This is acceptable because the check does not protect a privilege boundary:
 - Meeting reminders use the macOS Notification Center.
 - The recording bubble, Mission Control, Time Machine exclusion, the clipboard file copy,
   and the system privacy settings panes are macOS features.
+- Snap and Flatpak browsers. Snap Chromium is the default Chromium on Ubuntu, and both it
+  and Flatpak Chrome, Chromium and Brave run in a sandbox that cannot start a host binary
+  and look for native messaging manifests in their own folders, so the Meet extension
+  cannot reach the app there. Install Chrome or Chromium from the distribution's deb/rpm
+  packages instead.
+

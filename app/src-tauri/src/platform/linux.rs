@@ -23,9 +23,21 @@ struct Chromium {
 }
 
 const CHROMIUM: [Chromium; 3] = [
-    Chromium { id: "google-chrome", name: "Google Chrome", profile: "google-chrome" },
-    Chromium { id: "chromium", name: "Chromium", profile: "chromium" },
-    Chromium { id: "brave-browser", name: "Brave", profile: "BraveSoftware/Brave-Browser" },
+    Chromium {
+        id: "google-chrome",
+        name: "Google Chrome",
+        profile: "google-chrome",
+    },
+    Chromium {
+        id: "chromium",
+        name: "Chromium",
+        profile: "chromium",
+    },
+    Chromium {
+        id: "brave-browser",
+        name: "Brave",
+        profile: "BraveSoftware/Brave-Browser",
+    },
 ];
 
 /// The helper binaries that the app trusts: the ones next to the app executable. The Cargo
@@ -37,16 +49,10 @@ pub fn allowed_helpers() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// The executable of the process at the other end of a socket, when it runs as this user.
-/// `None` closes the connection: the check fails closed on every error.
-pub fn peer_path(fd: i32) -> Option<PathBuf> {
-    let (uid, exe) = tinta_core::peer::peer_executable(fd)?;
-    (uid == tinta_core::peer::current_uid()).then_some(exe)
-}
-
-/// Accepts a peer only if its executable is one of the helper binaries of this app.
-pub fn trusted_peer(path: &Path) -> bool {
-    tinta_core::peer::allowed_exe(path, &allowed_helpers())
+/// Accepts a peer only if it runs as this user and its executable is one of the helper
+/// binaries of this app. `None` closes the connection: the check fails closed on every error.
+pub fn authenticate(fd: i32) -> Option<PathBuf> {
+    tinta_core::peer::authenticate(fd, &allowed_helpers())
 }
 
 /// The folder of the user configuration files: `$XDG_CONFIG_HOME`, or `~/.config`.
@@ -63,7 +69,10 @@ fn browsers_in(config: &Path) -> Vec<super::other::Browser> {
     let mut browsers: Vec<super::other::Browser> = CHROMIUM
         .iter()
         .filter(|browser| config.join(browser.profile).is_dir())
-        .map(|browser| super::other::Browser { id: browser.id.to_string(), name: browser.name.to_string() })
+        .map(|browser| super::other::Browser {
+            id: browser.id.to_string(),
+            name: browser.name.to_string(),
+        })
         .collect();
     browsers.sort_by_key(|browser| browser.name.to_lowercase());
     browsers
@@ -83,7 +92,10 @@ pub fn default_browser() -> Option<super::other::Browser> {
 /// The executable that opens a call link in `browser`, when the browser is one of the
 /// Chromium browsers of the list. `None` for the default browser.
 pub fn browser_command(browser: &str) -> Option<&'static str> {
-    CHROMIUM.iter().find(|entry| entry.id == browser).map(|entry| entry.id)
+    CHROMIUM
+        .iter()
+        .find(|entry| entry.id == browser)
+        .map(|entry| entry.id)
 }
 
 /// The folders in which the browsers look for native messaging hosts. A browser writes its
@@ -98,7 +110,10 @@ fn native_host_dirs_in(config: &Path) -> Vec<PathBuf> {
     if profiles.is_empty() {
         profiles.push(config.join(CHROMIUM[0].profile));
     }
-    profiles.into_iter().map(|profile| profile.join("NativeMessagingHosts")).collect()
+    profiles
+        .into_iter()
+        .map(|profile| profile.join("NativeMessagingHosts"))
+        .collect()
 }
 
 fn native_host_dirs() -> Vec<PathBuf> {
@@ -119,7 +134,8 @@ fn host_manifest(name: &str, helper: &Path) -> serde_json::Value {
 fn write_host_manifest(dir: &Path, name: &str, helper: &Path) -> Result<PathBuf> {
     let manifest = host_manifest(name, helper);
     let path = dir.join(format!("{name}.json"));
-    std::fs::write(&path, serde_json::to_vec_pretty(&manifest)?).context("cannot write the native host manifest")?;
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest)?)
+        .context("cannot write the native host manifest")?;
     Ok(path)
 }
 
@@ -142,7 +158,8 @@ pub fn install_native_host() -> Result<PathBuf> {
     }
     match first {
         Some(path) => Ok(path),
-        None => Err(last_error.unwrap_or_else(|| anyhow!("cannot find a browser to register the extension host"))),
+        None => Err(last_error
+            .unwrap_or_else(|| anyhow!("cannot find a browser to register the extension host"))),
     }
 }
 
@@ -183,7 +200,10 @@ mod tests {
         assert_eq!(manifest["name"], NATIVE_HOST_NAME);
         assert_eq!(manifest["type"], "stdio");
         assert_eq!(manifest["path"], "/usr/bin/tinta-native-host");
-        assert_eq!(manifest["allowed_origins"], json!([format!("chrome-extension://{EXTENSION_ID}/")]));
+        assert_eq!(
+            manifest["allowed_origins"],
+            json!([format!("chrome-extension://{EXTENSION_ID}/")])
+        );
     }
 
     #[test]
@@ -196,7 +216,8 @@ mod tests {
             dirs,
             vec![
                 dir.path().join("chromium/NativeMessagingHosts"),
-                dir.path().join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+                dir.path()
+                    .join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
             ]
         );
     }
@@ -204,7 +225,10 @@ mod tests {
     #[test]
     fn registers_with_chrome_when_no_browser_ran_yet() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(native_host_dirs_in(dir.path()), vec![dir.path().join("google-chrome/NativeMessagingHosts")]);
+        assert_eq!(
+            native_host_dirs_in(dir.path()),
+            vec![dir.path().join("google-chrome/NativeMessagingHosts")]
+        );
     }
 
     #[test]
@@ -235,6 +259,12 @@ mod tests {
     fn the_helper_paths_are_next_to_the_app() {
         let dir = tempfile::tempdir().unwrap();
         let paths = tinta_core::peer::helpers_in(dir.path());
-        assert_eq!(paths, vec![dir.path().join("tinta-native-host"), dir.path().join("tinta-mcp")]);
+        assert_eq!(
+            paths,
+            vec![
+                dir.path().join("tinta-native-host"),
+                dir.path().join("tinta-mcp")
+            ]
+        );
     }
 }

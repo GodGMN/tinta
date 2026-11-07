@@ -184,7 +184,9 @@ mod tests {
 
     fn link(socket: &Path) -> AppLink {
         AppLink { socket: socket.to_path_buf(), stream: None, next_id: 0 }
-    }    /// Answers `count` requests on one connection, then closes it.
+    }
+
+    /// Answers `count` requests on one connection, then closes it.
     fn answer(listener: &UnixListener, count: usize) {
         let (stream, _) = listener.accept().unwrap();
         let mut writer = stream.try_clone().unwrap();

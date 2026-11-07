@@ -6,9 +6,15 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::{BufRead, BufReader};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+/// The socket that the child process connects to in `refuses_a_peer_whose_executable_was_deleted`.
+const CHILD_SOCKET: &str = "TINTA_TEST_PEER_SOCKET";
 
 /// Connects to a listener that runs the peer check with `allowed`, and returns whether the
 /// listener accepted the connection.
@@ -42,4 +48,67 @@ fn refuses_a_binary_that_is_not_allowed() {
 #[test]
 fn refuses_when_nothing_is_allowed() {
     assert!(!accepted(Vec::new()));
+}
+
+/// The child half of `refuses_a_peer_whose_executable_was_deleted`: connects to the socket
+/// from `CHILD_SOCKET` and waits until the parent closes it.
+#[test]
+fn peer_child_connects() {
+    let Ok(path) = std::env::var(CHILD_SOCKET) else {
+        return;
+    };
+    let stream = UnixStream::connect(path).unwrap();
+    let mut line = String::new();
+    let _ = BufReader::new(stream).read_line(&mut line);
+}
+
+#[test]
+fn refuses_a_peer_whose_executable_was_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    // A second link keeps the inode alive, so only the "(deleted)" marker can refuse it.
+    let copy = dir.path().join("peer");
+    let allowed = dir.path().join("tinta-mcp");
+    std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+    std::fs::hard_link(&copy, &allowed).unwrap();
+    let path = dir.path().join("tinta.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut child = Command::new(&copy)
+        .args(["--exact", "peer_child_connects"])
+        .env(CHILD_SOCKET, &path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the child did not connect");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("cannot accept the child connection: {error}"),
+        }
+    };
+    let exe = format!("/proc/{}/exe", child.id());
+    // Wait until the child runs the copy, then replace the executable on disk.
+    for _ in 0..200 {
+        if std::fs::read_link(&exe).ok().as_deref() == Some(copy.as_path()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_file(&copy).unwrap();
+    assert!(std::fs::read_link(&exe)
+        .unwrap()
+        .to_string_lossy()
+        .ends_with(" (deleted)"));
+    assert!(tinta_core::peer::authenticate(stream.as_raw_fd(), &[allowed]).is_none());
+    drop(stream);
+    let _ = child.wait();
 }

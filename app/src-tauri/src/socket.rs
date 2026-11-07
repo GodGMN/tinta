@@ -62,10 +62,10 @@ pub fn serve(_state: Arc<AppState>) -> Result<()> {
 
 #[cfg(unix)]
 fn connection(state: Arc<AppState>, stream: UnixStream) -> Result<()> {
-    let peer = platform::peer_path(stream.as_raw_fd());
+    let peer = platform::authenticate(stream.as_raw_fd());
     // Helper authentication fails closed on platforms without a peer check.
-    if !peer.as_deref().map(platform::trusted_peer).unwrap_or(false) {
-        bail!("{} is not a trusted Tinta helper", peer.map(|p| p.display().to_string()).unwrap_or_default());
+    if peer.is_none() {
+        bail!("the peer is not a trusted Tinta helper");
     }
     let mut extension_connection = None;
     let result = requests(&state, stream, &mut extension_connection);

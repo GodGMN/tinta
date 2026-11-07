@@ -11,7 +11,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
-pub use super::linux::{browsers, default_browser, install_native_host, peer_path, remove_old_native_host, trusted_peer};
+pub use super::linux::{
+    authenticate, browsers, default_browser, install_native_host, remove_old_native_host,
+};
 
 /// The value of the `call_browser` setting that selects the default browser.
 pub const DEFAULT_BROWSER: &str = "default";
@@ -69,15 +71,8 @@ pub fn remove_old_native_host() {}
 /// the check there rejects every connection until the named pipes exist: fail closed.
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-pub fn peer_path(_fd: i32) -> Option<PathBuf> {
+pub fn authenticate(_fd: i32) -> Option<PathBuf> {
     None
-}
-
-/// Rejects every peer: helper authentication is not implemented on this platform yet.
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn trusted_peer(_path: &Path) -> bool {
-    false
 }
 
 /// The system default browser, when the platform names one.
@@ -92,13 +87,25 @@ pub fn browsers() -> Vec<Browser> {
     Vec::new()
 }
 
+/// Starts `command` with `arg` and reaps the launcher in the background. Chrome hands the
+/// request to the running browser and exits, so an unreaped child would stay a zombie until
+/// the app exits.
+#[cfg(target_os = "linux")]
+fn spawn_detached(command: &str, arg: &str) -> std::io::Result<()> {
+    let mut child = Command::new(command).arg(arg).spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Opens a call link in the selected browser and returns the recording source for the call.
 /// The macOS browser list names bundle IDs; the Linux one names executables. A browser that is
 /// not installed now, and the default browser, give the handler of the system.
 pub fn open_call(link: &tinta_core::calendar::Link, browser: &str) -> String {
     #[cfg(target_os = "linux")]
     if let Some(command) = super::linux::browser_command(browser) {
-        if Command::new(command).arg(&link.url).spawn().is_ok() {
+        if spawn_detached(command, &link.url).is_ok() {
             return "all".to_string();
         }
     }

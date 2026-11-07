@@ -2,12 +2,21 @@
 """Score tinta-bench JSON output against AMI manual annotations.
 
 Subcommands:
-  ref      build a reference JSON from the AMI manual annotation XML files
-  score    WER + DER for one tinta-bench result JSON
-  table    markdown summary table from several score JSON files
+  ref                 build a reference JSON from the AMI manual annotation XML
+  slice               cut a wav to a deterministic short wav
+  clean-sample        cut single-speaker AMI regions into one clean-speech wav
+  librispeech-sample  build the 30-utterance LibriSpeech test-clean sample
+  score               WER (legacy and Whisper normalizer) + pyannote DER
+  tune                mean DER per clustering threshold / small-cluster filter on dev
+  table               markdown summary from several score JSON files
 
-DER is frame based (10 ms), with a NIST-style collar and overlap control.
-Requires: numpy, scipy, rapidfuzz (see docs/fork/benchmark.md).
+DER is pyannote.metrics DiarizationErrorRate over the full file (a UEM from 0 to
+the audio end). Primary is collar 0 s with overlapping speech counted; the
+0.25 s collar number is reported next to it. WER is reported with the legacy
+normalizer and with Whisper's EnglishTextNormalizer, both with del/ins/sub.
+
+Requires: numpy, scipy, rapidfuzz, pyannote.metrics, whisper-normalizer
+(see docs/fork/benchmark.md).
 """
 
 import argparse
@@ -16,22 +25,37 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
+import tempfile
+import urllib.request
 import xml.etree.ElementTree as ET
 
 FILLERS = {"uh", "um", "er", "ah", "eh", "mm", "hmm", "uh-huh", "mhm", "oh"}
+WHISPER_NORMALIZER = None
+LEGACY_NORMALIZER = None
 
 
-def norm_tokens(words):
+def legacy_tokens(words):
     """Lowercase, strip punctuation and keep one token per word."""
-    out = []
-    for w in words:
-        w = w.lower().replace("’", "'")
-        w = re.sub(r"[^a-z0-9'\- ]+", " ", w)
-        for piece in w.split():
-            if piece:
-                out.append(piece)
-    return out
+    global LEGACY_NORMALIZER
+    if LEGACY_NORMALIZER is None:
+        LEGACY_NORMALIZER = re.compile(r"[^a-z0-9'\- ]+")
+    text = words if isinstance(words, str) else " ".join(words)
+    text = text.lower().replace("\u2019", "'")
+    text = LEGACY_NORMALIZER.sub(" ", text)
+    return [p for p in text.split() if p]
+
+
+def whisper_tokens(words):
+    """Whisper's English text normalizer: punctuation, numbers, spellings, fillers."""
+    global WHISPER_NORMALIZER
+    if WHISPER_NORMALIZER is None:
+        from whisper_normalizer.english import EnglishTextNormalizer
+
+        WHISPER_NORMALIZER = EnglishTextNormalizer()
+    text = words if isinstance(words, str) else " ".join(words)
+    return WHISPER_NORMALIZER(text).split()
 
 
 def build_ref(annotations, meeting, out_path):
@@ -75,7 +99,7 @@ def build_ref(annotations, meeting, out_path):
         "meeting": meeting,
         "words": words,
         "segments": segments,
-        "duration": max(w["end"] for w in words) if words else 0.0,
+        "duration": max((w["end"] for w in words), default=0.0),
         "speakers": sorted({w["speaker"] for w in words}),
     }
     with open(out_path, "w") as f:
@@ -84,6 +108,48 @@ def build_ref(annotations, meeting, out_path):
         f"ref {meeting}: {len(words)} words, {len(segments)} segments, "
         f"{len(ref['speakers'])} speakers, {ref['duration'] / 60:.1f} min -> {out_path}"
     )
+
+
+def cut_slice(args):
+    """Cut [start, start+duration) from a wav into a new 16 kHz mono wav."""
+    import wave
+
+    with wave.open(args.wav, "rb") as src:
+        assert src.getnchannels() == 1 and src.getsampwidth() == 2
+        rate = src.getframerate()
+        src.setpos(int(args.start * rate))
+        data = src.readframes(int(args.duration * rate))
+    with wave.open(args.out_wav, "wb") as dst:
+        dst.setnchannels(1)
+        dst.setsampwidth(2)
+        dst.setframerate(rate)
+        dst.writeframes(data)
+    print(f"slice: {args.start:.1f}s + {args.duration:.1f}s -> {args.out_wav}")
+
+
+def slice_ref(args):
+    """Cut a reference JSON to the same interval as a wav slice."""
+    ref = json.load(open(args.ref))
+    a, b = args.start, args.start + args.duration
+    words = [
+        {**w, "start": w["start"] - a, "end": w["end"] - a}
+        for w in ref["words"]
+        if w["start"] >= a and w["end"] <= b
+    ]
+    segments = []
+    for s in ref["segments"]:
+        start, end = max(s["start"], a), min(s["end"], b)
+        if end > start:
+            segments.append({**s, "start": start - a, "end": end - a})
+    out = {
+        "meeting": ref["meeting"] + f"@{a:.0f}s",
+        "words": words,
+        "segments": segments,
+        "duration": min(b, ref["duration"]) - a,
+        "speakers": ref["speakers"],
+    }
+    json.dump(out, open(args.out, "w"), indent=1)
+    print(f"slice ref: {len(words)} words, {len(segments)} segments -> {args.out}")
 
 
 def clean_sample(args):
@@ -152,14 +218,57 @@ def clean_sample(args):
     )
 
 
-def wer(ref_words, hyp_words):
+def librispeech_sample(args):
+    """Build the same 30 test-clean utterances from the HF datasets server.
+
+    Rows 0..29 of openslr/librispeech_asr, config clean, split test, in order,
+    with 0.2 s of silence between utterances. Deterministic, so the SHA-256
+    pinned in fetch-data.sh holds.
+    """
+    import wave
+
+    endpoint = (
+        "https://datasets-server.huggingface.co/rows?"
+        f"dataset=openslr%2Flibrispeech_asr&config=clean&split=test&offset=0&length={args.count}"
+    )
+    with urllib.request.urlopen(endpoint, timeout=120) as r:
+        payload = json.load(r)
+
+    pieces = []
+    refs = []
+    sample_rate = 16000
+    for row in payload["rows"]:
+        audio = row["row"]["audio"][0]["src"]
+        with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            urllib.request.urlretrieve(audio, tmp_path)
+            raw = subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-i", tmp_path, "-f", "s16le",
+                 "-acodec", "pcm_s16le", "-ac", "1", "-ar", str(sample_rate), "-"],
+                check=True, capture_output=True,
+            ).stdout
+        finally:
+            os.unlink(tmp_path)
+        pieces.append(raw)
+        pieces.append(b"\x00\x00" * int(0.2 * sample_rate))
+        refs.append({"text": row["row"]["text"]})
+
+    with wave.open(args.out_wav, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"".join(pieces))
+    json.dump({"meeting": "librispeech_test-clean_30", "words": refs}, open(args.out_ref, "w"), indent=1)
+    print(f"librispeech sample: {len(refs)} utterances -> {args.out_wav}")
+
+
+def wer_tokens(ref_tokens, hyp_tokens):
     from rapidfuzz.distance import Levenshtein
 
-    r = norm_tokens(ref_words)
-    h = norm_tokens(hyp_words)
-    if not r:
-        return {"wer": 0.0, "ref_words": 0, "hyp_words": len(h), "errors": len(h)}
-    ops = Levenshtein.opcodes(r, h)
+    if not ref_tokens:
+        return {"wer": 0.0, "ref_words": 0, "hyp_words": len(hyp_tokens), "errors": len(hyp_tokens)}
+    ops = Levenshtein.opcodes(ref_tokens, hyp_tokens)
     sub = ins = dele = 0
     for tag, i1, i2, j1, j2 in ops:
         if tag == "replace":
@@ -173,100 +282,21 @@ def wer(ref_words, hyp_words):
             ins += j2 - j1
     errors = sub + ins + dele
     return {
-        "wer": errors / len(r),
+        "wer": errors / len(ref_tokens),
         "sub": sub,
         "ins": ins,
         "del": dele,
         "errors": errors,
-        "ref_words": len(r),
-        "hyp_words": len(h),
+        "ref_words": len(ref_tokens),
+        "hyp_words": len(hyp_tokens),
     }
 
 
-def der(ref_segments, hyp_segments, collar, exclude_overlap, step=0.01):
-    """Frame-based DER with optional overlap exclusion and NIST collar."""
-    import numpy as np
-    from scipy.optimize import linear_sum_assignment
-
-    ref_spk = sorted({s["speaker"] for s in ref_segments})
-    hyp_spk = sorted({s["speaker"] for s in hyp_segments})
-    if not ref_spk:
-        return {"der": 0.0, "note": "no reference segments"}
-    dur = max(
-        max(s["end"] for s in ref_segments), max((s["end"] for s in hyp_segments), default=0)
-    )
-    n = int(math.ceil(dur / step)) + 1
-
-    ref = np.zeros((len(ref_spk), n), dtype=bool)
-    ridx = {s: i for i, s in enumerate(ref_spk)}
-    for s in ref_segments:
-        ref[ridx[s["speaker"]], int(round(s["start"] / step)) : int(round(s["end"] / step))] = True
-
-    hyp = np.full(n, -1, dtype=np.int16)
-    hidx = {s: i for i, s in enumerate(hyp_spk)}
-    for s in hyp_segments:
-        hyp[int(round(s["start"] / step)) : int(round(s["end"] / step))] = hidx[s["speaker"]]
-
-    total = ref.sum(axis=0).astype(np.int32)
-    ref_any = total > 0
-    overlap = total > 1
-    hyp_any = hyp >= 0
-
-    mask = ref_any.copy()
-    if exclude_overlap:
-        mask &= ~overlap
-
-    unheard = np.zeros(n, dtype=bool)
-    if collar > 0:
-        for s in ref_segments:
-            a = int(round((s["start"] - collar) / step))
-            b = int(round((s["start"] + collar) / step))
-            unheard[max(0, a) : min(n, b)] = True
-            a = int(round((s["end"] - collar) / step))
-            b = int(round((s["end"] + collar) / step))
-            unheard[max(0, a) : min(n, b)] = True
-        mask &= ~unheard
-
-    # Map hyp clusters to ref speakers by overlapping speech duration.
-    cost = np.zeros((len(ref_spk), len(hyp_spk)))
-    for i, rs in enumerate(ref_spk):
-        for j, hs in enumerate(hyp_spk):
-            both = ref[i] & (hyp == j)
-            cost[i, j] = both.sum()
-    if len(ref_spk) and len(hyp_spk):
-        ri, hi = linear_sum_assignment(-cost)
-        mapping = {hyp_spk[j]: ref_spk[i] for i, j in zip(ri, hi)}
-    else:
-        mapping = {}
-    mapped = np.full(n, -1, dtype=np.int16)
-    for j, name in enumerate(hyp_spk):
-        if name in mapping:
-            mapped[hyp == j] = ridx[mapping[name]]
-        else:
-            mapped[hyp == j] = -2  # spoke, but not matched to any reference speaker
-
-    # Confusion: a hyp label that is not active in the reference at that frame.
-    hyp_ok = np.zeros(n, dtype=bool)
-    for i in range(len(ref_spk)):
-        hyp_ok |= (mapped == i) & ref[i]
-    confusion = hyp_any & ref_any & ~hyp_ok
-    miss = mask & ref_any & ~hyp_any
-    fa = mask & ~ref_any & hyp_any
-    conf = mask & confusion
-    speaks = mask & ref_any
-
-    total_ref = int(speaks.sum())
+def wer_pair(ref_words, hyp_words):
+    """WER with the legacy normalizer and with Whisper's English normalizer."""
     return {
-        "der": (int(miss.sum()) + int(fa.sum()) + int(conf.sum())) / max(1, total_ref),
-        "miss": int(miss.sum()) / max(1, total_ref),
-        "false_alarm": int(fa.sum()) / max(1, total_ref),
-        "confusion": int(conf.sum()) / max(1, total_ref),
-        "ref_speech_seconds": total_ref * step,
-        "collar": collar,
-        "exclude_overlap": exclude_overlap,
-        "ref_speakers": len(ref_spk),
-        "hyp_speakers": len(hyp_spk),
-        "mapping": mapping,
+        "legacy": wer_tokens(legacy_tokens(ref_words), legacy_tokens(hyp_words)),
+        "whisper": wer_tokens(whisper_tokens(ref_words), whisper_tokens(hyp_words)),
     }
 
 
@@ -274,6 +304,8 @@ def single_speaker_mask(ref, step=0.01):
     """Intervals where exactly one reference speaker is active (10 ms grid)."""
     import numpy as np
 
+    if not ref.get("segments"):
+        return np.zeros(0, dtype=bool), step
     dur = max((s["end"] for s in ref["segments"]), default=0.0)
     n = int(math.ceil(dur / step)) + 1
     cover = np.zeros(n, dtype=np.int16)
@@ -283,12 +315,7 @@ def single_speaker_mask(ref, step=0.01):
 
 
 def score_no_overlap(ref, asr):
-    """WER restricted to regions where only one reference speaker talks.
-
-    Both the reference words and the hypothesis words (by timestamp midpoint)
-    are filtered to those regions, so words lost to overlapping speech do not
-    count as errors. This is the number comparable to clean-speech WER.
-    """
+    """WER restricted to regions where only one reference speaker talks."""
     mask, step = single_speaker_mask(ref)
     if not len(mask):
         return None
@@ -304,9 +331,126 @@ def score_no_overlap(ref, asr):
             hyp_words.append(w["text"])
     if not ref_words:
         return None
-    res = wer(ref_words, hyp_words)
-    res["ref_words"] = len(norm_tokens(ref_words))
-    return res
+    return wer_pair(ref_words, hyp_words)
+
+
+def hyp_gap_stats(ref, asr, min_gap=5.0):
+    """Long stretches with no hypothesis word while the reference has speech.
+
+    This is the diagnostic for the old 240 s-chunk failure: whole stretches
+    inside a chunk produced no words at all.
+    """
+    words = sorted(asr.get("words", []), key=lambda w: w["start"])
+    if len(words) < 2:
+        return {"gaps_seconds": 0.0, "gaps": 0, "ref_words_in_gaps": 0}
+    gaps = 0
+    seconds = 0.0
+    ref_words = 0
+    prev = words[0]["end"]
+    for w in words[1:]:
+        start = w["start"]
+        if start - prev >= min_gap:
+            gaps += 1
+            seconds += start - prev
+            for r in ref["words"]:
+                mid = (r["start"] + r["end"]) / 2
+                if prev <= mid < start:
+                    ref_words += 1
+        prev = max(prev, w["end"])
+    return {"gaps_seconds": seconds, "gaps": gaps, "ref_words_in_gaps": ref_words}
+
+
+def annotation_from_segments(segments):
+    from pyannote.core import Annotation, Segment
+
+    ann = Annotation()
+    for s in segments:
+        start, end = float(s["start"]), float(s["end"])
+        if end <= start:
+            continue
+        label = str(s["speaker"])
+        ann[Segment(start, end), label] = label
+    return ann
+
+
+def der_pyannote(ref_segments, hyp_segments, uem_end, collar, skip_overlap):
+    """pyannote.metrics DiarizationErrorRate over a UEM covering the whole file."""
+    from pyannote.core import Segment
+    from pyannote.metrics.diarization import DiarizationErrorRate
+
+    ref = annotation_from_segments(ref_segments)
+    hyp = annotation_from_segments(hyp_segments)
+    metric = DiarizationErrorRate(collar=collar, skip_overlap=skip_overlap)
+    detail = metric(ref, hyp, uem=Segment(0.0, float(uem_end)), detailed=True)
+    total = float(detail["total"])
+    miss = float(detail.get("missed detection", detail.get("miss", 0.0)))
+    fa = float(detail.get("false alarm", 0.0))
+    conf = float(detail.get("confusion", 0.0))
+    return {
+        "der": float(detail["diarization error rate"]),
+        "miss": miss / total if total else 0.0,
+        "false_alarm": fa / total if total else 0.0,
+        "confusion": conf / total if total else 0.0,
+        "miss_seconds": miss,
+        "false_alarm_seconds": fa,
+        "confusion_seconds": conf,
+        "ref_speech_seconds": total,
+        "collar": collar,
+        "skip_overlap": skip_overlap,
+    }
+
+
+def filter_small_clusters(segments, fraction):
+    """Reassign clusters under `fraction` of speech time to the nearest large one.
+
+    Segments of a small cluster go to the large cluster whose nearest segment
+    is closest in time. No fixed speaker count is ever forced: if every cluster
+    is large, or none is, the segments come back unchanged.
+    """
+    if fraction <= 0 or not segments:
+        return list(segments), []
+    speech = {}
+    for s in segments:
+        speech[s["speaker"]] = speech.get(s["speaker"], 0.0) + max(0.0, s["end"] - s["start"])
+    total = sum(speech.values())
+    if total <= 0:
+        return list(segments), []
+    large = sorted(k for k, t in speech.items() if t >= fraction * total)
+    small = sorted(k for k in speech if k not in set(large))
+    if not large or not small:
+        return list(segments), []
+
+    by_large = {k: [] for k in large}
+    for s in segments:
+        if s["speaker"] in by_large:
+            by_large[s["speaker"]].append(s)
+
+    def gap(seg, candidate):
+        best = math.inf
+        for other in by_large[candidate]:
+            if seg["end"] < other["start"]:
+                d = other["start"] - seg["end"]
+            elif other["end"] < seg["start"]:
+                d = seg["start"] - other["end"]
+            else:
+                d = 0.0
+            best = min(best, d)
+        return best
+
+    out = []
+    for s in segments:
+        item = dict(s)
+        if item["speaker"] in small:
+            item["speaker"] = min(large, key=lambda k: (gap(item, k), str(k)))
+        out.append(item)
+    return out, small
+
+
+def speaker_totals(segments):
+    totals = {}
+    for s in segments:
+        totals[s["speaker"]] = totals.get(s["speaker"], 0.0) + max(0.0, s["end"] - s["start"])
+    return {str(k): round(v, 3) for k, v in sorted(totals.items(), key=lambda kv: -kv[1])}
 
 
 def score_one(args):
@@ -316,24 +460,28 @@ def score_one(args):
 
     asr = hyp.get("asr")
     if asr:
-        raw = wer([w["text"] for w in ref["words"]], asr.get("text", "").split())
-        nofill = wer(
+        ref_text = [w["text"] for w in ref["words"]]
+        hyp_text = asr.get("text", "")
+        both = wer_pair(ref_text, hyp_text)
+        out["wer"] = both["legacy"]["wer"]
+        out["wer_detail"] = both["legacy"]
+        out["wer_whisper"] = both["whisper"]["wer"]
+        out["wer_whisper_detail"] = both["whisper"]
+        nofill = wer_pair(
             [w["text"] for w in ref["words"] if w["text"].lower() not in FILLERS],
-            [
-                t
-                for t in asr.get("text", "").split()
-                if t.lower().strip(".,?!") not in FILLERS
-            ],
+            [t for t in hyp_text.split() if t.lower().strip(".,?!") not in FILLERS],
         )
-        out["wer"] = raw["wer"]
-        out["wer_without_fillers"] = nofill["wer"]
+        out["wer_without_fillers"] = nofill["legacy"]["wer"]
         noovl = score_no_overlap(ref, asr)
         if noovl:
-            out["wer_no_overlap"] = noovl["wer"]
+            out["wer_no_overlap"] = noovl["legacy"]["wer"]
+            out["wer_no_overlap_whisper"] = noovl["whisper"]["wer"]
             out["wer_no_overlap_detail"] = noovl
-        out["wer_detail"] = raw
+        out["hyp_gap_stats"] = hyp_gap_stats(ref, asr)
         out["asr_seconds"] = asr.get("decode_seconds")
         out["asr_rtf"] = asr.get("rtf")
+        out["asr_cpu_seconds"] = asr.get("cpu_seconds")
+        out["vad"] = asr.get("vad")
         out["load_ms_cold"] = asr.get("load_ms_cold")
         out["load_ms_warm"] = asr.get("load_ms_warm")
         out["has_word_timestamps"] = asr.get("has_word_timestamps")
@@ -341,47 +489,145 @@ def score_one(args):
 
     diar = hyp.get("diarization")
     if diar:
-        segs = [{"start": s["start"], "end": s["end"], "speaker": s["speaker"]} for s in diar["segments"]]
-        refsegs = [{"start": s["start"], "end": s["end"], "speaker": s["speaker"]} for s in ref["segments"]]
-        primary = der(refsegs, segs, args.collar, exclude_overlap=False)
+        segs = [
+            {"start": s["start"], "end": s["end"], "speaker": s["speaker"]}
+            for s in diar["segments"]
+        ]
+        refsegs = [
+            {"start": s["start"], "end": s["end"], "speaker": s["speaker"]}
+            for s in ref["segments"]
+        ]
+        uem_end = float(hyp.get("audio_seconds") or ref.get("duration") or 0.0)
+        filtered, dropped = filter_small_clusters(segs, args.small_cluster_fraction)
+
+        def der_block(hyp_segs):
+            primary = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.0, skip_overlap=False)
+            collar = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.25, skip_overlap=False)
+            no_ovl = der_pyannote(refsegs, hyp_segs, uem_end, collar=0.0, skip_overlap=True)
+            return primary, collar, no_ovl
+
+        primary, collar, no_ovl = der_block(segs)
+        f_primary, f_collar, f_no_ovl = der_block(filtered)
         out["der"] = primary["der"]
         out["der_detail"] = primary
-        out["der_no_overlap"] = der(refsegs, segs, args.collar, exclude_overlap=True)["der"]
-        out["der_no_collar"] = der(refsegs, segs, 0.0, exclude_overlap=False)["der"]
+        out["der_collar025"] = collar["der"]
+        out["der_collar025_detail"] = collar
+        out["der_no_overlap"] = no_ovl["der"]
+        out["der_filtered"] = f_primary["der"]
+        out["der_filtered_detail"] = f_primary
+        out["der_filtered_collar025"] = f_collar["der"]
+        out["der_filtered_no_overlap"] = f_no_ovl["der"]
+        out["small_cluster_fraction"] = args.small_cluster_fraction
+        out["small_clusters"] = [str(x) for x in dropped]
+        out["speaker_totals"] = speaker_totals(segs)
         out["diar_seconds"] = diar.get("process_seconds")
         out["diar_rtf"] = diar.get("rtf")
+        out["diar_cpu_seconds"] = diar.get("cpu_seconds")
+        out["threshold"] = diar.get("threshold")
         out["ref_speakers"] = len(ref["speakers"])
         out["hyp_speakers"] = diar.get("num_speakers")
+        out["hyp_speakers_filtered"] = len({s["speaker"] for s in filtered})
         out["speaker_count_ok"] = len(ref["speakers"]) == diar.get("num_speakers")
+        out["speaker_count_ok_filtered"] = (
+            len(ref["speakers"]) == out["hyp_speakers_filtered"]
+        )
 
     comb = hyp.get("combined")
     if comb:
-        out["total_seconds"] = comb["total_seconds"]
-        out["total_rtf"] = comb["rtf"]
+        out["combined_asr_seconds"] = comb.get("asr_seconds")
+        out["combined_diar_seconds"] = comb.get("diarization_seconds")
+        out["critical_path_seconds"] = comb.get("critical_path_seconds")
+        out["total_seconds"] = comb.get("total_seconds")
+        out["total_cpu_seconds"] = hyp.get("process_cpu_seconds")
+        out["total_rtf"] = comb.get("rtf")
     if "peak_rss_mb" in hyp:
         out["peak_rss_mb"] = hyp["peak_rss_mb"]
     out["threads"] = hyp.get("threads")
+    out["diar_threads"] = hyp.get("diar_threads")
+    out["spin"] = hyp.get("spin")
     out["audio_seconds"] = hyp.get("audio_seconds")
+    out["loadavg_start"] = hyp.get("loadavg_start")
+    out["loadavg_end"] = hyp.get("loadavg_end")
+    out["machine"] = hyp.get("machine")
 
     with open(args.out, "w") as f:
         json.dump(out, f, indent=1)
     print(json.dumps(out, indent=1))
 
 
+def tune(args):
+    """Aggregate dev DER over thresholds and small-cluster filters.
+
+    Result files are expected to be named diar-<meeting>-*.json; the AMI
+    reference is <ref-dir>/<meeting>.ref.json.
+    """
+    fractions = [float(x) for x in args.fractions.split(",")]
+    by_key = {}
+    for result in sorted(glob.glob(args.results_glob)):
+        meeting = os.path.basename(result).split("-")[1]
+        ref = json.load(open(os.path.join(args.ref_dir, meeting + ".ref.json")))
+        hyp = json.load(open(result))
+        diar = hyp.get("diarization")
+        if not diar:
+            continue
+        threshold = diar.get("threshold")
+        segs = diar["segments"]
+        refsegs = ref["segments"]
+        uem = float(hyp.get("audio_seconds") or ref.get("duration") or 0.0)
+        for fraction in fractions:
+            filtered, dropped = filter_small_clusters(segs, fraction)
+            detail = der_pyannote(refsegs, filtered, uem, collar=0.0, skip_overlap=False)
+            key = (threshold, fraction)
+            by_key.setdefault(key, []).append(
+                {
+                    "meeting": meeting,
+                    "der": detail["der"],
+                    "speakers": len({s["speaker"] for s in filtered}),
+                    "ref_speakers": len(ref["speakers"]),
+                    "clusters": len({s["speaker"] for s in segs}),
+                }
+            )
+    print("| threshold | cluster filter | mean DER | meetings | speaker count |")
+    print("|---|---|---|---|---|")
+    for (threshold, fraction) in sorted(by_key, key=lambda k: (k[0], k[1])):
+        rows = by_key[(threshold, fraction)]
+        mean = sum(r["der"] for r in rows) / len(rows)
+        counts = " ".join(f"{r['speakers']}/{r['ref_speakers']}" for r in rows)
+        print(
+            f"| {threshold} | {fraction * 100:.1f}% | {mean * 100:.1f}% | "
+            f"{len(rows)} | {counts} |"
+        )
+    candidates = [
+        (threshold, fraction, sum(r["der"] for r in rows) / len(rows))
+        for (threshold, fraction), rows in by_key.items()
+        if abs(fraction - args.choose_fraction) < 1e-9
+    ]
+    if candidates:
+        threshold, fraction, mean = min(candidates, key=lambda x: (x[2], x[0]))
+        print(f"BEST {threshold:g} {fraction:g} {mean:.6f}")
+
+
+def fmt_pct(v):
+    return "—" if v is None else f"{v * 100:.1f}%"
+
+
 def table(paths):
     rows = [json.load(open(p)) for p in paths]
     cols = [
         ("meeting", "meeting"),
-        ("audio_min", "audio_min"),
+        ("audio_min", "audio min"),
         ("threads", "thr"),
-        ("wer", "WER"),
+        ("wer", "WER legacy"),
+        ("wer_whisper", "WER Whisper"),
+        ("del", "del/ins/sub"),
+        ("threshold", "cluster thr"),
         ("der", "DER"),
-        ("der_no_overlap", "DER no-ovl"),
-        ("spk", "spk ref/hyp"),
+        ("der_collar025", "DER c25"),
+        ("der_filtered", "DER filt"),
+        ("spk", "spk raw/filt/ref"),
         ("asr_rtf", "ASR RTF"),
         ("diar_rtf", "DIAR RTF"),
         ("total_rtf", "total RTF"),
-        ("load_ms_cold", "load cold ms"),
         ("peak_rss_mb", "peak RSS MB"),
     ]
     print("| " + " | ".join(c[1] for c in cols) + " |")
@@ -392,21 +638,51 @@ def table(paths):
             if key == "audio_min":
                 v = f"{r.get('audio_seconds', 0) / 60:.1f}"
             elif key == "spk":
-                v = f"{r.get('ref_speakers', '?')}/{r.get('hyp_speakers', '?')}"
-            elif key == "wer":
-                v = f"{r.get('wer', 0) * 100:.1f}%"
-            elif key in ("der", "der_no_overlap"):
-                v = f"{r.get(key, 0) * 100:.1f}%"
+                v = (
+                    f"{r.get('hyp_speakers', '?')}/"
+                    f"{r.get('hyp_speakers_filtered', '?')}/"
+                    f"{r.get('ref_speakers', '?')}"
+                )
+            elif key == "del":
+                d = r.get("wer_whisper_detail") or {}
+                v = f"{d.get('del', '?')}/{d.get('ins', '?')}/{d.get('sub', '?')}"
+            elif key == "threshold" and r.get(key) is not None:
+                v = f"{r[key]:.2f}"
+            elif key in ("wer", "wer_whisper", "der", "der_collar025", "der_filtered"):
+                v = fmt_pct(r.get(key))
             elif key.endswith("_rtf"):
                 v = f"{r.get(key, 0):.3f}"
             elif key == "peak_rss_mb":
-                v = f"{r.get(key, 0):.0f}"
-            elif key == "load_ms_cold":
                 v = f"{r.get(key, 0):.0f}"
             else:
                 v = str(r.get(key, ""))
             vals.append(v)
         print("| " + " | ".join(vals) + " |")
+
+
+def timing(paths):
+    """Timing/ablation table straight from result JSON (no scoring)."""
+    print("| run | audio min | threads | spin | wall s | CPU s | RTF | max piece s | peak RSS MB |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for p in paths:
+        r = json.load(open(p))
+        if r.get("command") == "combined":
+            wall = r["combined"]["asr_seconds"]
+            cpu = r.get("process_cpu_seconds", 0.0)
+            rtf = r["combined"].get("rtf", 0.0)
+            note = "combined ASR wall"
+        else:
+            stage = r.get("asr") or r.get("diarization")
+            wall = stage.get("decode_seconds", stage.get("process_seconds", 0.0))
+            cpu = r.get("process_cpu_seconds", 0.0)
+            rtf = stage.get("rtf", 0.0)
+            note = os.path.basename(p)
+        max_piece = (r.get("asr") or {}).get("max_piece_seconds", 0.0)
+        print(
+            f"| {note} | {r.get('audio_seconds', 0) / 60:.1f} | {r.get('threads')} | "
+            f"{r.get('spin')} | {wall:.1f} | {cpu:.1f} | {rtf:.3f} | "
+            f"{max_piece:.1f} | {r.get('peak_rss_mb', 0):.0f} |"
+        )
 
 
 def main():
@@ -419,6 +695,20 @@ def main():
     p.add_argument("--out", required=True)
     p.set_defaults(func=lambda a: build_ref(a.annotations, a.meeting, a.out))
 
+    p = sub.add_parser("slice")
+    p.add_argument("--wav", required=True)
+    p.add_argument("--start", type=float, default=0.0)
+    p.add_argument("--duration", type=float, required=True)
+    p.add_argument("--out-wav", required=True)
+    p.set_defaults(func=cut_slice)
+
+    p = sub.add_parser("slice-ref")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--start", type=float, required=True)
+    p.add_argument("--duration", type=float, required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=slice_ref)
+
     p = sub.add_parser("clean-sample")
     p.add_argument("--ref", required=True)
     p.add_argument("--wav", required=True)
@@ -427,16 +717,33 @@ def main():
     p.add_argument("--out-ref", required=True)
     p.set_defaults(func=clean_sample)
 
+    p = sub.add_parser("librispeech-sample")
+    p.add_argument("--count", type=int, default=30)
+    p.add_argument("--out-wav", required=True)
+    p.add_argument("--out-ref", required=True)
+    p.set_defaults(func=librispeech_sample)
+
     p = sub.add_parser("score")
     p.add_argument("--ref", required=True)
     p.add_argument("--result", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--collar", type=float, default=0.25)
+    p.add_argument("--small-cluster-fraction", type=float, default=0.02)
     p.set_defaults(func=score_one)
+
+    p = sub.add_parser("tune")
+    p.add_argument("--ref-dir", required=True)
+    p.add_argument("--results-glob", required=True)
+    p.add_argument("--fractions", default="0,0.005,0.01,0.02,0.03")
+    p.add_argument("--choose-fraction", type=float, default=0.02)
+    p.set_defaults(func=tune)
 
     p = sub.add_parser("table")
     p.add_argument("paths", nargs="+")
     p.set_defaults(func=lambda a: table(a.paths))
+
+    p = sub.add_parser("timing")
+    p.add_argument("paths", nargs="+")
+    p.set_defaults(func=lambda a: timing(a.paths))
 
     args = ap.parse_args()
     args.func(args)

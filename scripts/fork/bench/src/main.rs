@@ -2,6 +2,11 @@
 //! and offline speaker diarization (pyannote segmentation 3.0 + speaker
 //! embedding). See docs/fork/benchmark.md for the reproduction commands.
 //!
+//! ASR is segmented with the sherpa-onnx Silero VAD into <= 30 s pieces cut at
+//! silence, with a hard 60 s cap per model call. The old fixed-chunk mode is
+//! kept only for the ablation (`--chunk-seconds`), with the overlap trimmed at
+//! the midpoint on both sides.
+//!
 //! Every stage writes one JSON object. Timings are wall clock. Model load is
 //! measured twice: "cold" after evicting the model files from the page cache
 //! (posix_fadvise DONTNEED), "warm" by building a second instance right after.
@@ -10,14 +15,25 @@ use serde_json::{json, Value};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
     OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
-    OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig, SpeakerEmbeddingExtractorConfig,
-    Wave,
+    OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
+    SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector, Wave,
 };
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::Instant;
+
+const SAMPLE_RATE: usize = 16000;
+const MAX_ASR_SECONDS: f32 = 60.0;
+const VAD_PIECE_SECONDS: f32 = 30.0;
+const VAD_PRE_ROLL_SECONDS: f32 = 2.0;
+const VAD_POST_ROLL_SECONDS: f32 = 1.0;
+const VAD_MIN_PIECE_SECONDS: f32 = 10.0;
+const VAD_SPLIT_WINDOW_SECONDS: f32 = 0.05;
+const VAD_JOIN_GAP_SECONDS: f32 = 0.5;
+const VAD_FLUSH_SECONDS: f32 = 20.0;
 
 struct Args {
     cmd: String,
@@ -96,31 +112,146 @@ fn peak_rss_mb() -> f64 {
     0.0
 }
 
+fn cpu_seconds() -> f64 {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return 0.0;
+        }
+        ru.ru_utime.tv_sec as f64
+            + ru.ru_utime.tv_usec as f64 / 1e6
+            + ru.ru_stime.tv_sec as f64
+            + ru.ru_stime.tv_usec as f64 / 1e6
+    }
+}
+
 fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
-struct AsrModels<'a> {
-    encoder: &'a str,
-    decoder: &'a str,
-    joiner: &'a str,
-    tokens: &'a str,
+/// CPU ids this process may actually run on.
+fn affinity_ids() -> Vec<usize> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut set,
+        ) != 0
+        {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|i| libc::CPU_ISSET(*i, &set))
+            .collect()
+    }
 }
 
-fn build_recognizer(m: &AsrModels, threads: i32) -> Option<OfflineRecognizer> {
+fn read_first<T: std::str::FromStr>(path: &str) -> Option<T> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Physical cores among the CPUs the process may use (package, core) pairs.
+fn physical_cores(ids: &[usize]) -> usize {
+    let mut cores = HashSet::new();
+    for id in ids {
+        let pkg: Option<i32> = read_first(&format!(
+            "/sys/devices/system/cpu/cpu{id}/topology/physical_package_id"
+        ));
+        let core: Option<i32> =
+            read_first(&format!("/sys/devices/system/cpu/cpu{id}/topology/core_id"));
+        if let (Some(p), Some(c)) = (pkg, core) {
+            cores.insert((p, c));
+        }
+    }
+    if cores.is_empty() {
+        ids.len()
+    } else {
+        cores.len()
+    }
+}
+
+/// CPU quota from cgroup v2, in CPUs, if a quota is set.
+fn cgroup_cpus() -> Option<usize> {
+    let text = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
+    let mut it = text.split_whitespace();
+    let quota = it.next()?;
+    let period: u64 = it.next()?.parse().ok()?;
+    if quota == "max" || period == 0 {
+        return None;
+    }
+    let quota: u64 = quota.parse().ok()?;
+    Some(quota.div_ceil(period).max(1) as usize)
+}
+
+fn machine_info() -> Value {
+    let ids = affinity_ids();
+    let logical = if ids.is_empty() {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        ids.len()
+    };
+    let physical = physical_cores(&ids).min(logical);
+    let cpu = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("model name"))
+                .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
+        })
+        .unwrap_or_default();
+    json!({
+        "cpu": cpu,
+        "logical_cpus": logical,
+        "physical_cores": physical,
+        "affinity_ids": ids,
+        "cgroup_cpus": cgroup_cpus(),
+        "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+    })
+}
+
+/// Provider string plus a temp config file that disables ORT intra-op spinning.
+fn provider_string(spin: i32) -> (String, Option<String>) {
+    if spin < 0 {
+        return ("cpu".to_string(), None);
+    }
+    let path = format!("/tmp/tinta-bench-provider-{}.conf", std::process::id());
+    let body = format!(
+        "SessionConfig.session.intra_op.allow_spinning={}\n",
+        spin.min(1)
+    );
+    if std::fs::write(&path, body).is_ok() {
+        (format!("cpu:{path}"), Some(path))
+    } else {
+        ("cpu".to_string(), None)
+    }
+}
+
+struct AsrModels {
+    encoder: String,
+    decoder: String,
+    joiner: String,
+    tokens: String,
+}
+
+#[allow(clippy::field_reassign_with_default)]
+fn build_recognizer(m: &AsrModels, threads: i32, provider: &str) -> Option<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.transducer = OfflineTransducerModelConfig {
-        encoder: Some(m.encoder.to_string()),
-        decoder: Some(m.decoder.to_string()),
-        joiner: Some(m.joiner.to_string()),
+        encoder: Some(m.encoder.clone()),
+        decoder: Some(m.decoder.clone()),
+        joiner: Some(m.joiner.clone()),
     };
-    config.model_config.tokens = Some(m.tokens.to_string());
+    config.model_config.tokens = Some(m.tokens.clone());
     config.model_config.model_type = Some("nemo_transducer".to_string());
-    config.model_config.provider = Some("cpu".to_string());
+    config.model_config.provider = Some(provider.to_string());
     config.model_config.num_threads = threads;
     OfflineRecognizer::create(&config)
 }
 
+#[allow(clippy::too_many_arguments, clippy::field_reassign_with_default)]
 fn build_diarizer(
     seg_model: &str,
     embedding: &str,
@@ -130,6 +261,7 @@ fn build_diarizer(
     min_on: f32,
     min_off: f32,
     window_shift: f32,
+    provider: &str,
 ) -> Option<OfflineSpeakerDiarization> {
     let mut config = OfflineSpeakerDiarizationConfig::default();
     config.segmentation = OfflineSpeakerSegmentationModelConfig {
@@ -139,13 +271,13 @@ fn build_diarizer(
         },
         num_threads: threads,
         debug: false,
-        provider: Some("cpu".to_string()),
+        provider: Some(provider.to_string()),
     };
     config.embedding = SpeakerEmbeddingExtractorConfig {
         model: Some(embedding.to_string()),
         num_threads: threads,
         debug: false,
-        provider: Some("cpu".to_string()),
+        provider: Some(provider.to_string()),
     };
     config.clustering.num_clusters = num_speakers;
     config.clustering.threshold = threshold;
@@ -194,13 +326,18 @@ fn tokens_to_words(tokens: &[String], ts: &[f32], dur: Option<&[f32]>) -> Vec<Wo
     words
 }
 
-fn run_asr(
+fn run_asr_call(
     rec: &OfflineRecognizer,
     samples: &[f32],
     offset_s: f32,
 ) -> (String, Vec<String>, Vec<f32>, Option<Vec<f32>>) {
+    let seconds = samples.len() as f32 / SAMPLE_RATE as f32;
+    assert!(
+        seconds <= MAX_ASR_SECONDS + 0.001,
+        "ASR call of {seconds:.1} s exceeds the hard cap of {MAX_ASR_SECONDS} s"
+    );
     let stream = rec.create_stream();
-    stream.accept_waveform(16000, samples);
+    stream.accept_waveform(SAMPLE_RATE as i32, samples);
     rec.decode(&stream);
     let r = stream.get_result().expect("asr result");
     let ts: Vec<f32> = r
@@ -213,233 +350,657 @@ fn run_asr(
     (r.text, r.tokens, ts, r.durations)
 }
 
+/// Silero VAD speech segments in sample indices, absolute in the input.
+#[allow(clippy::field_reassign_with_default)]
+fn vad_segments(
+    samples: &[f32],
+    model: &str,
+    threads: i32,
+    provider: &str,
+    threshold: f32,
+) -> (Vec<(usize, usize)>, f64, Value) {
+    let mut cfg = VadModelConfig::default();
+    cfg.silero_vad = SileroVadModelConfig {
+        model: Some(model.to_string()),
+        threshold,
+        min_silence_duration: 0.3,
+        min_speech_duration: 0.1,
+        window_size: 512,
+        max_speech_duration: VAD_PIECE_SECONDS,
+    };
+    cfg.sample_rate = SAMPLE_RATE as i32;
+    cfg.num_threads = threads;
+    cfg.provider = Some(provider.to_string());
+    cfg.debug = false;
+
+    let t = Instant::now();
+    let vad = VoiceActivityDetector::create(&cfg, 60.0).expect("create VAD");
+    let load_ms = ms_since(t);
+    let mut segs: Vec<(usize, usize)> = Vec::new();
+    let flush_n = (VAD_FLUSH_SECONDS * SAMPLE_RATE as f32) as usize;
+    let mut since_flush = 0usize;
+    for block in samples.chunks(SAMPLE_RATE) {
+        vad.accept_waveform(block);
+        since_flush += block.len();
+        while let Some(s) = vad.front() {
+            let start = s.start().max(0) as usize;
+            let n = s.n().max(0) as usize;
+            if n > 0 {
+                segs.push((start, (start + n).min(samples.len())));
+            }
+            vad.pop();
+        }
+        // A long continuous speech run would otherwise keep growing the VAD's
+        // circular buffer. Close it every 20 s; the pre-roll on the next piece
+        // keeps the cut harmless.
+        if vad.detected() && since_flush >= flush_n {
+            vad.flush();
+            since_flush = 0;
+            while let Some(s) = vad.front() {
+                let start = s.start().max(0) as usize;
+                let n = s.n().max(0) as usize;
+                if n > 0 {
+                    segs.push((start, (start + n).min(samples.len())));
+                }
+                vad.pop();
+            }
+        } else if !vad.detected() {
+            since_flush = 0;
+        }
+    }
+    vad.flush();
+    while let Some(s) = vad.front() {
+        let start = s.start().max(0) as usize;
+        let n = s.n().max(0) as usize;
+        if n > 0 {
+            segs.push((start, (start + n).min(samples.len())));
+        }
+        vad.pop();
+    }
+    let speech_s: f64 = segs.iter().map(|(a, b)| (b - a) as f64 / SAMPLE_RATE as f64).sum();
+    let seg_count = segs.len();
+    let ranges: Vec<Value> = segs
+        .iter()
+        .map(|(a, b)| json!([*a as f64 / SAMPLE_RATE as f64, *b as f64 / SAMPLE_RATE as f64]))
+        .collect();
+    (
+        segs,
+        load_ms,
+        json!({
+            "model": model,
+            "load_ms": load_ms,
+            "segments": seg_count,
+            "speech_seconds": speech_s,
+            "max_speech_duration": VAD_PIECE_SECONDS,
+            "min_silence_duration": 0.3,
+            "threshold": threshold,
+            "ranges": ranges,
+        }),
+    )
+}
+
+/// Quietest point in [lo, hi), used to split a long speech run at low energy
+/// instead of at an arbitrary 30 s boundary.
+fn quietest_point(samples: &[f32], lo: usize, hi: usize) -> usize {
+    let win = (VAD_SPLIT_WINDOW_SECONDS * SAMPLE_RATE as f32) as usize;
+    if hi <= lo + win {
+        return (lo + hi) / 2;
+    }
+    let mut best = lo + win / 2;
+    let mut best_energy = f32::INFINITY;
+    let mut pos = lo;
+    while pos + win <= hi {
+        let energy: f32 = samples[pos..pos + win].iter().map(|x| x * x).sum();
+        if energy < best_energy {
+            best_energy = energy;
+            best = pos + win / 2;
+        }
+        pos += win;
+    }
+    best
+}
+
+/// Split a speech run into pieces of at most `max_piece` seconds, cutting at
+/// the quietest point in the second half of each piece.
+fn split_run(samples: &[f32], a: usize, b: usize, max_piece: f32) -> Vec<(usize, usize)> {
+    let max_n = (max_piece * SAMPLE_RATE as f32) as usize;
+    let mut runs = Vec::new();
+    let mut start = a;
+    while b.saturating_sub(start) > max_n {
+        let hi = start + max_n;
+        let lo = start + (max_n as f32 * 0.6) as usize;
+        let split = quietest_point(samples, lo, hi);
+        runs.push((start, split));
+        start = split;
+    }
+    if b > start {
+        runs.push((start, b));
+    }
+    runs
+}
+
+/// Group VAD segments into decode pieces of at most `max_piece` seconds.
+/// Every piece gets a pre-roll because Parakeet can return zero words for an
+/// input that starts mid-speech; overlapping edges are de-duplicated at the
+/// midpoint after decoding.
+fn group_vad_pieces(
+    samples: &[f32],
+    segs: &[(usize, usize)],
+    audio_len: usize,
+    max_piece: f32,
+) -> Vec<(usize, usize)> {
+    let max_piece_n = (max_piece * SAMPLE_RATE as f32) as usize;
+    let join_gap = (VAD_JOIN_GAP_SECONDS * SAMPLE_RATE as f32) as usize;
+    let pre = (VAD_PRE_ROLL_SECONDS * SAMPLE_RATE as f32) as usize;
+    let post = (VAD_POST_ROLL_SECONDS * SAMPLE_RATE as f32) as usize;
+    let min_piece = (VAD_MIN_PIECE_SECONDS * SAMPLE_RATE as f32) as usize;
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in segs {
+        runs.extend(split_run(samples, *a, *b, max_piece));
+    }
+
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in runs {
+        if let Some(last) = groups.last_mut() {
+            let span = b.saturating_sub(last.0);
+            let gap = a.saturating_sub(last.1);
+            if span <= max_piece_n && gap <= join_gap {
+                last.1 = b;
+                continue;
+            }
+        }
+        groups.push((a, b));
+    }
+
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for (i, (a, b)) in groups.iter().enumerate() {
+        let mut start = a.saturating_sub(pre);
+        if i == 0 {
+            start = 0;
+        }
+        let end = (b + post).max(start + min_piece).min(audio_len);
+        if end <= start {
+            continue;
+        }
+        let cap = (MAX_ASR_SECONDS * SAMPLE_RATE as f32) as usize;
+        let end = end.min(start + cap);
+        pieces.push((start, end));
+    }
+    pieces
+}
+
+fn fixed_chunks(audio_len: usize, chunk_s: f32, overlap: f32) -> Vec<(usize, usize)> {
+    let chunk = (chunk_s * SAMPLE_RATE as f32) as usize;
+    let step = ((chunk_s - overlap).max(0.5) * SAMPLE_RATE as f32) as usize;
+    let mut pieces = Vec::new();
+    let mut pos = 0usize;
+    while pos < audio_len {
+        let end = (pos + chunk).min(audio_len);
+        pieces.push((pos, end));
+        if end == audio_len {
+            break;
+        }
+        pos += step;
+    }
+    pieces
+}
+
+struct AsrStage<'a> {
+    samples: &'a [f32],
+    audio_s: f64,
+    models: &'a AsrModels,
+    threads: i32,
+    provider: &'a str,
+    vad_model: Option<&'a str>,
+    vad_threshold: f32,
+    chunk_s: f32,
+    overlap: f32,
+}
+
+fn run_asr_stage(cfg: &AsrStage) -> Value {
+    let stage_t = Instant::now();
+    let cpu_start = cpu_seconds();
+
+    let mut vad_json = Value::Null;
+    let mut pieces;
+    let mut vad_seconds = 0.0;
+    if let Some(vad_model) = cfg.vad_model {
+        let t = Instant::now();
+        let (segs, _load_ms, info) = vad_segments(cfg.samples, vad_model, 1, cfg.provider, cfg.vad_threshold);
+        pieces = group_vad_pieces(cfg.samples, &segs, cfg.samples.len(), VAD_PIECE_SECONDS);
+        vad_seconds = t.elapsed().as_secs_f64();
+        vad_json = info;
+        vad_json["decode_seconds"] = json!(vad_seconds);
+        vad_json["pieces"] = json!(pieces.len());
+        if pieces.is_empty() {
+            pieces = fixed_chunks(cfg.samples.len(), VAD_PIECE_SECONDS, 0.0);
+            vad_json["fallback_fixed_chunks"] = json!(true);
+        }
+    } else {
+        pieces = fixed_chunks(cfg.samples.len(), cfg.chunk_s, cfg.overlap);
+    }
+    let cpu_after_vad = cpu_seconds();
+
+    evict(&[
+        &cfg.models.encoder,
+        &cfg.models.decoder,
+        &cfg.models.joiner,
+        &cfg.models.tokens,
+    ]);
+    let t = Instant::now();
+    let rec = build_recognizer(cfg.models, cfg.threads, cfg.provider).expect("create recognizer");
+    let load_cold = ms_since(t);
+
+    let t = Instant::now();
+    let rec2 = build_recognizer(cfg.models, cfg.threads, cfg.provider)
+        .expect("create recognizer (warm)");
+    let load_warm = ms_since(t);
+    drop(rec);
+    drop(rec2);
+
+    let rec = build_recognizer(cfg.models, cfg.threads, cfg.provider).expect("create recognizer");
+    let cpu_after_build = cpu_seconds();
+
+    let t = Instant::now();
+    let mut all_words: Vec<Word> = Vec::new();
+    let mut chunks_out: Vec<(f32, f32, Vec<Word>)> = Vec::new();
+    for (a, b) in &pieces {
+        let seconds = (*b - *a) as f32 / SAMPLE_RATE as f32;
+        assert!(
+            seconds <= MAX_ASR_SECONDS + 0.001,
+            "piece of {seconds:.1} s exceeds the {MAX_ASR_SECONDS} s cap"
+        );
+        let off = *a as f32 / SAMPLE_RATE as f32;
+        let (_text, tk, tsv, dur) = run_asr_call(&rec, &cfg.samples[*a..*b], off);
+        let words = tokens_to_words(&tk, &tsv, dur.as_deref());
+        chunks_out.push((off, *b as f32 / SAMPLE_RATE as f32, words));
+    }
+    // Cut every overlap at its midpoint on both sides, then sort by time.
+    for i in 1..chunks_out.len() {
+        let boundary = if cfg.vad_model.is_some() {
+            (chunks_out[i - 1].1 + chunks_out[i].0) / 2.0
+        } else {
+            chunks_out[i].0 + cfg.overlap / 2.0
+        };
+        chunks_out[i - 1].2.retain(|w| w.start < boundary);
+        chunks_out[i].2.retain(|w| w.start >= boundary);
+    }
+    for (_, _, words) in chunks_out {
+        all_words.extend(words);
+    }
+    all_words.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all_words.retain(|w| !w.text.trim().is_empty());
+    let decode_seconds = t.elapsed().as_secs_f64();
+    let cpu_end = cpu_seconds();
+
+    let text = all_words
+        .iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let max_piece = pieces
+        .iter()
+        .map(|(a, b)| (*b - *a) as f64 / SAMPLE_RATE as f64)
+        .fold(0.0f64, f64::max);
+    let stage_seconds = stage_t.elapsed().as_secs_f64();
+    json!({
+        "load_ms_cold": load_cold,
+        "load_ms_warm": load_warm,
+        "vad": vad_json,
+        "vad_seconds": vad_seconds,
+        "vad_cpu_seconds": cpu_after_vad - cpu_start,
+        "pieces": pieces.len(),
+        "max_piece_seconds": max_piece,
+        "decode_seconds": decode_seconds,
+        "stage_seconds": stage_seconds,
+        "cpu_seconds": cpu_end - cpu_after_build,
+        "total_cpu_seconds": cpu_end - cpu_start,
+        "rtf": decode_seconds / cfg.audio_s,
+        "chunk_seconds": if cfg.vad_model.is_some() { 0.0 } else { cfg.chunk_s },
+        "chunk_overlap": cfg.overlap,
+        "text": text,
+        "word_count": all_words.len(),
+        "has_word_timestamps": all_words.iter().all(|w| w.end >= w.start),
+        "words": all_words.iter().map(|w| json!({"start": w.start, "end": w.end, "text": w.text})).collect::<Vec<_>>(),
+    })
+}
+
+struct DiarStage<'a> {
+    samples: &'a [f32],
+    audio_s: f64,
+    seg_model: &'a str,
+    embedding: &'a str,
+    threads: i32,
+    threshold: f32,
+    num_speakers: i32,
+    min_on: f32,
+    min_off: f32,
+    window_shift: f32,
+    provider: &'a str,
+}
+
+fn run_diar_stage(cfg: &DiarStage) -> Value {
+    let stage_t = Instant::now();
+    let cpu_start = cpu_seconds();
+    evict(&[cfg.seg_model, cfg.embedding]);
+    let t = Instant::now();
+    let d = build_diarizer(
+        cfg.seg_model,
+        cfg.embedding,
+        cfg.threads,
+        cfg.threshold,
+        cfg.num_speakers,
+        cfg.min_on,
+        cfg.min_off,
+        cfg.window_shift,
+        cfg.provider,
+    )
+    .expect("create diarizer");
+    let load_cold = ms_since(t);
+    let t = Instant::now();
+    let d2 = build_diarizer(
+        cfg.seg_model,
+        cfg.embedding,
+        cfg.threads,
+        cfg.threshold,
+        cfg.num_speakers,
+        cfg.min_on,
+        cfg.min_off,
+        cfg.window_shift,
+        cfg.provider,
+    )
+    .expect("create diarizer (warm)");
+    let load_warm = ms_since(t);
+    drop(d2);
+    let cpu_after_build = cpu_seconds();
+
+    let t = Instant::now();
+    let result = d.process(cfg.samples).expect("diarize");
+    let process_seconds = t.elapsed().as_secs_f64();
+    let cpu_end = cpu_seconds();
+    let segs = result.sort_by_start_time();
+    let segments: Vec<(f32, f32, i32)> =
+        segs.iter().map(|s| (s.start, s.end, s.speaker)).collect();
+    json!({
+        "seg_model": cfg.seg_model,
+        "embedding_model": cfg.embedding,
+        "threshold": cfg.threshold,
+        "window_shift": cfg.window_shift,
+        "min_duration_on": cfg.min_on,
+        "min_duration_off": cfg.min_off,
+        "load_ms_cold": load_cold,
+        "load_ms_warm": load_warm,
+        "process_seconds": process_seconds,
+        "stage_seconds": stage_t.elapsed().as_secs_f64(),
+        "cpu_seconds": cpu_end - cpu_after_build,
+        "total_cpu_seconds": cpu_end - cpu_start,
+        "rtf": process_seconds / cfg.audio_s,
+        "num_speakers": result.num_speakers(),
+        "num_segments": result.num_segments(),
+        "segments": segments.iter().map(|(s, e, sp)| json!({"start": s, "end": e, "speaker": sp})).collect::<Vec<_>>(),
+    })
+}
+
+fn combine_turns(asr: &Value, diar_segments: &[(f32, f32, i32)]) -> Vec<Value> {
+    let words: Vec<Value> = asr["words"].as_array().cloned().unwrap_or_default();
+    let mut turns: Vec<Value> = Vec::new();
+    for w in &words {
+        let ws = w["start"].as_f64().unwrap_or(0.0) as f32;
+        let we = w["end"].as_f64().unwrap_or(0.0) as f32;
+        let mut best = (-1, 0.0f32);
+        for (s, e, sp) in diar_segments {
+            let ov = (we.min(*e) - ws.max(*s)).max(0.0);
+            if ov > best.1 {
+                best = (*sp, ov);
+            }
+        }
+        let spk = if best.0 < 0 {
+            let mid = (ws + we) / 2.0;
+            diar_segments
+                .iter()
+                .min_by(|a, b| {
+                    let da = if mid < a.0 {
+                        a.0 - mid
+                    } else if mid > a.1 {
+                        mid - a.1
+                    } else {
+                        0.0
+                    };
+                    let db = if mid < b.0 {
+                        b.0 - mid
+                    } else if mid > b.1 {
+                        mid - b.1
+                    } else {
+                        0.0
+                    };
+                    da.partial_cmp(&db).unwrap()
+                })
+                .map(|x| x.2)
+                .unwrap_or(-1)
+        } else {
+            best.0
+        };
+        let text = w["text"].as_str().unwrap_or("").to_string();
+        let append = turns
+            .last()
+            .map(|t| t["speaker"].as_i64().unwrap_or(-2) == spk as i64)
+            .unwrap_or(false);
+        if append {
+            let last = turns.last_mut().unwrap();
+            let t2 = format!("{} {}", last["text"].as_str().unwrap_or(""), text);
+            last["text"] = json!(t2.trim());
+            last["end"] = json!(we);
+        } else {
+            turns.push(json!({"speaker": spk, "start": ws, "end": we, "text": text}));
+        }
+    }
+    turns
+}
+
 fn main() {
     let args = Args::parse();
     let wav_path = args.req("wav");
-    let threads = args.i32_or("threads", 4);
     let out_path = args.req("output");
+    let machine = machine_info();
+    let logical = machine["logical_cpus"].as_u64().unwrap_or(1) as i32;
+    let physical = (machine["physical_cores"].as_u64().unwrap_or(logical as u64) as i32).min(logical);
+
+    // Defaults scale with the CPUs the process actually gets: ASR gets half of
+    // them, capped at 4; diarization gets 2-4.
+    let default_asr_threads = (physical / 2).clamp(1, 4);
+    let default_diar_threads = (physical / 2).clamp(2, 4);
+    let asr_threads = args.i32_or("threads", default_asr_threads);
+    let diar_threads = args.i32_or("diar-threads", default_diar_threads);
+    let spin = args.i32_or("spin", -1);
 
     let wave = Wave::read(&wav_path).expect("read wav");
     assert_eq!(wave.sample_rate(), 16000, "expected 16 kHz mono wav");
-    let samples = wave.samples();
-    let audio_s = samples.len() as f64 / 16000.0;
+    let samples_owned = wave.samples().to_vec();
+    let samples = samples_owned.as_slice();
+    let audio_s = samples.len() as f64 / SAMPLE_RATE as f64;
+
+    let (provider, provider_conf) = provider_string(spin);
+    let process_start = Instant::now();
+    if args.cmd == "vad" {
+        let model = args.req("vad-model");
+        let (segs, _load, info) = vad_segments(samples, &model, asr_threads, &provider, args.f32_or("vad-threshold", 0.5));
+        let pieces = group_vad_pieces(samples, &segs, samples.len(), VAD_PIECE_SECONDS);
+        let out = json!({
+            "command": "vad",
+            "wav": wav_path,
+            "audio_seconds": audio_s,
+            "threads": asr_threads,
+            "loadavg_start": loadavg(),
+            "vad": info,
+            "pieces": pieces.iter().map(|(a, b)| json!([*a as f64 / SAMPLE_RATE as f64, *b as f64 / SAMPLE_RATE as f64])).collect::<Vec<_>>(),
+            "max_piece_seconds": pieces.iter().map(|(a, b)| (*b - *a) as f64 / SAMPLE_RATE as f64).fold(0.0f64, f64::max),
+            "peak_rss_mb": peak_rss_mb(),
+            "loadavg_end": loadavg(),
+        });
+        if let Some(dir) = Path::new(&out_path).parent() { let _ = std::fs::create_dir_all(dir); }
+        let mut f = File::create(&out_path).expect("create output");
+        f.write_all(serde_json::to_string_pretty(&out).unwrap().as_bytes()).expect("write output");
+        if let Some(path) = provider_conf { let _ = std::fs::remove_file(path); }
+        return;
+    }
+    let cpu_start = cpu_seconds();
 
     let mut out = json!({
         "command": args.cmd,
         "wav": wav_path,
         "audio_seconds": audio_s,
-        "threads": threads,
-        "loadavg_start": loadavg(),
-        "machine": {
-            "cpu": std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())).unwrap_or_default(),
-            "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "threads": asr_threads,
+        "diar_threads": diar_threads,
+        "thread_defaults": {
+            "asr": default_asr_threads,
+            "diarization": default_diar_threads,
+            "logical_cpus": logical,
+            "physical_cores": physical,
         },
+        "spin": if spin < 0 { "default".to_string() } else { spin.to_string() },
+        "provider": provider,
+        "loadavg_start": loadavg(),
+        "machine": machine,
     });
 
-    let run_asr_stage = args.cmd == "asr" || args.cmd == "combined";
-    let run_diar_stage = args.cmd == "diarize" || args.cmd == "combined";
+    let run_asr = args.cmd == "asr" || args.cmd == "combined";
+    let run_diar = args.cmd == "diarize" || args.cmd == "combined";
+    let vad_model = args.get("vad-model").map(|s| s.to_string());
+    let chunk_s = args.f32_or("chunk-seconds", 0.0);
 
-    let mut asr_seconds = 0.0f64;
-    let mut diar_seconds = 0.0f64;
-
-    if run_asr_stage {
-        let models = AsrModels {
-            encoder: &args.req("encoder"),
-            decoder: &args.req("decoder"),
-            joiner: &args.req("joiner"),
-            tokens: &args.req("tokens"),
-        };
-        evict(&[models.encoder, models.decoder, models.joiner, models.tokens]);
-        let t = Instant::now();
-        let rec = build_recognizer(&models, threads).expect("create recognizer");
-        let load_cold = ms_since(t);
-
-        let t = Instant::now();
-        let rec2 = build_recognizer(&models, threads).expect("create recognizer (warm)");
-        let load_warm = ms_since(t);
-        drop(rec);
-        drop(rec2);
-
-        let rec = build_recognizer(&models, threads).expect("create recognizer");
-
-        let chunk_s = args.f32_or("chunk-seconds", 0.0);
-        let overlap = args.f32_or("chunk-overlap", 1.0);
-        let t = Instant::now();
-        let text;
-        let mut tokens = Vec::new();
-        let mut ts = Vec::new();
-        let mut durations = Vec::<f32>::new();
-        let mut words = Vec::<Word>::new();
-        let mut chunks = 0;
-        if chunk_s <= 0.0 {
-            let (t1, tk, tsv, dur) = run_asr(&rec, samples, 0.0);
-            text = t1;
-            words = tokens_to_words(&tk, &tsv, dur.as_deref());
-            tokens = tk;
-            ts = tsv;
-            durations = dur.unwrap_or_default();
-            chunks = 1;
-        } else {
-            let chunk = (chunk_s * 16000.0) as usize;
-            let step = ((chunk_s - overlap).max(0.5) * 16000.0) as usize;
-            let mut pos = 0usize;
-            while pos < samples.len() {
-                let end = (pos + chunk).min(samples.len());
-                let off = pos as f32 / 16000.0;
-                let (t1, tk, tsv, dur) = run_asr(&rec, &samples[pos..end], off);
-                let mut w = tokens_to_words(&tk, &tsv, dur.as_deref());
-                // Drop words that start in the overlap the previous chunk
-                // already transcribed, so no word is counted twice.
-                if pos > 0 {
-                    let keep_from = off + overlap / 2.0;
-                    w.retain(|x| x.start >= keep_from);
-                }
-                let _ = t1;
-                words.extend(w);
-                tokens.extend(tk);
-                ts.extend(tsv);
-                durations.extend(dur.unwrap_or_default());
-                chunks += 1;
-                if end == samples.len() {
-                    break;
-                }
-                pos += step;
-            }
-            text = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    let asr_models = if run_asr {
+        AsrModels {
+            encoder: args.req("encoder"),
+            decoder: args.req("decoder"),
+            joiner: args.req("joiner"),
+            tokens: args.req("tokens"),
         }
-        asr_seconds = t.elapsed().as_secs_f64();
-        let ts_min = ts.iter().cloned().fold(f32::INFINITY, f32::min);
-        let ts_max = ts.iter().cloned().fold(0.0f32, f32::max);
-        out["asr"] = json!({
-            "load_ms_cold": load_cold,
-            "load_ms_warm": load_warm,
-            "decode_seconds": asr_seconds,
-            "rtf": asr_seconds / audio_s,
-            "chunks": chunks,
-            "text": text,
-            "tokens": tokens,
-            "token_timestamps": ts,
-            "token_durations": durations,
-            "word_count": words.len(),
-            "has_word_timestamps": !ts.is_empty() && words.iter().all(|w| w.end >= w.start),
-            "timestamp_min": if ts.is_empty() { 0.0 } else { ts_min },
-            "timestamp_max": if ts.is_empty() { 0.0 } else { ts_max },
-            "words": words.iter().map(|w| json!({"start": w.start, "end": w.end, "text": w.text})).collect::<Vec<_>>(),
-        });
-    }
+    } else {
+        AsrModels {
+            encoder: String::new(),
+            decoder: String::new(),
+            joiner: String::new(),
+            tokens: String::new(),
+        }
+    };
+    let (seg_model, embedding) = if run_diar {
+        (args.req("seg-model"), args.req("embedding"))
+    } else {
+        (String::new(), String::new())
+    };
+    let threshold = args.f32_or("threshold", 0.5);
+    let num_speakers = args.i32_or("num-speakers", -1);
+    let min_on = args.f32_or("min-duration-on", 0.3);
+    let min_off = args.f32_or("min-duration-off", 0.5);
+    let window_shift = args.f32_or("window-shift", 0.2);
 
-    let mut diar_segments: Vec<(f32, f32, i32)> = Vec::new();
-    if run_diar_stage {
-        let seg_model = args.req("seg-model");
-        let embedding = args.req("embedding");
-        evict(&[&seg_model, &embedding]);
-        let t = Instant::now();
-        let d = build_diarizer(
-            &seg_model,
-            &embedding,
-            threads,
-            args.f32_or("threshold", 0.5),
-            args.i32_or("num-speakers", -1),
-            args.f32_or("min-duration-on", 0.3),
-            args.f32_or("min-duration-off", 0.5),
-            args.f32_or("window-shift", 0.1),
-        )
-        .expect("create diarizer");
-        let load_cold = ms_since(t);
-        let t = Instant::now();
-        let d2 = build_diarizer(
-            &seg_model,
-            &embedding,
-            threads,
-            args.f32_or("threshold", 0.5),
-            args.i32_or("num-speakers", -1),
-            args.f32_or("min-duration-on", 0.3),
-            args.f32_or("min-duration-off", 0.5),
-            args.f32_or("window-shift", 0.1),
-        )
-        .expect("create diarizer (warm)");
-        let load_warm = ms_since(t);
-        drop(d2);
+    let asr_cfg = AsrStage {
+        samples,
+        audio_s,
+        models: &asr_models,
+        threads: asr_threads,
+        provider: &provider,
+        vad_model: vad_model.as_deref(),
+        vad_threshold: args.f32_or("vad-threshold", 0.5),
+        chunk_s,
+        overlap: args.f32_or("chunk-overlap", 2.0),
+    };
+    let diar_cfg = DiarStage {
+        samples,
+        audio_s,
+        seg_model: &seg_model,
+        embedding: &embedding,
+        threads: diar_threads,
+        threshold,
+        num_speakers,
+        min_on,
+        min_off,
+        window_shift,
+        provider: &provider,
+    };
 
-        let t = Instant::now();
-        let result = d.process(samples).expect("diarize");
-        diar_seconds = t.elapsed().as_secs_f64();
-        let segs = result.sort_by_start_time();
-        diar_segments = segs.iter().map(|s| (s.start, s.end, s.speaker)).collect();
-        out["diarization"] = json!({
-            "seg_model": seg_model,
-            "embedding_model": embedding,
-            "threshold": args.f32_or("threshold", 0.5),
-            "window_shift": args.f32_or("window-shift", 0.1),
-            "load_ms_cold": load_cold,
-            "load_ms_warm": load_warm,
-            "process_seconds": diar_seconds,
-            "rtf": diar_seconds / audio_s,
-            "num_speakers": result.num_speakers(),
-            "num_segments": result.num_segments(),
-            "segments": diar_segments.iter().map(|(s, e, sp)| json!({"start": s, "end": e, "speaker": sp})).collect::<Vec<_>>(),
-        });
-    }
-
+    let mut asr_out = Value::Null;
+    let mut diar_out = Value::Null;
     if args.cmd == "combined" {
-        let total = asr_seconds + diar_seconds;
-        // Assign every ASR word to the diarization speaker it overlaps most.
-        let words: Vec<Value> = out["asr"]["words"].as_array().cloned().unwrap_or_default();
-        let mut turns: Vec<Value> = Vec::new();
-        for w in &words {
-            let ws = w["start"].as_f64().unwrap_or(0.0) as f32;
-            let we = w["end"].as_f64().unwrap_or(0.0) as f32;
-            let mut best = (-1, 0.0f32);
-            for (s, e, sp) in &diar_segments {
-                let ov = (we.min(*e) - ws.max(*s)).max(0.0);
-                if ov > best.1 {
-                    best = (*sp, ov);
-                }
-            }
-            let spk = if best.0 < 0 {
-                // No overlap: nearest segment by midpoint distance.
-                let mid = (ws + we) / 2.0;
-                diar_segments
-                    .iter()
-                    .min_by(|a, b| {
-                        let da = if mid < a.0 { a.0 - mid } else if mid > a.1 { mid - a.1 } else { 0.0 };
-                        let db = if mid < b.0 { b.0 - mid } else if mid > b.1 { mid - b.1 } else { 0.0 };
-                        da.partial_cmp(&db).unwrap()
-                    })
-                    .map(|x| x.2)
-                    .unwrap_or(-1)
-            } else {
-                best.0
-            };
-            let text = w["text"].as_str().unwrap_or("").to_string();
-            let append = turns
-                .last()
-                .map(|t| t["speaker"].as_i64().unwrap_or(-2) == spk as i64)
-                .unwrap_or(false);
-            if append {
-                let last = turns.last_mut().unwrap();
-                let t2 = format!("{} {}", last["text"].as_str().unwrap_or(""), text);
-                last["text"] = json!(t2.trim());
-                last["end"] = json!(we);
-            } else {
-                turns.push(json!({"speaker": spk, "start": ws, "end": we, "text": text}));
-            }
-        }
+        let (a, d) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| run_asr_stage(&asr_cfg));
+            let d = scope.spawn(|| run_diar_stage(&diar_cfg));
+            (
+                a.join().expect("asr thread"),
+                d.join().expect("diarization thread"),
+            )
+        });
+        let mut a = a;
+        let mut d = d;
+        // RUSAGE_SELF is process-wide: the per-stage CPU split is not
+        // attributable when both stages run at once. Use the standalone runs
+        // for per-stage CPU; report only the process total here.
+        a["cpu_seconds"] = serde_json::Value::Null;
+        a["total_cpu_seconds"] = serde_json::Value::Null;
+        d["cpu_seconds"] = serde_json::Value::Null;
+        d["total_cpu_seconds"] = serde_json::Value::Null;
+        let asr_wall = a["stage_seconds"].as_f64().unwrap_or(0.0);
+        let diar_wall = d["stage_seconds"].as_f64().unwrap_or(0.0);
+        let turns = {
+            let segs: Vec<(f32, f32, i32)> = d["segments"]
+                .as_array()
+                .map(|v| {
+                    v.iter()
+                        .map(|s| {
+                            (
+                                s["start"].as_f64().unwrap_or(0.0) as f32,
+                                s["end"].as_f64().unwrap_or(0.0) as f32,
+                                s["speaker"].as_i64().unwrap_or(-1) as i32,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            combine_turns(&a, &segs)
+        };
+        let total = process_start.elapsed().as_secs_f64();
         out["combined"] = json!({
-            "asr_seconds": asr_seconds,
-            "diarization_seconds": diar_seconds,
+            "asr_seconds": asr_wall,
+            "diarization_seconds": diar_wall,
+            "critical_path_seconds": asr_wall.max(diar_wall),
             "total_seconds": total,
             "rtf": total / audio_s,
             "turns": turns,
         });
+        asr_out = a;
+        diar_out = d;
+    } else {
+        if run_asr {
+            asr_out = run_asr_stage(&asr_cfg);
+        }
+        if run_diar {
+            diar_out = run_diar_stage(&diar_cfg);
+        }
+    }
+    if run_asr {
+        out["asr"] = asr_out;
+    }
+    if run_diar {
+        out["diarization"] = diar_out;
     }
 
     out["peak_rss_mb"] = json!(peak_rss_mb());
+    out["process_wall_seconds"] = json!(process_start.elapsed().as_secs_f64());
+    out["process_cpu_seconds"] = json!(cpu_seconds() - cpu_start);
     out["loadavg_end"] = json!(loadavg());
+
     if let Some(dir) = Path::new(&out_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut f = File::create(&out_path).expect("create output");
     f.write_all(serde_json::to_string_pretty(&out).unwrap().as_bytes())
         .expect("write output");
+    if let Some(path) = provider_conf {
+        let _ = std::fs::remove_file(path);
+    }
 }

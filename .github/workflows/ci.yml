@@ -72,9 +72,13 @@ jobs:
       VCPKG_ROOT: C:\vcpkg
     steps:
       - uses: actions/checkout@v4
-      # SQLCipher is bundled but builds against OpenSSL. vcpkg provides it for MSVC.
+      # SQLCipher is bundled but builds against OpenSSL. vcpkg provides it for MSVC, and
+      # libsqlite3-sys wants the prefix in OPENSSL_DIR.
       - name: Install OpenSSL
         run: vcpkg install openssl:x64-windows
+      - name: Point SQLCipher at OpenSSL
+        shell: pwsh
+        run: echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
       # The Tauri build script copies the sidecar binaries that the bundle declares.
       - name: Create placeholder sidecars

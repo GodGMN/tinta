@@ -182,8 +182,10 @@ jobs:
               apt-get install -y -qq --no-install-recommends \
                 gnome-keyring dbus dbus-x11 libsecret-tools espeak-ng ffmpeg \
                 python3 ca-certificates
-              deb="$(find bundle -name "*.deb" -print -quit)"
+              # apt treats a relative .deb path as a package name, so use an absolute one.
+              deb="$(find "$GITHUB_WORKSPACE/bundle" -type f -name "*.deb" -print -quit)"
               test -n "$deb"
+              echo "installing $deb"
               apt-get install -y -qq --no-install-recommends "$deb"
               for binary in /usr/bin/tinta /usr/bin/tinta-engine /usr/bin/tinta-mcp \
                 /usr/bin/tinta-native-host; do

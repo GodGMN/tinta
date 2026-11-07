@@ -15,6 +15,7 @@ in dependency order and is never review-merged itself.
   [#4 `feat/7/engine-skeleton`](https://github.com/GodGMN/tinta/pull/4),
   [#7 `feat/9/engine-finalize`](https://github.com/GodGMN/tinta/pull/7),
   [#15 `feat/20/recluster`](https://github.com/GodGMN/tinta/pull/15),
+  [#16 `feat/21/segmentation`](https://github.com/GodGMN/tinta/pull/16),
   [#10 `feat/11/linux-recording`](https://github.com/GodGMN/tinta/pull/10),
   [#13 `feat/12/linux-packaging`](https://github.com/GodGMN/tinta/pull/13).
   The `spike/*` branches are not part of it.
@@ -41,8 +42,9 @@ The script resets the branch to `origin/main` and merges each branch with
 8. `feat/7/engine-skeleton`
 9. `feat/9/engine-finalize`
 10. `feat/20/recluster`
-11. `feat/11/linux-recording`
-12. `feat/12/linux-packaging`
+11. `feat/21/segmentation`
+12. `feat/11/linux-recording`
+13. `feat/12/linux-packaging`
 
 It prints the head of every merged branch and refuses to finish unless each one
 is an ancestor of the result. The only ref it pushes is `integration/linux`, and
@@ -50,11 +52,12 @@ only with `--force-with-lease`.
 
 The branch also has integration-only commits (the AppImage helper fix, the
 smoke test, the keyring test). They carry an `Integration-only: true` trailer.
-Before resetting, the script records them in `.git/tinta-integration-commits`
-and reads the last published `integration/linux` for the list; after the merges
-it cherry-picks them back. On a brand-new clone that is the published branch.
-If a cherry-pick conflicts, resolve it, `git commit --no-edit`, and rerun with
-`--resume`.
+Before resetting, the script records them in `.git/tinta-integration-commits`.
+A fresh run always rebuilds that list from the last published
+`integration/linux` (so commits added since the previous build are kept); only
+`--resume` reads the recorded list, because the rebuild already reset the
+branch. After the merges the script cherry-picks them back. If a cherry-pick
+conflicts, resolve it, `git commit --no-edit`, and rerun with `--resume`.
 
 `git rerere` is enabled by the script. A manual resolution is remembered in the
 local rerere cache, so the same conflict resolves itself the next time. The

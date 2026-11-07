@@ -76,6 +76,7 @@ BRANCHES=(
   feat/7/engine-skeleton
   feat/9/engine-finalize
   feat/20/recluster
+  feat/21/segmentation
   feat/11/linux-recording
   feat/12/linux-packaging
 )
@@ -208,12 +209,16 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-git fetch "$REMOTE" --prune
+# Force-update every remote-tracking ref: the port branches are rewritten while
+# they are in review, and a stale ref would silently rebuild the old heads.
+git fetch "$REMOTE" --prune --force "+refs/heads/*:refs/remotes/$REMOTE/*"
 
-# Read the integration-only commits from the state file (a resumed run) or from
-# the last published result. A first run on a new clone has none yet.
+# Read the integration-only commits from the state file (only when resuming an
+# interrupted rebuild) or from the last published result. A fresh run must use
+# the published branch: the state file still holds the pre-rebuild SHAs, which
+# are stale once the cherry-picks have been published.
 INTEGRATION_COMMITS=()
-if [[ -f "$state" ]]; then
+if [[ "$RESUME" -eq 1 && -f "$state" ]]; then
   mapfile -t INTEGRATION_COMMITS <"$state"
 fi
 if ((${#INTEGRATION_COMMITS[@]} == 0)); then

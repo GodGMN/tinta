@@ -242,7 +242,7 @@ impl AppState {
         let mut extension = self.extension.lock().unwrap().clone();
         // A Meet call in Chrome does not belong to a recording of a desktop app call.
         // An extension without recent messages has no current call, for example when the end message did not arrive.
-        let stale = extension.last_seen.is_none_or(|t| now_ms() - t > EXTENSION_LIVE_MS);
+        let stale = extension.last_seen.map_or(true, |t| now_ms() - t > EXTENSION_LIVE_MS);
         if app_call.is_some() || stale {
             extension = ExtensionState::default();
         }
@@ -789,7 +789,7 @@ impl AppState {
             let state = state();
             let silent = {
                 let ext = state.extension.lock().unwrap();
-                ext.meeting_code.as_deref() == Some(code.as_str()) && ext.call_seen.is_none_or(|t| t <= left_at)
+                ext.meeting_code.as_deref() == Some(code.as_str()) && ext.call_seen.map_or(true, |t| t <= left_at)
             };
             if silent {
                 state.on_extension_message(&json!({"type": "meeting_ended", "meeting_code": code, "left_at": left_at}));

@@ -14,18 +14,14 @@ use sherpa_onnx::{
     FastClusteringConfig, OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
     OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
     OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
-    OfflineTransducerModelConfig, SileroVadModelConfig, SpeakerEmbeddingExtractorConfig,
-    VadModelConfig, VoiceActivityDetector,
+    OfflineTransducerModelConfig, SpeakerEmbeddingExtractorConfig, VoiceActivityDetector,
 };
 use std::path::Path;
 
 use crate::manifest::{ModelFile, ModelGroup};
 use crate::threads::Threads;
 
-const SAMPLE_RATE: i32 = 16_000;
-/// The benchmark's VAD settings and the 30 s cap on a piece.
-const VAD_MAX_SPEECH_SECONDS: f32 = 30.0;
-const VAD_BUFFER_SECONDS: f32 = 60.0;
+const VAD_BUFFER_SECONDS: f32 = 120.0;
 /// A safe over-segmenting default from the dev sweep.
 const DIARIZATION_THRESHOLD: f32 = 0.7;
 
@@ -99,21 +95,12 @@ fn load_transcription(
 
 fn load_vad(group: &ModelGroup, root: &Path, threads: &Threads, provider: &str) -> Result<()> {
     let model = path_of(root, group.file("vad")?);
-    let config = VadModelConfig {
-        silero_vad: SileroVadModelConfig {
-            model: Some(model),
-            threshold: 0.5,
-            min_silence_duration: 0.3,
-            min_speech_duration: 0.1,
-            window_size: 512,
-            max_speech_duration: VAD_MAX_SPEECH_SECONDS,
-        },
-        sample_rate: SAMPLE_RATE,
-        num_threads: threads.asr as i32,
-        provider: Some(provider.to_string()),
-        debug: false,
-        ..Default::default()
-    };
+    let config = crate::speech::vad_config(
+        model,
+        threads.asr,
+        provider.to_string(),
+        &crate::segment::Settings::default(),
+    );
 
     let vad = VoiceActivityDetector::create(&config, VAD_BUFFER_SECONDS)
         .context("the voice activity model did not load. Install the models again.")?;

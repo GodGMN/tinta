@@ -7,6 +7,9 @@
 - On Windows and Linux, when Tinta knows the call participants, the engine never reports more remote speakers than participants.
 - When speaker labels stop at 4 hours of a longer recording, the finalize result carries a note and the engine logs the reason. The app keeps working as before.
 
+### Changed
+- On Windows and Linux, meetings are transcribed more accurately. The engine no longer cuts a sentence when the voice detector reaches its limit, and it transcribes again the stretches where a long sentence came back with missing words. In the measured AMI meetings, the words lost to segmentation dropped by about 5 points of error rate.
+
 ### Fixed
 - On Windows and Linux, a recording longer than 4 hours keeps its full transcript, with speaker labels for the first 4 hours.
 - On Windows and Linux, importing an audio file longer than 12 hours fails immediately, before any audio is written, and a failed import no longer leaves a partially written track behind.

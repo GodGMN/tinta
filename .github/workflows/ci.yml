@@ -48,6 +48,89 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -p tinta --all-targets -- -D warnings
 
+  bundle-linux:
+    # Ubuntu 22.04 keeps the build on glibc 2.35, so the bundles run on Debian 12 (glibc 2.36)
+    # and Ubuntu 24.04 (glibc 2.39). `ubuntu-latest` is 24.04, and a build there needs glibc
+    # 2.39, which rules out both. 22.04 has libwebkit2gtk-4.1-dev in universe; if GitHub retires
+    # the image, build the bundle in a 22.04 container instead of moving to ubuntu-latest.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the bundles
+        run: ./scripts/build-linux.sh
+      - name: Check the bundles
+        run: |
+          set -euo pipefail
+          deb="$(ls target/release/bundle/deb/*.deb)"
+          # Save the listing once: `dpkg-deb -c | grep -q` would stop tar with SIGPIPE.
+          contents="$(mktemp)"
+          dpkg-deb -c "$deb" > "$contents"
+          cat "$contents"
+          dpkg-deb -I "$deb"
+          for name in tinta tinta-engine tinta-mcp tinta-native-host; do
+            grep -q "usr/bin/$name$" "$contents" || { echo "missing usr/bin/$name"; exit 1; }
+          done
+          tmp="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$tmp"
+          cat "$tmp/usr/share/applications/Tinta.desktop"
+          grep -qx 'Categories=AudioVideo;Audio;Recorder;' "$tmp/usr/share/applications/Tinta.desktop"
+          appimage="$(ls target/release/bundle/appimage/*.AppImage)"
+          work="$(mktemp -d)"
+          cd "$work"
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          ls -l squashfs-root/usr/bin
+          cat squashfs-root/usr/share/applications/Tinta.desktop
+          for name in tinta tinta-engine tinta-mcp tinta-native-host; do
+            test -x "squashfs-root/usr/bin/$name" || { echo "missing $name in the AppImage"; exit 1; }
+          done
+      # An ldd run on this machine proves nothing: the build image has every -dev package
+      # installed. Install the real .deb in a clean supported release instead, so apt has
+      # to resolve the whole Depends list, and check the installed binaries there.
+      - name: Install the deb in clean Debian 12 and Ubuntu 24.04
+        run: |
+          set -euo pipefail
+          deb="$(ls target/release/bundle/deb/*.deb)"
+          for image in debian:12 ubuntu:24.04; do
+            echo "== $image =="
+            docker run --rm \
+              -v "$PWD/$deb:/tmp/tinta.deb:ro" \
+              "$image" bash -euc '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends /tmp/tinta.deb
+                for binary in /usr/bin/tinta /usr/bin/tinta-engine \
+                  /usr/bin/tinta-mcp /usr/bin/tinta-native-host; do
+                  test -x "$binary"
+                  if ldd "$binary" | grep "not found"; then
+                    echo "unresolved libraries for $binary"
+                    exit 1
+                  fi
+                done
+              '
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinta-linux-x86_64
+          retention-days: 30
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
   app-macos:
     # The Intel image for the same capacity reason as `core-macos`. This compiles the macOS
     # platform module, so it proves that the Mac code still builds, but only for

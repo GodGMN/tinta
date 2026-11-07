@@ -11,6 +11,8 @@
 - On Windows and Linux, when Tinta knows the call participants, the engine never reports more remote speakers than participants.
 - When speaker labels stop at 4 hours of a longer recording, the finalize result carries a note and the engine logs the reason. The app keeps working as before.
 - Tinta records meetings on Linux. It records your microphone and the sound your computer plays, keeps both when you pause, and transcribes them when you stop. The microphone mute button, the live transcript, and the recording bubble work as on macOS.
+- Tinta has a Linux build, as a `.deb` package and an AppImage. It is a preview: it needs the rest of the Linux stack (key store, recording, helpers, call detection), so a bundle from the packaging branch alone cannot open a library or record. The README section **Linux (preview)** lists what works and what does not.
+- CI installs the `.deb` in clean Debian 12 and Ubuntu 24.04 containers and checks every installed binary with `ldd`, so a missing runtime package fails the build. The `tinta-linux-x86_64` artifact is kept for 30 days.
 
 ### Changed
 - On Windows and Linux, Tinta never creates a new key when a library already exists. If the system key store does not have the key, Tinta asks you to unlock your keyring instead of making the library unreadable.

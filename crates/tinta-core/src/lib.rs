@@ -1,14 +1,20 @@
 //! Core library for Tinta: storage, keys, name matching, calendar events, export, and MCP tools.
 
 pub mod calendar;
+pub mod chunks;
+#[cfg(feature = "database")]
 pub mod db;
+#[cfg(feature = "database")]
 pub mod export;
+#[cfg(feature = "database")]
 pub mod granola;
 pub mod keys;
 pub mod naming;
 pub mod paths;
 pub mod protocol;
+#[cfg(feature = "database")]
 pub mod tools;
+#[cfg(feature = "database")]
 pub mod transcript;
 
 pub fn now_ms() -> i64 {

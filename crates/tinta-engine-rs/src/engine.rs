@@ -493,16 +493,31 @@ mod tests {
         assert_eq!(reply["error"], "missing parameter: dir");
     }
 
+    /// Builds a request line with serde, so a Windows path's backslashes are
+    /// escaped correctly.
+    fn line(id: u64, cmd: &str, params: Value) -> String {
+        json!({ "id": id, "cmd": cmd, "params": params }).to_string()
+    }
+
     #[test]
     fn sample_validates_its_track_and_rejects_a_short_key() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().display().to_string();
         let key = STANDARD.encode([1u8; 32]);
-        let lines = run(&format!(
-            "{{\"id\":1,\"cmd\":\"sample\",\"params\":{{\"dir\":\"{}\",\"track\":\"left\",\"s\":0,\"e\":1,\"audio_key\":\"{key}\"}}}}\n\
-             {{\"id\":2,\"cmd\":\"sample\",\"params\":{{\"dir\":\"{}\",\"track\":\"mic\",\"s\":0,\"e\":1,\"audio_key\":\"AAAA\"}}}}",
-            dir.path().display(),
-            dir.path().display()
-        ));
+        let input = format!(
+            "{}\n{}",
+            line(
+                1,
+                "sample",
+                json!({ "dir": path, "track": "left", "s": 0, "e": 1, "audio_key": key }),
+            ),
+            line(
+                2,
+                "sample",
+                json!({ "dir": path, "track": "mic", "s": 0, "e": 1, "audio_key": "AAAA" }),
+            ),
+        );
+        let lines = run(&input);
         assert_eq!(lines[1]["error"], "invalid track");
         assert_eq!(lines[2]["error"], "invalid audio key");
     }
@@ -511,10 +526,18 @@ mod tests {
     fn sample_returns_a_wav_for_an_empty_meeting() {
         let dir = tempfile::tempdir().unwrap();
         let key = STANDARD.encode([1u8; 32]);
-        let lines = run(&format!(
-            "{{\"id\":1,\"cmd\":\"sample\",\"params\":{{\"dir\":\"{}\",\"track\":\"remote\",\"s\":0,\"e\":1,\"audio_key\":\"{key}\"}}}}",
-            dir.path().display()
-        ));
+        let input = line(
+            1,
+            "sample",
+            json!({
+                "dir": dir.path().display().to_string(),
+                "track": "remote",
+                "s": 0,
+                "e": 1,
+                "audio_key": key,
+            }),
+        );
+        let lines = run(&input);
         let wav = lines[1]["result"]["wav_base64"].as_str().unwrap();
         assert_eq!(STANDARD.decode(wav).unwrap().len(), 44);
     }

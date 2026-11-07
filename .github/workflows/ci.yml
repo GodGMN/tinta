@@ -67,6 +67,11 @@ jobs:
           done
       - name: Clippy
         run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+      # The app runs this engine on macOS. Building it here compiles the Swift code of the
+      # engine too, which the Rust jobs cannot check.
+      - name: Build the Swift engine
+        working-directory: engine
+        run: swift build -c release
 
   app-windows:
     runs-on: windows-latest

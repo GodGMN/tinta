@@ -432,30 +432,22 @@ pub fn with_models<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     work()
 }
 
-/// Runs `work` while holding the model lock, but returns `Ok(None)` instead of
-/// waiting when `keep_going` turns false.
+/// Runs `work` while holding the model lock, or returns `Ok(None)` at once when
+/// another pass holds it.
 ///
 /// The live draft worker uses this: during the final pass of the previous
-/// meeting the lock is held for minutes, and `stop` must not wait on it. One
-/// utterance is skipped instead, and the final pass transcribes it anyway.
-pub fn with_models_unless<T>(
-    keep_going: impl Fn() -> bool,
-    work: impl FnOnce() -> Result<T>,
-) -> Result<Option<T>> {
-    loop {
-        match MODEL_LOCK.try_lock() {
-            Ok(_guard) => return work().map(Some),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let _guard = poisoned.into_inner();
-                return work().map(Some);
-            }
-            Err(TryLockError::WouldBlock) => {
-                if !keep_going() {
-                    return Ok(None);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+/// meeting the lock is held for minutes, and the live worker must not queue a
+/// single utterance behind it. One `try_lock` either takes the models or skips
+/// that utterance (the final pass transcribes it anyway); the VAD keeps
+/// feeding, and the skipped span is a zero gap on the meeting clock.
+pub fn try_with_models<T>(work: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    match MODEL_LOCK.try_lock() {
+        Ok(_guard) => work().map(Some),
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let _guard = poisoned.into_inner();
+            work().map(Some)
         }
+        Err(TryLockError::WouldBlock) => Ok(None),
     }
 }
 
@@ -513,19 +505,23 @@ mod tests {
         });
         waiting.recv().unwrap();
         let called = std::sync::atomic::AtomicBool::new(false);
-        let result = with_models_unless(
-            || false,
-            || -> Result<()> {
-                called.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            },
-        );
+        let started = std::time::Instant::now();
+        let result = try_with_models(|| -> Result<()> {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
         assert!(matches!(result, Ok(None)), "the live pass gave up");
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        // It skipped at once instead of polling the lock.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "the skip took {:?}",
+            started.elapsed()
+        );
         release.send(()).unwrap();
         holder.join().unwrap();
         // With the lock free the same call runs.
-        assert_eq!(with_models_unless(|| true, || Ok(5)).unwrap(), Some(5));
+        assert_eq!(try_with_models(|| Ok(5)).unwrap(), Some(5));
     }
 
     #[test]

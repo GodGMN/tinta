@@ -43,11 +43,21 @@ pub struct Capabilities {
     pub live_transcription: bool,
 }
 
+/// A command that arrived while `start` was still opening its devices. Swift's
+/// `start` blocked the command loop, so a mute or pause clicked right after
+/// Record was applied when capture began; these are replayed in order once the
+/// session is active, with their original wall-clock time for a mute.
+enum PendingCommand {
+    Pause,
+    Resume,
+    MicMuted(bool, i64),
+}
+
 /// The recording session and, while a `start` is opening its devices, the fact
 /// that one is on its way. Guarded so `stop` and the start worker cannot race.
 enum SessionState {
     Idle,
-    Starting,
+    Starting(Vec<PendingCommand>),
     Active(RecordingSession),
 }
 
@@ -96,7 +106,7 @@ impl Engine {
         let result = self.read_commands(&mut input);
         // Stdin EOF and I/O errors still flush the recording, like Swift's
         // shutdown path.
-        self.stop_session();
+        let _ = self.stop_session();
         result
     }
 
@@ -123,7 +133,7 @@ impl Engine {
         };
 
         if request.cmd == "shutdown" {
-            self.stop_session();
+            let _ = self.stop_session();
             self.out.reply(&request.id, json!({}))?;
             log("shutdown requested");
             return Ok(true);
@@ -199,21 +209,25 @@ impl Engine {
             "call_report" => bail!("Call reading is not available on this platform."),
             "summarize" => bail!("Summaries are not available on this platform."),
             "start" => {
-                // Reached only from `handle_line`, which runs `start` off the
-                // command loop; the guard keeps the arm total.
-                bail!("a recording is already active");
+                // `handle_line` runs `start` on its own worker before reaching
+                // the command dispatch, so this arm is never the real path.
+                unreachable!("start is handled before the command dispatch");
             }
             "pause" => {
-                let state = self.lock_session();
-                if let SessionState::Active(session) = &*state {
-                    session.pause();
+                let mut state = self.lock_session();
+                match &mut *state {
+                    SessionState::Active(session) => session.pause(),
+                    SessionState::Starting(pending) => pending.push(PendingCommand::Pause),
+                    SessionState::Idle => {}
                 }
                 Ok(json!({}))
             }
             "resume" => {
-                let state = self.lock_session();
-                if let SessionState::Active(session) = &*state {
-                    session.resume();
+                let mut state = self.lock_session();
+                match &mut *state {
+                    SessionState::Active(session) => session.resume(),
+                    SessionState::Starting(pending) => pending.push(PendingCommand::Resume),
+                    SessionState::Idle => {}
                 }
                 Ok(json!({}))
             }
@@ -223,16 +237,20 @@ impl Engine {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let t = param_i64(params, "t").unwrap_or_else(crate::recording::now_wall_ms);
-                let state = self.lock_session();
-                if let SessionState::Active(session) = &*state {
-                    session.set_mic_muted(muted, t);
+                let mut state = self.lock_session();
+                match &mut *state {
+                    SessionState::Active(session) => session.set_mic_muted(muted, t),
+                    SessionState::Starting(pending) => {
+                        pending.push(PendingCommand::MicMuted(muted, t));
+                    }
+                    SessionState::Idle => {}
                 }
                 Ok(json!({}))
             }
-            "stop" => {
-                self.stop_session();
-                Ok(json!({}))
-            }
+            "stop" => match self.stop_session() {
+                Some(message) => bail!(message),
+                None => Ok(json!({})),
+            },
             "sample" => {
                 let dir = param_string(params, "dir")?;
                 let track = match param_string(params, "track")?.as_str() {
@@ -251,7 +269,11 @@ impl Engine {
 
     /// Stops and drops the active recording, if any. A `start` whose devices
     /// are still opening sees `Idle` when it finishes and stops itself.
-    fn stop_session(&mut self) {
+    ///
+    /// Returns the message a wedged audio server produced (see
+    /// [`RecordingSession::stop`]), so the `stop` command can answer with an
+    /// error instead of hanging.
+    fn stop_session(&mut self) -> Option<String> {
         let session = {
             let mut state = self.lock_session();
             match std::mem::replace(&mut *state, SessionState::Idle) {
@@ -260,8 +282,9 @@ impl Engine {
             }
         };
         if let Some(mut session) = session {
-            session.stop();
+            return session.stop();
         }
+        None
     }
 
     /// Validates the parameters synchronously, then opens both capture streams
@@ -295,7 +318,7 @@ impl Engine {
             drop(state);
             return self.out.fail(&request.id, "a recording is already active");
         }
-        *state = SessionState::Starting;
+        *state = SessionState::Starting(Vec::new());
         drop(state);
 
         let out = self.out.clone();
@@ -323,18 +346,35 @@ impl Engine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match result {
                 Ok(session) => {
-                    if matches!(*state, SessionState::Starting) {
-                        let start_wall_ms = session.start_wall_ms();
-                        *state = SessionState::Active(session);
-                        drop(state);
-                        let _ = out.reply(&id, json!({ "start_wall_ms": start_wall_ms }));
-                    } else {
-                        // `stop` arrived while the devices were opening.
-                        // Dropping the session stops what was already capturing.
-                        drop(state);
-                        drop(session);
-                        let _ = out.fail(&id, "the recording was stopped before it started");
+                    let pending = match std::mem::replace(&mut *state, SessionState::Idle) {
+                        SessionState::Starting(pending) => pending,
+                        _ => {
+                            // `stop` arrived while the devices were opening.
+                            // Dropping the session stops what was capturing.
+                            drop(state);
+                            drop(session);
+                            let _ = out.fail(&id, "the recording was stopped before it started");
+                            return;
+                        }
+                    };
+                    *state = SessionState::Active(session);
+                    let SessionState::Active(session) = &*state else {
+                        unreachable!("the state was just set");
+                    };
+                    let start_wall_ms = session.start_wall_ms();
+                    // Replay the mute, pause and resume commands that arrived
+                    // while the devices were opening, in their original order.
+                    for command in pending {
+                        match command {
+                            PendingCommand::Pause => session.pause(),
+                            PendingCommand::Resume => session.resume(),
+                            PendingCommand::MicMuted(muted, t) => {
+                                session.set_mic_muted(muted, t);
+                            }
+                        }
                     }
+                    drop(state);
+                    let _ = out.reply(&id, json!({ "start_wall_ms": start_wall_ms }));
                 }
                 Err(error) => {
                     *state = SessionState::Idle;
@@ -663,6 +703,42 @@ mod tests {
         assert_eq!(sources[0]["name"], "All system audio");
         assert_eq!(sources[0]["playing"], false);
         assert_eq!(lines[1]["result"]["route"], "speakers");
+    }
+
+    #[test]
+    fn commands_sent_while_start_is_opening_are_queued_in_order() {
+        let mut harness = harness();
+        *harness
+            .engine
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = SessionState::Starting(Vec::new());
+        for line in [
+            "{\"id\":1,\"cmd\":\"mic_muted\",\"params\":{\"muted\":true,\"t\":1700000000000}}",
+            "{\"id\":2,\"cmd\":\"pause\"}",
+            "{\"id\":3,\"cmd\":\"resume\"}",
+        ] {
+            assert!(!harness.engine.handle_line(line).unwrap());
+        }
+        // Every command was acknowledged while the devices were opening.
+        let lines = harness.sink.lines();
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line["ok"] == true));
+        let state = harness
+            .engine
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let SessionState::Starting(pending) = &*state else {
+            panic!("the session left the starting state");
+        };
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(
+            pending[0],
+            PendingCommand::MicMuted(true, 1_700_000_000_000)
+        ));
+        assert!(matches!(pending[1], PendingCommand::Pause));
+        assert!(matches!(pending[2], PendingCommand::Resume));
     }
 
     #[test]

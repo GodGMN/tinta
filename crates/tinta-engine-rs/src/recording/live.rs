@@ -170,12 +170,10 @@ fn run(config: crate::recording::LiveConfig, receiver: Receiver<LivePiece>, shar
             }
             let offset = start as f64 / SAMPLE_RATE as f64;
             // A concurrent finalize may hold the models for minutes. Live
-            // drafts are a nicety: skip this utterance rather than load a
-            // second recognizer or block `stop` behind the final pass.
-            let decoded = crate::speech::with_models_unless(
-                || !strong.stopping(),
-                || pass.decode(&samples, offset),
-            );
+            // drafts are a nicety: one `try_lock` skips this utterance instead
+            // of queueing it behind the final pass, and the next one is tried
+            // as soon as the lock is free.
+            let decoded = crate::speech::try_with_models(|| pass.decode(&samples, offset));
             match decoded {
                 Ok(Some(words)) => {
                     if strong.stopping() {
@@ -198,8 +196,9 @@ fn run(config: crate::recording::LiveConfig, receiver: Receiver<LivePiece>, shar
                         );
                     }
                 }
-                // The final pass held the models and the recording stopped.
-                Ok(None) => break,
+                // Another pass held the models: this utterance keeps no draft.
+                // The final pass transcribes it from the chunks.
+                Ok(None) => continue,
                 Err(error) => {
                     if strong.stopping() {
                         break;

@@ -26,6 +26,16 @@ const REMOTE_SINK: &str = "tinta_e2e_remote";
 const MIC_SINK: &str = "tinta_e2e_mic_sink";
 const MIC_SOURCE: &str = "tinta_e2e_mic";
 
+/// The cases share one pulse server and change its default devices, so they run
+/// one at a time even when the test harness uses several threads.
+static SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn tool(name: &str) -> PathBuf {
     std::env::var_os(format!("TINTA_{}", name.to_uppercase()))
         .map(PathBuf::from)
@@ -93,6 +103,24 @@ impl Fixture {
         all.extend_from_slice(args);
         let id = run(&self.pactl, &all);
         self.modules.push(id);
+    }
+
+    /// Unloads the most recently loaded module, as unplugging a device does.
+    fn unload_last(&mut self) {
+        let id = self.modules.pop().expect("a module is loaded");
+        run(&self.pactl, &["unload-module", &id]);
+    }
+
+    /// Loads a fresh remapped microphone source over the microphone sink, the
+    /// way plugging a headset back in publishes a new input.
+    fn plug_microphone(&mut self, name: &str) {
+        self.load(&[
+            "module-remap-source",
+            &format!("master={MIC_SINK}.monitor"),
+            &format!("source_name={name}"),
+        ]);
+        run(&self.pactl, &["set-default-source", name]);
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -242,6 +270,7 @@ fn sleep_until(start: Instant, seconds: f32) {
 #[test]
 #[ignore = "needs a PulseAudio/PipeWire server and pulseaudio-utils"]
 fn records_two_tracks_with_pause_and_levels() {
+    let _serial = serial();
     let fixture = Fixture::setup();
     let paplay = tool("paplay");
     let dir = tempfile::tempdir().unwrap();
@@ -392,6 +421,7 @@ fn records_two_tracks_with_pause_and_levels() {
 #[test]
 #[ignore = "needs a PulseAudio/PipeWire server and pulseaudio-utils"]
 fn a_monitor_default_source_is_not_recorded_as_the_microphone() {
+    let _serial = serial();
     let fixture = Fixture::setup();
     let paplay = tool("paplay");
     // A machine with no input device makes the speaker monitor the default
@@ -458,4 +488,108 @@ fn a_monitor_default_source_is_not_recorded_as_the_microphone() {
         !levels.is_empty() && levels.iter().all(|event| event["mic"] == 0.0),
         "the microphone meter stays at zero"
     );
+}
+
+#[test]
+#[ignore = "needs a PulseAudio/PipeWire server and pulseaudio-utils"]
+fn a_microphone_that_disappears_and_returns_is_not_filled_with_the_monitor() {
+    let _serial = serial();
+    let mut fixture = Fixture::setup();
+    let paplay = tool("paplay");
+    let dir = tempfile::tempdir().unwrap();
+    let mic_tone = dir.path().join("mic.wav");
+    let remote_tone = dir.path().join("remote.wav");
+    std::fs::write(&mic_tone, tinta_engine_rs::audio::wav(&tone(2.5, 880.0))).unwrap();
+    std::fs::write(&remote_tone, tinta_engine_rs::audio::wav(&tone(2.5, 440.0))).unwrap();
+
+    let mut engine = Engine::spawn();
+    engine.send(json!({
+        "id": 1,
+        "cmd": "start",
+        "params": {
+            "dir": dir.path().display().to_string(),
+            "audio_key": STANDARD.encode([7u8; 32]),
+            "source": "all",
+        },
+    }));
+    let start = engine.reply(1);
+    assert_eq!(start["ok"], true, "{start}");
+    let t0 = Instant::now();
+
+    // 0-2.5 s: the microphone records its tone.
+    play(&paplay, MIC_SINK, &mic_tone);
+
+    // 3 s: unplug the microphone. The server falls back to a speaker monitor,
+    // which must never be recorded as the microphone.
+    sleep_until(t0, 3.0);
+    fixture.unload_last();
+    // 4-6.5 s: only the meeting audio plays; the microphone track stays silent.
+    sleep_until(t0, 4.0);
+    play(&paplay, REMOTE_SINK, &remote_tone);
+
+    // 7 s: plug a new microphone in, as a USB headset appearing or Bluetooth
+    // switching to HFP. The track must resume on the meeting clock.
+    sleep_until(t0, 7.0);
+    fixture.plug_microphone("tinta_e2e_mic2");
+    sleep_until(t0, 9.0);
+    play(&paplay, MIC_SINK, &mic_tone);
+
+    sleep_until(t0, 13.5);
+    engine.send(json!({ "id": 2, "cmd": "stop" }));
+    assert_eq!(engine.reply(2)["ok"], true);
+    engine.finish();
+    let seen = std::mem::take(&mut engine.seen);
+
+    let key = [7u8; 32];
+    let mic = read_track(dir.path(), &key, Track::Mic).unwrap();
+    let remote = read_track(dir.path(), &key, Track::Remote).unwrap();
+    eprintln!("mic {} samples, remote {} samples", mic.len(), remote.len());
+    for (name, track) in [("remote", &remote), ("mic", &mic)] {
+        let windows: Vec<String> = (0..14)
+            .map(|second| {
+                format!(
+                    "{second}:{:.3}",
+                    rms(track, second as f32, second as f32 + 1.0)
+                )
+            })
+            .collect();
+        eprintln!("{name} rms by second: {}", windows.join(" "));
+    }
+
+    assert!(rms(&mic, 0.3, 2.2) > 0.1, "the first microphone tone");
+    assert!(
+        rms(&mic, 4.2, 6.2) < 0.01,
+        "the monitor is recorded as the microphone after the unplug: {:.3}",
+        rms(&mic, 4.2, 6.2)
+    );
+    assert!(
+        rms(&remote, 4.2, 6.2) > 0.1,
+        "the meeting audio after the unplug"
+    );
+    assert!(
+        rms(&mic, 9.3, 11.5) > 0.1,
+        "the microphone resumed after it was plugged back: {:.3}",
+        rms(&mic, 9.3, 11.5)
+    );
+
+    let warnings: Vec<String> = seen
+        .iter()
+        .filter(|value| value["event"] == "warning")
+        .map(|value| value["message"].as_str().unwrap_or_default().to_string())
+        .collect();
+    eprintln!("warnings: {warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("records the meeting audio only")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message.contains("available again")),
+        "{warnings:?}"
+    );
+
+    drop(fixture);
 }

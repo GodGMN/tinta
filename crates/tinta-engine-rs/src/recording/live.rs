@@ -20,6 +20,7 @@ use serde_json::json;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::audio::SAMPLE_RATE;
 use crate::recording::Shared;
@@ -35,6 +36,10 @@ const VAD_WINDOW: usize = 512;
 /// A jump beyond this is a pause, not a late piece: reset the VAD instead of
 /// feeding half a minute of zeros.
 const MAX_GAP_SAMPLES: i64 = 30 * SAMPLE_RATE as i64;
+/// How long `stop` waits for the worker to leave its current decode. A decode
+/// of one segment is far shorter; the wait only matters when a final pass holds
+/// the model lock, in which case the worker gives up instead of decoding.
+const FINISH_WAIT: Duration = Duration::from_millis(1_500);
 
 /// One stored piece of audio, in meeting-clock order.
 pub(crate) struct LivePiece {
@@ -71,13 +76,28 @@ impl LiveDrafts {
         })
     }
 
-    /// Closes the channel. The worker finishes the segment it is decoding and
-    /// exits; stopping a recording never waits on the model.
+    /// Closes the queue and waits a bounded time for the worker to exit.
+    ///
+    /// The worker checks `stopping()` before every emit, so once `stop` has set
+    /// the flag nothing it does can reach the next meeting. It may still be
+    /// inside one decode: `finish` waits [`FINISH_WAIT`] and then leaves the
+    /// thread to exit on its own, named `live-drafts`, rather than make `stop`
+    /// wait on the recognizer. The capture threads are already joined and the
+    /// channel closed, so the memory is released as soon as that decode ends.
     pub fn finish(mut self) {
         self.sender = None;
-        if let Some(worker) = self.worker.take() {
-            drop(worker);
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let deadline = Instant::now() + FINISH_WAIT;
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
         }
+        if worker.is_finished() {
+            let _ = worker.join();
+        }
+        // Otherwise the handle is dropped deliberately: the documented detach
+        // above, not a lost thread.
     }
 }
 
@@ -111,10 +131,7 @@ fn run(config: crate::recording::LiveConfig, receiver: Receiver<LivePiece>, shar
     };
     let mut pass = SpeechPass::new(config.manifest, config.models_root, threads);
     let vads = crate::speech::with_models(|| {
-        Ok::<_, anyhow::Error>((
-            TrackVad::new(pass.live_vad()?),
-            TrackVad::new(pass.live_vad()?),
-        ))
+        Ok::<_, anyhow::Error>((TrackVad::new(pass.vad()?), TrackVad::new(pass.vad()?)))
     });
     let (mut mic, mut remote) = match vads {
         Ok(vads) => vads,
@@ -152,8 +169,18 @@ fn run(config: crate::recording::LiveConfig, receiver: Receiver<LivePiece>, shar
                 continue;
             }
             let offset = start as f64 / SAMPLE_RATE as f64;
-            match crate::speech::with_models(|| pass.decode(&samples, offset)) {
-                Ok(words) => {
+            // A concurrent finalize may hold the models for minutes. Live
+            // drafts are a nicety: skip this utterance rather than load a
+            // second recognizer or block `stop` behind the final pass.
+            let decoded = crate::speech::with_models_unless(
+                || !strong.stopping(),
+                || pass.decode(&samples, offset),
+            );
+            match decoded {
+                Ok(Some(words)) => {
+                    if strong.stopping() {
+                        break;
+                    }
                     let text = words
                         .iter()
                         .map(|word| word.w.as_str())
@@ -171,10 +198,17 @@ fn run(config: crate::recording::LiveConfig, receiver: Receiver<LivePiece>, shar
                         );
                     }
                 }
-                Err(error) => strong.emit(
-                    "error",
-                    json!({ "message": format!("live transcription failed: {error}") }),
-                ),
+                // The final pass held the models and the recording stopped.
+                Ok(None) => break,
+                Err(error) => {
+                    if strong.stopping() {
+                        break;
+                    }
+                    strong.emit(
+                        "error",
+                        json!({ "message": format!("live transcription failed: {error}") }),
+                    );
+                }
             }
         }
     }

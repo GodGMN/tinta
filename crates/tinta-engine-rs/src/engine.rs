@@ -1,12 +1,13 @@
 //! The engine command loop.
 //!
 //! Commands are handled one at a time on the stdin reader thread, except
-//! `install_models`, `import_audio` and `finalize`: those run on worker threads
-//! and reply when they finish, so `ping`, `models_status`, `calendar`, `sample`
-//! and the other quick commands keep answering during a 487 MB install or a long
-//! final pass. A second install is rejected while one is in flight. macOS-only
-//! commands return the degraded replies from `docs/engine-protocol.md` so the app
-//! does not show errors or retry loops.
+//! `start`, `install_models`, `import_audio` and `finalize`: those run on worker
+//! threads and reply when they finish, so `ping`, `models_status`, `calendar`,
+//! `sample` and the other quick commands keep answering while a capture device
+//! opens, during a 487 MB install or during a long final pass. A second start is
+//! rejected while one is in flight. macOS-only commands return the degraded
+//! replies from `docs/engine-protocol.md` so the app does not show errors or
+//! retry loops.
 
 use crate::recording::{LiveConfig, RecordingSession, StartOptions};
 
@@ -18,7 +19,7 @@ use serde_json::{json, Map, Value};
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::install;
 use crate::manifest::Manifest;
@@ -42,13 +43,21 @@ pub struct Capabilities {
     pub live_transcription: bool,
 }
 
+/// The recording session and, while a `start` is opening its devices, the fact
+/// that one is on its way. Guarded so `stop` and the start worker cannot race.
+enum SessionState {
+    Idle,
+    Starting,
+    Active(RecordingSession),
+}
+
 pub struct Engine {
     out: Output,
     manifest: Manifest,
     models_root: PathBuf,
     threads: Threads,
     installing: Arc<AtomicBool>,
-    session: Option<RecordingSession>,
+    session: Arc<Mutex<SessionState>>,
 }
 
 impl Engine {
@@ -59,8 +68,14 @@ impl Engine {
             models_root,
             threads,
             installing: Arc::new(AtomicBool::new(false)),
-            session: None,
+            session: Arc::new(Mutex::new(SessionState::Idle)),
         }
+    }
+
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Emits `ready` and answers lines until stdin ends or a `shutdown` request
@@ -129,6 +144,14 @@ impl Engine {
             return Ok(false);
         }
 
+        // Opening a capture stream waits on the server, so `start` runs on a
+        // worker thread: `ping` and `models_status` keep answering while the
+        // devices open, and the reply still waits for the streams, like Swift.
+        if request.cmd == "start" {
+            self.start_session(&request)?;
+            return Ok(false);
+        }
+
         match self.handle_command(&request.cmd, &request.params) {
             Ok(result) => self.out.reply(&request.id, result)?,
             Err(error) => self.out.fail(&request.id, &error.to_string())?,
@@ -176,45 +199,20 @@ impl Engine {
             "call_report" => bail!("Call reading is not available on this platform."),
             "summarize" => bail!("Summaries are not available on this platform."),
             "start" => {
-                // Swift checks the active session before the parameters.
-                if self.session.is_some() {
-                    bail!("a recording is already active");
-                }
-                let directory = PathBuf::from(param_string(params, "dir")?);
-                let key = audio_key(params)?;
-                let source = params
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .filter(|source| !source.is_empty())
-                    .unwrap_or("all")
-                    .to_string();
-                let mic_muted = params
-                    .get("mic_muted")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let live = self.live_config();
-                let session = RecordingSession::start(
-                    StartOptions {
-                        directory,
-                        key,
-                        source,
-                        mic_muted,
-                    },
-                    self.out.clone(),
-                    live,
-                )?;
-                let start_wall_ms = session.start_wall_ms();
-                self.session = Some(session);
-                Ok(json!({ "start_wall_ms": start_wall_ms }))
+                // Reached only from `handle_line`, which runs `start` off the
+                // command loop; the guard keeps the arm total.
+                bail!("a recording is already active");
             }
             "pause" => {
-                if let Some(session) = &self.session {
+                let state = self.lock_session();
+                if let SessionState::Active(session) = &*state {
                     session.pause();
                 }
                 Ok(json!({}))
             }
             "resume" => {
-                if let Some(session) = &self.session {
+                let state = self.lock_session();
+                if let SessionState::Active(session) = &*state {
                     session.resume();
                 }
                 Ok(json!({}))
@@ -225,7 +223,8 @@ impl Engine {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let t = param_i64(params, "t").unwrap_or_else(crate::recording::now_wall_ms);
-                if let Some(session) = &self.session {
+                let state = self.lock_session();
+                if let SessionState::Active(session) = &*state {
                     session.set_mic_muted(muted, t);
                 }
                 Ok(json!({}))
@@ -250,27 +249,101 @@ impl Engine {
         }
     }
 
-    /// Stops and drops the active recording, if any.
+    /// Stops and drops the active recording, if any. A `start` whose devices
+    /// are still opening sees `Idle` when it finishes and stops itself.
     fn stop_session(&mut self) {
-        if let Some(mut session) = self.session.take() {
+        let session = {
+            let mut state = self.lock_session();
+            match std::mem::replace(&mut *state, SessionState::Idle) {
+                SessionState::Active(session) => Some(session),
+                _ => None,
+            }
+        };
+        if let Some(mut session) = session {
             session.stop();
         }
     }
 
-    /// Live drafts need the installed models. `TINTA_ENGINE_LIVE=0` turns them
-    /// off for a machine that should spend nothing on them.
-    fn live_config(&self) -> Option<LiveConfig> {
-        if std::env::var_os("TINTA_ENGINE_LIVE").is_some_and(|value| value == "0") {
-            return None;
+    /// Validates the parameters synchronously, then opens both capture streams
+    /// on a worker thread. The reply is written once the devices are open; other
+    /// commands, `ping` and `models_status` included, keep being answered.
+    fn start_session(&mut self, request: &Request) -> io::Result<()> {
+        let params = &request.params;
+        let directory = match param_string(params, "dir") {
+            Ok(directory) => PathBuf::from(directory),
+            Err(error) => return self.out.fail(&request.id, &error.to_string()),
+        };
+        let key = match audio_key(params) {
+            Ok(key) => key,
+            Err(error) => return self.out.fail(&request.id, &error.to_string()),
+        };
+        let source = params
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+            .unwrap_or("all")
+            .to_string();
+        let mic_muted = params
+            .get("mic_muted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // The parameter checks are cheap and run before the session guard, so a
+        // malformed start never changes the session state.
+        let mut state = self.lock_session();
+        if !matches!(*state, SessionState::Idle) {
+            drop(state);
+            return self.out.fail(&request.id, "a recording is already active");
         }
-        if !self.manifest.all_files_exist(&self.models_root) {
-            return None;
-        }
-        Some(LiveConfig {
-            manifest: self.manifest.clone(),
-            models_root: self.models_root.clone(),
-            threads: self.threads,
-        })
+        *state = SessionState::Starting;
+        drop(state);
+
+        let out = self.out.clone();
+        let id = request.id.clone();
+        let sessions = self.session.clone();
+        let manifest = self.manifest.clone();
+        let root = self.models_root.clone();
+        let threads = self.threads;
+        std::thread::spawn(move || {
+            let live = live_config(&manifest, &root, threads);
+            let result = catching("the recording start stopped unexpectedly", || {
+                RecordingSession::start(
+                    StartOptions {
+                        directory,
+                        key,
+                        source,
+                        mic_muted,
+                    },
+                    out.clone(),
+                    live,
+                )
+            });
+            let mut state = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match result {
+                Ok(session) => {
+                    if matches!(*state, SessionState::Starting) {
+                        let start_wall_ms = session.start_wall_ms();
+                        *state = SessionState::Active(session);
+                        drop(state);
+                        let _ = out.reply(&id, json!({ "start_wall_ms": start_wall_ms }));
+                    } else {
+                        // `stop` arrived while the devices were opening.
+                        // Dropping the session stops what was already capturing.
+                        drop(state);
+                        drop(session);
+                        let _ = out.fail(&id, "the recording was stopped before it started");
+                    }
+                }
+                Err(error) => {
+                    *state = SessionState::Idle;
+                    drop(state);
+                    let _ = out.fail(&id, &error.to_string());
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Runs one final pass on a worker thread. Two passes may overlap; the speech
@@ -340,6 +413,22 @@ impl Engine {
         });
         Ok(())
     }
+}
+
+/// Live drafts need the installed models. `TINTA_ENGINE_LIVE=0` turns them off
+/// for a machine that should spend nothing on them.
+fn live_config(manifest: &Manifest, root: &Path, threads: Threads) -> Option<LiveConfig> {
+    if std::env::var_os("TINTA_ENGINE_LIVE").is_some_and(|value| value == "0") {
+        return None;
+    }
+    if !manifest.all_files_exist(root) {
+        return None;
+    }
+    Some(LiveConfig {
+        manifest: manifest.clone(),
+        models_root: root.to_path_buf(),
+        threads,
+    })
 }
 
 /// Reads a required, non-empty string parameter. The message matches Swift's

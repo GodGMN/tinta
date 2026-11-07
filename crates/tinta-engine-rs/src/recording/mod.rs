@@ -3,8 +3,10 @@
 //!
 //! This mirrors `RecordingSession` in `engine/Sources/TintaEngine/Session.swift`:
 //!
-//! - the meeting clock starts at `start_wall_ms` and every sample is placed by
-//!   its index on that clock, so pauses and capture errors become silence;
+//! - the meeting clock starts at `start_wall_ms`; each read is placed by the
+//!   time its audio was captured, with the sample counter as the primary clock
+//!   and the wall clock correcting it in both directions, so a stall is
+//!   silence or a small trim, never a permanent shift;
 //! - the microphone is held for 0.8 s so a `mic_muted` command that arrives a
 //!   little after the click still silences the audio from the exact time;
 //! - `pause` drops both tracks and flushes, `stop` releases the held
@@ -14,6 +16,11 @@
 //! The two capture threads are the only writers of chunk files. Reopening a
 //! failed stream keeps the clock, so the outage is a silent gap; all buffers
 //! are bounded, so memory does not grow with the length of the meeting.
+//!
+//! A machine with no physical microphone makes its speaker monitor the default
+//! source. Recording that as the microphone would duplicate every remote
+//! utterance as the user, so that case records no microphone track, emits one
+//! warning, and reports `mic: 0` in `levels`.
 
 pub mod capture;
 pub mod live;
@@ -32,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::manifest::Manifest;
 use crate::protocol::{log, Output};
 use crate::threads::Threads;
-use capture::{CaptureSource, FRAGMENT_SAMPLES};
+use capture::{CaptureSource, Microphone, FRAGMENT_SAMPLES};
 use tinta_core::chunks::{ChunkWriter, Track, GAP_SAMPLES, SAMPLE_RATE};
 
 /// The microphone audio held back before it is stored, in samples (0.8 s).
@@ -41,6 +48,11 @@ const MIC_HOLD_SAMPLES: i64 = (SAMPLE_RATE * 8 / 10) as i64;
 const ECHO_WINDOW_SAMPLES: i64 = 60 * SAMPLE_RATE as i64;
 /// The levels cadence, the same as Swift's 250 ms timer.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(250);
+/// Reopen attempts back off from this delay to [`REOPEN_LOG_INTERVAL`].
+const REOPEN_DELAY: Duration = Duration::from_millis(300);
+/// A reopen failure is logged at most once per interval, and the retry delay
+/// stops growing here, so a device that is gone overnight cannot flood stderr.
+const REOPEN_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Everything `start` needs from its parameters.
 pub struct StartOptions {
@@ -69,7 +81,8 @@ pub struct RecordingSession {
 
 impl RecordingSession {
     /// Opens both capture streams and starts the capture, level and live
-    /// threads. A stream that cannot open fails the whole start, like Swift.
+    /// threads. A stream that cannot open fails the whole start, like Swift;
+    /// a machine with no physical microphone records the meeting audio only.
     pub fn start(options: StartOptions, out: Output, live: Option<LiveConfig>) -> Result<Self> {
         let StartOptions {
             directory,
@@ -78,14 +91,31 @@ impl RecordingSession {
             mic_muted,
         } = options;
 
-        let mic = capture::open_capture(Track::Mic)
-            .map_err(|error| anyhow::anyhow!("cannot open the microphone: {error}"))?;
-        let remote = capture::open_capture(Track::Remote)
+        let mut remote = capture::open_remote()
             .map_err(|error| anyhow::anyhow!("cannot capture the meeting audio: {error}"))?;
+        let (mut mic, missing_mic) = match capture::open_microphone() {
+            Ok(Microphone::Capture(source)) => (Some(source), None),
+            Ok(Microphone::Missing(reason)) => (None, Some(reason)),
+            Err(error) => {
+                // The microphone is optional here: a broken input device must
+                // not cost the user the meeting audio.
+                (None, Some(error.to_string()))
+            }
+        };
+        // Drop what the server buffered while the second stream opened, so
+        // both tracks start at the meeting start instead of carrying a
+        // different amount of pre-roll.
+        if let Some(mic) = &mut mic {
+            mic.flush()
+                .context("cannot prepare the microphone stream")?;
+        }
+        remote
+            .flush()
+            .context("cannot prepare the meeting audio stream")?;
 
         let start_wall_ms = now_wall_ms();
         let start = Instant::now();
-        let recorder = Recorder::new(&directory, &key, mic_muted, start_wall_ms)?;
+        let recorder = Recorder::new(&directory, &key, mic_muted, start_wall_ms, mic.is_some())?;
         write_session_json(&directory, start_wall_ms, &source)?;
 
         let shared = Arc::new(Shared {
@@ -98,13 +128,32 @@ impl RecordingSession {
         });
         shared.set_remote_capturing(true);
 
+        if let Some(reason) = missing_mic {
+            log(&format!(
+                "no microphone, recording the meeting audio only: {reason}"
+            ));
+            shared.emit(
+                "warning",
+                json!({
+                    "message": format!(
+                        "No microphone was found, so Tinta records the meeting audio only. ({reason})"
+                    ),
+                }),
+            );
+        }
+
         let live = match live {
             Some(config) => Some(live::LiveDrafts::spawn(config, &shared)?),
             None => None,
         };
 
         let mut workers = Vec::new();
-        for (track, source) in [(Track::Mic, mic), (Track::Remote, remote)] {
+        let mut tracks: Vec<(Track, Box<dyn CaptureSource>)> = Vec::new();
+        if let Some(mic) = mic {
+            tracks.push((Track::Mic, mic));
+        }
+        tracks.push((Track::Remote, remote));
+        for (track, source) in tracks {
             let thread_shared = shared.clone();
             let spawned = thread::Builder::new()
                 .name(format!("capture-{}", track.dir_name()))
@@ -178,13 +227,15 @@ impl RecordingSession {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
-        if let Some(live) = self.live.take() {
-            live.finish();
-        }
+        // Closing the recorder first drops the last live sender, so the live
+        // worker sees a closed queue and can exit before `finish` waits on it.
         let errors = match self.shared.recorder.lock() {
             Ok(mut recorder) => recorder.stop(),
             Err(_) => Vec::new(),
         };
+        if let Some(live) = self.live.take() {
+            live.finish();
+        }
         for message in errors {
             let _ = self
                 .shared
@@ -248,10 +299,6 @@ impl Shared {
         let _ = self.out.event(event, fields);
     }
 
-    pub(crate) fn log(&self, message: &str) {
-        log(message);
-    }
-
     fn set_remote_capturing(&self, capturing: bool) {
         let previous = self.remote_capturing.swap(capturing, Ordering::SeqCst);
         if previous != capturing {
@@ -290,7 +337,8 @@ fn run_capture(shared: Arc<Shared>, track: Track, source: Box<dyn CaptureSource>
     run_capture_with(shared, track, source, capture::open_capture);
 }
 
-/// The testable form of the loop: `open` supplies the replacement after an error.
+/// The testable form of the loop: `open` supplies the replacement after an error
+/// or a default-device change.
 fn run_capture_with<F>(
     shared: Arc<Shared>,
     track: Track,
@@ -302,65 +350,125 @@ fn run_capture_with<F>(
     let mut buffer = vec![0.0f32; FRAGMENT_SAMPLES];
     let mut clock = ClockMap::default();
     let mut warned = false;
-    while !shared.stop.load(Ordering::SeqCst) {
+    while !shared.stopping() {
+        // A changed default device is not a read error. On PipeWire the server
+        // moves the stream; on plain PulseAudio it does not move it and does
+        // not fail it, so the stream has to be reopened by name.
+        if source.needs_reopen() {
+            log(&format!(
+                "{} capture follows the new default device",
+                track.dir_name()
+            ));
+            match open(track) {
+                Ok(next) => {
+                    source = next;
+                    continue;
+                }
+                Err(error) => {
+                    if track == Track::Remote {
+                        shared.set_remote_capturing(false);
+                    }
+                    emit_stopped(&shared, track, &mut warned, &error.to_string());
+                    match reopen(&shared, track, &open) {
+                        Some(next) => {
+                            source = next;
+                            continue;
+                        }
+                        None => return,
+                    }
+                }
+            }
+        }
         match source.read(&mut buffer) {
-            Ok(0) => continue,
-            Ok(count) => {
+            Ok(read) if read.count == 0 => continue,
+            Ok(read) => {
                 if warned {
                     warned = false;
-                    shared.log(&format!("{} capture reconnected", track.dir_name()));
+                    log(&format!("{} capture reconnected", track.dir_name()));
                 }
                 if track == Track::Remote {
                     shared.set_remote_capturing(true);
                 }
-                let index = clock.index_for_read(shared.start.elapsed(), count);
-                shared.ingest(track, &buffer[..count], index);
+                let placement = clock.place(shared.start, read.captured, read.count);
+                shared.ingest(track, &buffer[placement.skip..read.count], placement.index);
             }
             Err(error) => {
                 if track == Track::Remote {
                     shared.set_remote_capturing(false);
                 }
-                if !warned {
-                    warned = true;
-                    let name = if track == Track::Mic {
-                        "microphone"
-                    } else {
-                        "meeting audio"
-                    };
-                    shared.emit(
-                        "warning",
-                        json!({
-                            "message": format!(
-                                "The {name} capture stopped: {error}. Tinta reconnects it."
-                            ),
-                        }),
-                    );
-                }
-                clock.reset();
-                loop {
-                    if shared.stop.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(300));
-                    if shared.stop.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    match open(track) {
-                        Ok(next) => {
-                            source = next;
-                            break;
-                        }
-                        Err(error) => shared.log(&format!(
-                            "cannot reopen the {} capture: {error}",
-                            track.dir_name()
-                        )),
-                    }
+                emit_stopped(&shared, track, &mut warned, &error.to_string());
+                match reopen(&shared, track, &open) {
+                    Some(next) => source = next,
+                    None => return,
                 }
             }
         }
     }
     if track == Track::Remote {
         shared.set_remote_capturing(false);
+    }
+}
+
+/// Emits the one warning per outage that tells the user capture stopped.
+fn emit_stopped(shared: &Shared, track: Track, warned: &mut bool, error: &str) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    let name = if track == Track::Mic {
+        "microphone"
+    } else {
+        "meeting audio"
+    };
+    shared.emit(
+        "warning",
+        json!({
+            "message": format!("The {name} capture stopped: {error}. Tinta reconnects it."),
+        }),
+    );
+}
+
+/// Reopens a failed stream, backing off from 300 ms to 30 s. A missing device
+/// stays silent and is logged at most once per 30 s. Returns `None` on stop.
+fn reopen<F>(shared: &Shared, track: Track, open: &F) -> Option<Box<dyn CaptureSource>>
+where
+    F: Fn(Track) -> Result<Box<dyn CaptureSource>>,
+{
+    let mut delay = REOPEN_DELAY;
+    let mut last_log: Option<Instant> = None;
+    loop {
+        if !sleep_unless_stopped(shared, delay) {
+            return None;
+        }
+        match open(track) {
+            Ok(next) => return Some(next),
+            Err(error) => {
+                let now = Instant::now();
+                if last_log.is_none_or(|at| now.duration_since(at) >= REOPEN_LOG_INTERVAL) {
+                    log(&format!(
+                        "cannot reopen the {} capture: {error}",
+                        track.dir_name()
+                    ));
+                    last_log = Some(now);
+                }
+                delay = (delay * 2).min(REOPEN_LOG_INTERVAL);
+            }
+        }
+    }
+}
+
+/// Sleeps in short steps, returning false as soon as the session stops.
+fn sleep_unless_stopped(shared: &Shared, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if shared.stopping() {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        thread::sleep(left.min(Duration::from_millis(100)));
     }
 }
 
@@ -380,31 +488,68 @@ fn run_levels(shared: Arc<Shared>) {
     }
 }
 
-/// Maps capture reads to the meeting clock. Sample counting keeps the tracks
-/// aligned; the wall clock pulls the index forward after a stall so the missed
-/// audio becomes a gap, exactly as a later chunk start does in Swift.
+/// Where one read goes on the meeting clock.
+struct Placement {
+    /// The meeting-clock index of the first stored sample.
+    index: i64,
+    /// Samples to drop from the front of the read, correcting a fast device.
+    skip: usize,
+}
+
+/// Maps capture reads to the meeting clock.
+///
+/// The sample counter is the primary clock, so jitter in the capture timestamps
+/// never moves a track. The capture time of each read corrects it when the two
+/// clocks disagree by more than [`GAP_SAMPLES`]: buffered audio read after a
+/// stall still has its true (old) capture time and lands where it belongs, a
+/// real outage becomes a silent gap, and a device that runs faster than the wall
+/// clock has its extra samples dropped instead of stretching the track.
 #[derive(Default)]
 struct ClockMap {
     next: Option<i64>,
 }
 
 impl ClockMap {
-    fn index_for_read(&mut self, elapsed: Duration, count: usize) -> i64 {
-        let wall = (elapsed.as_secs_f64() * SAMPLE_RATE as f64) as i64;
-        // The samples just read end near `wall`; they start `count` earlier.
-        let start = (wall - count as i64).max(0);
-        let index = match self.next {
-            // Swift only ever moves the start forward: a small drift and a
-            // backwards jump are snapped to the expected next sample.
-            Some(next) if start - next <= GAP_SAMPLES => next,
-            _ => start,
+    fn place(&mut self, start: Instant, captured: Option<Instant>, count: usize) -> Placement {
+        let Some(captured) = captured else {
+            // No capture time: count samples only.
+            let index = self.next.unwrap_or(0);
+            self.next = Some(index + count as i64);
+            return Placement { index, skip: 0 };
         };
-        self.next = Some(index + count as i64);
-        index
-    }
-
-    fn reset(&mut self) {
-        self.next = None;
+        let elapsed = captured.saturating_duration_since(start).as_secs_f64();
+        // The read ends at `captured`; its first sample is `count` earlier.
+        let wall_start = ((elapsed * SAMPLE_RATE as f64) as i64 - count as i64).max(0);
+        let Some(next) = self.next else {
+            self.next = Some(wall_start + count as i64);
+            return Placement {
+                index: wall_start,
+                skip: 0,
+            };
+        };
+        let drift = next - wall_start;
+        if drift > GAP_SAMPLES {
+            // Placed audio is ahead of the wall clock: the device sent more
+            // samples than real time allows. Drop the excess.
+            let skip = (drift as usize).min(count);
+            let index = wall_start + skip as i64;
+            self.next = Some(index + (count - skip) as i64);
+            Placement { index, skip }
+        } else if drift < -GAP_SAMPLES {
+            // The wall clock is ahead: samples were captured and lost. Leave
+            // silence rather than moving the audio earlier.
+            self.next = Some(wall_start + count as i64);
+            Placement {
+                index: wall_start,
+                skip: 0,
+            }
+        } else {
+            self.next = Some(next + count as i64);
+            Placement {
+                index: next,
+                skip: 0,
+            }
+        }
     }
 }
 
@@ -412,7 +557,9 @@ impl ClockMap {
 /// level peaks and remote levels for the live echo check. No buffer grows with
 /// the length of the meeting.
 struct Recorder {
-    writers: [ChunkWriter; 2],
+    /// `None` for a track this recording does not have: the microphone on a
+    /// machine without one.
+    writers: [Option<ChunkWriter>; 2],
     start_wall_ms: i64,
     paused: bool,
     mic_hold: VecDeque<(Vec<f32>, i64)>,
@@ -430,11 +577,28 @@ fn slot(track: Track) -> usize {
 }
 
 impl Recorder {
-    fn new(directory: &Path, key: &[u8; 32], mic_muted: bool, start_wall_ms: i64) -> Result<Self> {
-        let mic = ChunkWriter::new(directory, key, Track::Mic)
-            .context("cannot create the microphone track")?;
-        let remote = ChunkWriter::new(directory, key, Track::Remote)
-            .context("cannot create the meeting audio track")?;
+    fn new(
+        directory: &Path,
+        key: &[u8; 32],
+        mic_muted: bool,
+        start_wall_ms: i64,
+        record_mic: bool,
+    ) -> Result<Self> {
+        // With no physical microphone (the default source is a speaker
+        // monitor) no microphone directory is created at all: the meeting has
+        // no mic track, and `finalize` reads it as empty.
+        let mic = if record_mic {
+            Some(
+                ChunkWriter::new(directory, key, Track::Mic)
+                    .context("cannot create the microphone track")?,
+            )
+        } else {
+            None
+        };
+        let remote = Some(
+            ChunkWriter::new(directory, key, Track::Remote)
+                .context("cannot create the meeting audio track")?,
+        );
         let mut mute_changes = Vec::new();
         if mic_muted {
             mute_changes.push((0, true));
@@ -449,6 +613,11 @@ impl Recorder {
             remote_levels: VecDeque::new(),
             live: None,
         })
+    }
+
+    /// Whether this recording has a microphone track.
+    fn has_mic(&self) -> bool {
+        self.writers[0].is_some()
     }
 
     /// Feeds one read. Levels update even while paused, like Swift.
@@ -469,6 +638,9 @@ impl Recorder {
             {
                 self.remote_levels.pop_front();
             }
+        }
+        if track == Track::Mic && !self.has_mic() {
+            return None;
         }
         if self.paused {
             return None;
@@ -551,6 +723,7 @@ impl Recorder {
             });
         }
         self.writers[slot(track)]
+            .as_mut()?
             .append(samples, start)
             .err()
             .map(|error| format!("chunk write failed for {}: {error}", track.dir_name()))
@@ -558,8 +731,9 @@ impl Recorder {
 
     fn flush_all(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
-        for track in Track::ALL {
-            if let Err(error) = self.writers[slot(track)].flush() {
+        for (track, writer) in Track::ALL.into_iter().zip(self.writers.iter_mut()) {
+            let Some(writer) = writer else { continue };
+            if let Err(error) = writer.flush() {
                 errors.push(format!(
                     "chunk write failed for {}: {error}",
                     track.dir_name()
@@ -649,6 +823,7 @@ pub fn now_wall_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording::capture::CaptureRead;
     use tinta_core::chunks::read_track;
 
     fn key() -> [u8; 32] {
@@ -660,7 +835,7 @@ mod tests {
     }
 
     fn recorder(dir: &Path, mic_muted: bool) -> Recorder {
-        Recorder::new(dir, &key(), mic_muted, 1_000_000).unwrap()
+        Recorder::new(dir, &key(), mic_muted, 1_000_000, true).unwrap()
     }
 
     fn constant(value: f32, count: usize) -> Vec<f32> {
@@ -676,42 +851,100 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_follows_sample_counting_and_resyncs_after_a_stall() {
+    fn a_buffered_stall_does_not_shift_the_track() {
+        let start = Instant::now();
         let mut clock = ClockMap::default();
-        // First read: 100 ms of audio at t=100 ms.
-        assert_eq!(
-            clock.index_for_read(Duration::from_millis(100), FRAGMENT_SAMPLES),
-            0
+        // Ten on-time reads, 0-1.0 s, with a few milliseconds of jitter in the
+        // capture times. Sample counting keeps every index exact.
+        for step in 1..=10 {
+            let jitter = if step % 2 == 0 { 0.002 } else { -0.001 };
+            let captured = Duration::from_secs_f64(step as f64 * 0.1 + jitter);
+            let placement = clock.place(start, Some(start + captured), FRAGMENT_SAMPLES);
+            assert_eq!(placement.index, (step - 1) as i64 * 1_600);
+            assert_eq!(placement.skip, 0);
+        }
+        // The thread stalls 500 ms while the server keeps buffering. When it
+        // resumes, the five fragments are read at once, each carrying the time
+        // it was captured.
+        for step in 11..=15 {
+            let captured = Duration::from_secs_f64(step as f64 * 0.1);
+            let placement = clock.place(start, Some(start + captured), FRAGMENT_SAMPLES);
+            assert_eq!(placement.index, (step - 1) as i64 * 1_600);
+            assert_eq!(placement.skip, 0);
+        }
+        // The track is still 1.5 s long, not 1.9 s: the stall left no shift.
+        let placement = clock.place(start, Some(start + Duration::from_millis(1_600)), 1_600);
+        let end = placement.index + (1_600 - placement.skip) as i64;
+        let wall = (1.6 * SAMPLE_RATE as f64) as i64;
+        assert!(
+            (end - wall).abs() < 800,
+            "residual offset {} samples",
+            end - wall
         );
-        // A steady read lands exactly where the previous one ended.
-        assert_eq!(
-            clock.index_for_read(Duration::from_millis(200), FRAGMENT_SAMPLES),
-            1_600
-        );
-        // Jitter smaller than the gap snap does not move the index.
-        assert_eq!(
-            clock.index_for_read(Duration::from_millis(310), FRAGMENT_SAMPLES),
-            3_200
-        );
-        // A one-second stall pulls the index forward, leaving a silent gap.
-        let resumed = clock.index_for_read(Duration::from_millis(1_400), FRAGMENT_SAMPLES);
-        assert_eq!(resumed, 20_800);
-        assert!(resumed > 4_800 + GAP_SAMPLES);
     }
 
     #[test]
-    fn the_clock_never_moves_backwards() {
+    fn a_real_outage_leaves_a_silent_gap() {
+        let start = Instant::now();
         let mut clock = ClockMap::default();
-        assert_eq!(clock.index_for_read(Duration::from_millis(100), 1_600), 0);
-        // A backwards wall clock is snapped to the expected next sample.
-        assert_eq!(
-            clock.index_for_read(Duration::from_millis(50), 1_600),
-            1_600
+        for step in 1..=5 {
+            let placement = clock.place(
+                start,
+                Some(start + Duration::from_millis(step * 100)),
+                FRAGMENT_SAMPLES,
+            );
+            assert_eq!(placement.index, (step - 1) as i64 * 1_600);
+        }
+        // Reads resume 1.1 s later with nothing buffered: the missing audio is
+        // silence at its true place on the clock.
+        let placement = clock.place(start, Some(start + Duration::from_millis(1_600)), 1_600);
+        assert_eq!(placement.index, 24_000);
+        assert_eq!(placement.skip, 0);
+    }
+
+    /// Feeds `reads` of one fragment each at `rate` times the wall clock.
+    /// Returns the residual at the end and after one minute.
+    fn drift_run(rate: f64, reads: usize) -> (i64, i64) {
+        let start = Instant::now();
+        let mut clock = ClockMap::default();
+        let mut wall = 0.0f64;
+        let mut first_residual = 0i64;
+        let mut end = 0i64;
+        for step in 0..reads {
+            wall += FRAGMENT_SAMPLES as f64 / (SAMPLE_RATE as f64 * rate);
+            let placement = clock.place(
+                start,
+                Some(start + Duration::from_secs_f64(wall)),
+                FRAGMENT_SAMPLES,
+            );
+            end = placement.index + (FRAGMENT_SAMPLES - placement.skip) as i64;
+            if step == 600 {
+                first_residual = end - (wall * SAMPLE_RATE as f64) as i64;
+            }
+        }
+        (end - (wall * SAMPLE_RATE as f64) as i64, first_residual)
+    }
+
+    #[test]
+    fn a_fast_device_clock_is_corrected_instead_of_stretching_the_track() {
+        // 1% fast over ten minutes of 100 ms reads, as a USB headset against
+        // the wall clock.
+        let (residual, first) = drift_run(1.01, 6_000);
+        assert!(
+            residual.abs() <= 2 * GAP_SAMPLES,
+            "the track is {residual} samples off the wall clock"
         );
-        // So is a small forward drift.
-        assert_eq!(
-            clock.index_for_read(Duration::from_millis(180), 1_600),
-            3_200
+        // The error after ten minutes is the same size as after one: it is
+        // bounded, not accumulating.
+        assert!(first.abs() <= 2 * GAP_SAMPLES, "after a minute: {first}");
+    }
+
+    #[test]
+    fn a_slow_device_clock_is_corrected_with_silence() {
+        let (residual, _) = drift_run(0.99, 6_000);
+        assert!(
+            residual.abs() <= 2 * GAP_SAMPLES,
+            "the track is {residual} samples off the wall clock"
         );
     }
 
@@ -860,6 +1093,21 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_without_a_microphone_writes_no_mic_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = Recorder::new(dir.path(), &key(), false, 1_000_000, false).unwrap();
+        // The monitor-as-microphone audio is ignored, not stored.
+        recorder.ingest(Track::Mic, &constant(0.5, 16_000), 0);
+        recorder.ingest(Track::Remote, &constant(0.5, 16_000), 0);
+        assert!(recorder.stop().is_empty());
+        assert!(!dir.path().join("audio/mic").exists(), "no mic directory");
+        assert_eq!(track(dir.path(), Track::Remote).len(), 16_000);
+        assert!(read_track(dir.path(), &key(), Track::Mic)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn session_json_matches_the_documented_shape() {
         let dir = tempfile::tempdir().unwrap();
         write_session_json(dir.path(), 1_762_400_000_000, "all").unwrap();
@@ -905,12 +1153,15 @@ mod tests {
     }
 
     impl CaptureSource for FakeSource {
-        fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        fn read(&mut self, out: &mut [f32]) -> Result<CaptureRead> {
             thread::sleep(Duration::from_millis(100));
             let calls = self.total.fetch_add(1, Ordering::SeqCst) + 1;
             if calls >= self.limit {
                 self.shared.stop.store(true, Ordering::SeqCst);
-                return Ok(0);
+                return Ok(CaptureRead {
+                    count: 0,
+                    captured: None,
+                });
             }
             if let Some(fail_after) = self.fail_after {
                 if self.reads >= fail_after {
@@ -920,7 +1171,12 @@ mod tests {
             }
             self.reads += 1;
             out.fill(0.5);
-            Ok(out.len())
+            Ok(CaptureRead {
+                count: out.len(),
+                // A real stream reports when the last sample was captured; the
+                // fake uses the read completion, so a reopen leaves a gap.
+                captured: Some(Instant::now()),
+            })
         }
     }
 

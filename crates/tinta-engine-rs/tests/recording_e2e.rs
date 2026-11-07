@@ -195,12 +195,18 @@ impl Drop for Engine {
 }
 
 fn play(paplay: &Path, sink: &str, file: &Path) {
-    let status = Command::new(paplay)
+    let status = start_play(paplay, sink, file).wait().expect("paplay ends");
+    assert!(status.success(), "paplay plays {sink}");
+}
+
+/// Starts `paplay` and returns the child, so the test can send commands while
+/// the tone plays.
+fn start_play(paplay: &Path, sink: &str, file: &Path) -> Child {
+    Command::new(paplay)
         .arg(format!("--device={sink}"))
         .arg(file)
-        .status()
-        .expect("paplay starts");
-    assert!(status.success(), "paplay plays {sink}");
+        .spawn()
+        .expect("paplay starts")
 }
 
 fn tone(seconds: f32, frequency: f32) -> Vec<f32> {
@@ -264,9 +270,28 @@ fn records_two_tracks_with_pause_and_levels() {
     // Remote speech in 0-5 s. The microphone must stay silent.
     play(&paplay, REMOTE_SINK, &remote_tone);
 
-    // Microphone speech in 8-13 s. The remote track must stay silent.
+    // Microphone speech in 8-13 s. The remote track must stay silent. Mute the
+    // microphone by wall-clock time at 9.5 s and unmute at 11 s: the window must
+    // be silent even though the audio was captured before the commands arrived.
     sleep_until(t0, 8.0);
-    play(&paplay, MIC_SINK, &mic_tone);
+    let mut tone = start_play(&paplay, MIC_SINK, &mic_tone);
+    sleep_until(t0, 9.5);
+    let muted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    engine.send(json!({ "id": 5, "cmd": "mic_muted",
+        "params": { "muted": true, "t": muted_at } }));
+    assert_eq!(engine.reply(5)["ok"], true);
+    sleep_until(t0, 11.0);
+    let unmuted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    engine.send(json!({ "id": 6, "cmd": "mic_muted",
+        "params": { "muted": false, "t": unmuted_at } }));
+    assert_eq!(engine.reply(6)["ok"], true);
+    assert!(tone.wait().unwrap().success(), "the microphone tone plays");
 
     // A remote tone while paused must not reach the chunks.
     sleep_until(t0, 15.0);
@@ -321,13 +346,20 @@ fn records_two_tracks_with_pause_and_levels() {
     );
     assert!(rms(&remote, 16.0, 18.0) < 0.01, "remote through the pause");
 
-    // Microphone: silent while only the remote plays, audible at 9-12 s and
-    // again after the resume.
+    // Microphone: silent while only the remote plays, audible at 8-9.4 s, silent
+    // through the mute, audible again until the tone ends, and again after the
+    // resume.
     assert!(rms(&mic, 1.0, 4.0) < 0.01, "microphone hears the remote");
-    assert!(rms(&mic, 9.0, 12.0) > 0.1, "microphone tone");
+    assert!(rms(&mic, 8.2, 9.3) > 0.1, "microphone tone");
+    assert!(
+        rms(&mic, 9.7, 10.8) < 0.01,
+        "microphone through the mute: {:.4}",
+        rms(&mic, 9.7, 10.8)
+    );
+    assert!(rms(&mic, 11.2, 12.6) > 0.1, "microphone after the unmute");
     assert!(rms(&mic, 21.0, 24.0) > 0.1, "microphone after the resume");
 
-    // The levels events report both meters and the capture state.
+    // The levels events report both meters, the capture state and the mute.
     let levels: Vec<&Value> = seen
         .iter()
         .filter(|value| value["event"] == "levels")
@@ -340,6 +372,12 @@ fn records_two_tracks_with_pause_and_levels() {
         .iter()
         .any(|event| event["mic"].as_f64().unwrap_or(0.0) > 0.02));
     assert!(levels.iter().any(|event| event["remote_capturing"] == true));
+    assert!(
+        levels
+            .iter()
+            .any(|event| event["mic_muted"] == true && event["mic"].as_f64() == Some(0.0)),
+        "no muted levels tick"
+    );
 
     let session = std::fs::read_dir(dir.path().join("audio"))
         .unwrap()
@@ -349,4 +387,75 @@ fn records_two_tracks_with_pause_and_levels() {
     assert_eq!(session, 1, "one session json");
 
     drop(fixture);
+}
+
+#[test]
+#[ignore = "needs a PulseAudio/PipeWire server and pulseaudio-utils"]
+fn a_monitor_default_source_is_not_recorded_as_the_microphone() {
+    let fixture = Fixture::setup();
+    let paplay = tool("paplay");
+    // A machine with no input device makes the speaker monitor the default
+    // source. Recording it as the microphone duplicates every remote word.
+    run(
+        &fixture.pactl,
+        &["set-default-source", &format!("{REMOTE_SINK}.monitor")],
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let dir = tempfile::tempdir().unwrap();
+    let remote_tone = dir.path().join("remote.wav");
+    std::fs::write(&remote_tone, tinta_engine_rs::audio::wav(&tone(3.0, 440.0))).unwrap();
+
+    let mut engine = Engine::spawn();
+    engine.send(json!({
+        "id": 1,
+        "cmd": "start",
+        "params": {
+            "dir": dir.path().display().to_string(),
+            "audio_key": STANDARD.encode([7u8; 32]),
+            "source": "all",
+        },
+    }));
+    let start = engine.reply(1);
+    assert_eq!(start["ok"], true, "{start}");
+    play(&paplay, REMOTE_SINK, &remote_tone);
+    thread::sleep(Duration::from_millis(3_500));
+    engine.send(json!({ "id": 2, "cmd": "stop" }));
+    assert_eq!(engine.reply(2)["ok"], true);
+    engine.finish();
+    let seen = std::mem::take(&mut engine.seen);
+
+    let key = [7u8; 32];
+    assert!(
+        !dir.path().join("audio/mic").exists(),
+        "a monitor source must not create a microphone track"
+    );
+    assert!(read_track(dir.path(), &key, Track::Mic).unwrap().is_empty());
+    assert!(
+        rms(
+            &read_track(dir.path(), &key, Track::Remote).unwrap(),
+            0.5,
+            2.5
+        ) > 0.1
+    );
+
+    let warnings: Vec<String> = seen
+        .iter()
+        .filter(|value| value["event"] == "warning")
+        .map(|value| value["message"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("No microphone was found"),
+        "{:?}",
+        warnings[0]
+    );
+    let levels: Vec<&Value> = seen
+        .iter()
+        .filter(|value| value["event"] == "levels")
+        .collect();
+    assert!(
+        !levels.is_empty() && levels.iter().all(|event| event["mic"] == 0.0),
+        "the microphone meter stays at zero"
+    );
 }

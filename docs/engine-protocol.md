@@ -1116,6 +1116,30 @@ notification permission when the read reports `granted` (`calendar.rs:211-215`).
 `available:false` from `summary_status` prevents automatic summaries without any app
 change (`lib.rs:589`).
 
+The fork engines that do implement the object send it in `ready` and in `ping`:
+
+```json
+{"event":"ready","version":"0.9.3","capabilities":{"capture_system_audio":true,"capture_app_audio":false,"calls_detection":false,"call_reader":false,"calendar":false,"summaries":false,"echo_cancellation":false,"import_audio":true,"live_transcription":true}}
+```
+
+| field | meaning when `true` |
+|---|---|
+| `capture_system_audio` | `start` records the audio of the whole system. |
+| `capture_app_audio` | `list_sources` names the apps and `start` records one of them. |
+| `calls_detection` | The engine emits `call_started`, `call_ended` and `call_state`. |
+| `call_reader` | `calls` with `read`, `request_accessibility` and `call_report` work. |
+| `calendar` | `calendar`, `request_calendar` and `calendar_changed` work. |
+| `summaries` | `summarize` works. |
+| `echo_cancellation` | The microphone track has the meeting audio removed by the platform. |
+| `import_audio` | `import_audio` works. |
+| `live_transcription` | `start` emits `live {track, s, e, text}` while recording. |
+
+The app parser reads the known keys and treats a missing key — and a missing object — as
+`true`, so an engine that omits `live_transcription` is assumed to have it. Always send
+the field explicitly; on Linux the engine starts the live worker only when every model
+file is installed, and `TINTA_ENGINE_LIVE=0` turns it off, but the capability still
+describes what the binary can do.
+
 ### 10.2 Recording sources and permissions
 
 The app stores the selected source as a string and passes it to `start` unchanged

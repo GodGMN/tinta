@@ -196,7 +196,7 @@ impl SpeechPass {
             .context("the voice activity model did not load. Install the models again.")
     }
 
-    fn diarizer(&self, max_speakers: Option<usize>) -> Result<OfflineSpeakerDiarization> {
+    fn diarizer(&self) -> Result<OfflineSpeakerDiarization> {
         self.check_installed()?;
         let group = self.group("diarization")?;
         let segmentation = self.path(group, "segmentation")?;
@@ -218,7 +218,7 @@ impl SpeechPass {
                 debug: false,
                 provider: Some(provider),
             },
-            clustering: cluster_speakers(DIARIZATION_THRESHOLD, max_speakers),
+            clustering: cluster_speakers(DIARIZATION_THRESHOLD),
             min_duration_on: 0.3,
             min_duration_off: 0.5,
         };
@@ -268,6 +268,8 @@ impl SpeechPass {
                 continue;
             };
             stream.accept_waveform(SAMPLE_RATE as i32, &samples[from..to]);
+            // The spike did not call input_finished(); it changed no labels on
+            // ES2004b. The golden tests cover reclustering only, not this step.
             stream.input_finished();
             let embedding = if extractor.is_ready(&stream) {
                 extractor.compute(&stream)
@@ -336,7 +338,7 @@ impl FinalPass for SpeechPass {
         let samples = &samples[..samples
             .len()
             .min(MAX_DIARIZATION_SECONDS * SAMPLE_RATE as usize)];
-        let diarizer = self.diarizer(max_speakers)?;
+        let diarizer = self.diarizer()?;
         progress(0.0);
         // Step 1 of the recipe: over-cluster at 0.7 (see `cluster_speakers`).
         let result = diarizer
@@ -467,10 +469,10 @@ fn padded_unit_range(start: f32, end: f32, len: usize, min_samples: usize) -> (u
 /// dissolve/reassign below 3 % of the speech), which is what turns the 24-60
 /// clusters of a meeting into its real speakers.
 ///
-/// `max_speakers` is a **cap**, not a count: the app sends the number of remote
-/// participants, and [`crate::clustering::Options::max_speakers`] merges the
-/// closest final centroids until the count fits. This function itself keeps
-/// `num_clusters = -1`: forcing sherpa-onnx's *exact* count is forbidden by
+/// The caller's `max_speakers` is a **cap**, not a count, and is applied after
+/// `recluster` ([`crate::clustering::Options::max_speakers`] merges the closest
+/// final centroids until the count fits). It is deliberately not a parameter
+/// here: this function keeps `num_clusters = -1`: forcing sherpa-onnx's *exact* count is forbidden by
 /// design condition 6 and would split a real speaker when the caller passes a
 /// number above the truth. The recipe alone returns the reference count +/-1 on
 /// the 90 s `finalize_models` clip; the cap is only an upper bound.
@@ -478,10 +480,7 @@ fn padded_unit_range(start: f32, end: f32, len: usize, min_samples: usize) -> (u
 /// **0.7 is tuned for CAMPPlus only** (the `diarization` embedding model in the
 /// manifest). Another embedding model has a different similarity scale and needs
 /// its own over-clustering threshold, merge distance and `min_share`.
-pub fn cluster_speakers(threshold: f32, max_speakers: Option<usize>) -> FastClusteringConfig {
-    // The cap is applied after `recluster` in `FinalPass::diarize`; this step
-    // must never force an exact count.
-    let _ = max_speakers;
+pub fn cluster_speakers(threshold: f32) -> FastClusteringConfig {
     FastClusteringConfig {
         num_clusters: -1,
         threshold,
@@ -595,14 +594,12 @@ mod tests {
 
     #[test]
     fn clustering_keeps_the_threshold_and_never_forces_a_count() {
-        for max_speakers in [None, Some(0), Some(3)] {
-            let config = cluster_speakers(0.7, max_speakers);
-            assert_eq!(config.threshold, 0.7);
-            // sherpa-onnx can only force an exact count; the design conditions
-            // forbid that, so the automatic count stays.
-            assert_eq!(config.num_clusters, -1);
-            assert!(!config.compute_confidence);
-        }
+        let config = cluster_speakers(0.7);
+        assert_eq!(config.threshold, 0.7);
+        // sherpa-onnx can only force an exact count; the design conditions
+        // forbid that, so the automatic count stays.
+        assert_eq!(config.num_clusters, -1);
+        assert!(!config.compute_confidence);
     }
 
     #[test]

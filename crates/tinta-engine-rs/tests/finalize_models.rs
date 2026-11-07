@@ -117,7 +117,7 @@ const REFERENCE_SPEAKERS: usize = 3;
 
 #[test]
 #[ignore = "needs TINTA_ENGINE_MODELS_DIR and TINTA_ENGINE_TEST_AUDIO with the reference clip"]
-fn imports_and_finalizes_a_two_speaker_clip() {
+fn imports_and_finalizes_a_three_speaker_clip() {
     let models = required("TINTA_ENGINE_MODELS_DIR");
     let clip = required("TINTA_ENGINE_TEST_AUDIO");
     assert!(

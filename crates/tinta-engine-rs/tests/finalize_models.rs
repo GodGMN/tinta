@@ -1,7 +1,7 @@
 //! End-to-end final pass with the real sherpa-onnx models.
 //!
-//! Ignored by default: it needs the installed models and a two-speaker clip, both
-//! outside the repository. Run it with
+//! Ignored by default: it needs the installed models and the reference clip,
+//! both outside the repository. Run it with
 //!
 //! ```text
 //! TINTA_ENGINE_MODELS_DIR=/path/to/models \
@@ -9,9 +9,14 @@
 //! cargo test --locked -p tinta-engine-rs --test finalize_models -- --ignored --nocapture
 //! ```
 //!
-//! The clip must be 60-90 s of speech with at least two speakers. It is imported
+//! The clip must be 60-90 s of speech with at least two speakers (the pinned one
+//! has three). It is imported
 //! as the remote track, so the whole pipeline (decode, resample, TNTC write,
 //! read, VAD segmentation, ASR, echo filter, diarization) runs.
+//!
+//! The pinned clip is ES2004b[120, 210) from the BUTSpeechFIT AMI setup; see
+//! `REFERENCE_SPEAKERS` for its reference speakers. The test runs with no
+//! `max_speakers` cap, so it checks the recipe itself, not the app's cap.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -90,8 +95,28 @@ fn check_track(result: &Value, track: &str) {
     }
 }
 
+/// Reference speaker count for the pinned clip, from the BUTSpeechFIT AMI
+/// `only_words` RTTM of ES2004b (commit 2509d8933721023fab4def2618aabd5c28eb82e9).
+///
+/// The clip is `ES2004b.Mix-Headset.wav[120.0, 210.0)` (verified sample-exact:
+/// Pearson correlation 1.0 with a 16 kHz read at that offset). In that window the
+/// reference has four labelled speakers, but one (`MEO015`) holds 0.44 s:
+///
+/// | speaker | seconds |
+/// |---|---|
+/// | FEE013 | 49.7 |
+/// | MEE014 | 8.2 |
+/// | FEE016 | 4.8 |
+/// | MEO015 | 0.4 (excluded, under 1 s) |
+///
+/// so the count to compare against is **3**. The recipe merges nothing on this
+/// clip and returns 4 (MEE014 is split in two), which is within the +/-1 check.
+/// The reference JSON lives outside the repository (task #18 evidence,
+/// `results/ref-ES2004b.json`); no audio or reference data is committed.
+const REFERENCE_SPEAKERS: usize = 3;
+
 #[test]
-#[ignore = "needs TINTA_ENGINE_MODELS_DIR and TINTA_ENGINE_TEST_AUDIO with a two-speaker clip"]
+#[ignore = "needs TINTA_ENGINE_MODELS_DIR and TINTA_ENGINE_TEST_AUDIO with the reference clip"]
 fn imports_and_finalizes_a_two_speaker_clip() {
     let models = required("TINTA_ENGINE_MODELS_DIR");
     let clip = required("TINTA_ENGINE_TEST_AUDIO");
@@ -144,9 +169,11 @@ fn imports_and_finalizes_a_two_speaker_clip() {
         .iter()
         .map(|segment| segment["speaker"].as_str().unwrap())
         .collect();
+    // The recipe has no count prior; the reference has REFERENCE_SPEAKERS
+    // speakers over 1 s in this window. Allow one over- or under-split.
     assert!(
-        speakers.len() >= 2,
-        "the clip should have at least two speakers, found {speakers:?}"
+        speakers.len().abs_diff(REFERENCE_SPEAKERS) <= 1,
+        "the clip has {REFERENCE_SPEAKERS} reference speakers over 1 s, found {speakers:?}"
     );
     assert!(
         segments

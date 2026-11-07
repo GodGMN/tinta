@@ -36,6 +36,7 @@ pub struct AudioDecoder {
     decoder: Box<dyn SymphoniaDecoder>,
     sample_rate: u32,
     channels: usize,
+    total_frames: Option<u64>,
 }
 
 impl AudioDecoder {
@@ -77,17 +78,26 @@ impl AudioDecoder {
             .map(|channels| channels.count())
             .unwrap_or(1)
             .max(1);
+        let total_frames = track.codec_params.n_frames;
         Ok(Self {
             format,
             track_id,
             decoder,
             sample_rate,
             channels,
+            total_frames,
         })
     }
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Frames the container declares for the stream, when it declares them.
+    /// WAV sizes its data chunk, MP3 may carry a Xing frame count; a streamed
+    /// container without a duration has none.
+    pub fn total_frames(&self) -> Option<u64> {
+        self.total_frames
     }
 
     pub fn channels(&self) -> usize {

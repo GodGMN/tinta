@@ -10,6 +10,7 @@
 //! Recording commands are a later task and fail with an `unsupported` error.
 
 pub mod audio;
+pub mod clustering;
 pub mod echo;
 pub mod engine;
 pub mod finalize;

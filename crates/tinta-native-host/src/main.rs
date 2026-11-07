@@ -61,8 +61,9 @@ impl std::fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
-/// The app closed the connection before it answered "hello". The app trusts only the host
-/// in its own bundle, so this host is from another copy of the app, for example the copy before an update.
+/// The app closed the connection before it answered "hello". The app trusts only the host next
+/// to its own executable, so this host is from another copy of the app, for example the copy
+/// before an update.
 #[derive(Debug)]
 struct Refused;
 
@@ -173,6 +174,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::path::Path;
 
     fn socket(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("tinta-host-{name}-{}.sock", std::process::id()));
@@ -180,8 +182,8 @@ mod tests {
         path
     }
 
-    fn link(socket: &PathBuf) -> AppLink {
-        AppLink { socket: socket.clone(), stream: None, next_id: 0 }
+    fn link(socket: &Path) -> AppLink {
+        AppLink { socket: socket.to_path_buf(), stream: None, next_id: 0 }
     }
 
     /// Answers `count` requests on one connection, then closes it.

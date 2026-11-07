@@ -1,22 +1,43 @@
-//! The app socket. Only the signed helper binaries next to the app can connect:
+//! The app socket. Only the helper binaries next to the app can connect:
 //! `tinta-mcp` for MCP tools and `tinta-native-host` for Meet extension messages.
+//!
+//! macOS checks the code signature of the helper. Linux checks the user of the connection and
+//! the executable of the peer process; see `crates/tinta-core/src/peer.rs`.
+//!
+//! On Windows the app has no socket yet; the helper binaries connect over a Unix socket,
+//! which Windows support adds with the rest of the port.
 
-use crate::{system, AppState, MCP_ENABLED_DEFAULT};
-use anyhow::{bail, Result};
-use tinta_core::protocol::{Request, Response};
-use tinta_core::{paths, tools};
-use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use crate::AppState;
+use anyhow::Result;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use crate::{platform, MCP_ENABLED_DEFAULT};
+#[cfg(unix)]
+use anyhow::bail;
+#[cfg(unix)]
+use serde_json::{json, Value};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use tinta_core::protocol::{Request, Response};
+#[cfg(unix)]
+use tinta_core::{paths, tools};
+
 /// The maximum length of one request line.
+#[cfg(unix)]
 const MAX_LINE_BYTES: u64 = 1 << 20;
 
+#[cfg(unix)]
 pub fn serve(state: Arc<AppState>) -> Result<()> {
     let path = paths::socket_path();
+    paths::prepare_socket_dir()?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -33,10 +54,18 @@ pub fn serve(state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
+/// Windows has no app socket yet, so the app starts without one.
+#[cfg(not(unix))]
+pub fn serve(_state: Arc<AppState>) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn connection(state: Arc<AppState>, stream: UnixStream) -> Result<()> {
-    let peer = system::peer_path(stream.as_raw_fd());
-    if !peer.as_deref().map(system::trusted_peer).unwrap_or(false) {
-        bail!("{} is not a trusted Tinta helper", peer.map(|p| p.display().to_string()).unwrap_or_default());
+    let peer = platform::authenticate(stream.as_raw_fd());
+    // Helper authentication fails closed on platforms without a peer check.
+    if peer.is_none() {
+        bail!("the peer is not a trusted Tinta helper");
     }
     let mut extension_connection = None;
     let result = requests(&state, stream, &mut extension_connection);
@@ -48,6 +77,7 @@ fn connection(state: Arc<AppState>, stream: UnixStream) -> Result<()> {
 
 /// Answers the requests of one trusted connection. `extension_connection` receives the
 /// connection number when the peer is the native host.
+#[cfg(unix)]
 fn requests(state: &AppState, stream: UnixStream, extension_connection: &mut Option<u64>) -> Result<()> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -89,6 +119,7 @@ fn requests(state: &AppState, stream: UnixStream, extension_connection: &mut Opt
     }
 }
 
+#[cfg(unix)]
 fn tool_call(state: &AppState, session: &str, id: u64, params: &Value) -> Response {
     if state.setting("mcp_enabled", MCP_ENABLED_DEFAULT) != "true" {
         return Response::err(id, "MCP access is off in Tinta settings");

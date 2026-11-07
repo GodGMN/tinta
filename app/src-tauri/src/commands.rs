@@ -1,6 +1,6 @@
 //! Commands for the app window.
 
-use crate::{state, system, MCP_ENABLED_DEFAULT};
+use crate::{platform, state, system, MCP_ENABLED_DEFAULT};
 use tinta_core::db::Origin;
 use tinta_core::export::{self, Document};
 use tinta_core::paths;
@@ -26,12 +26,12 @@ async fn bootstrap() -> CommandResult<Value> {
         let permissions = s.engine.call("permissions", json!({}), Duration::from_secs(10)).unwrap_or(json!({}));
         let summaries =
             s.engine.call("summary_status", json!({}), Duration::from_secs(10)).unwrap_or(json!({"available": false}));
-        let mcp_path = system::helper_path("tinta-mcp");
+        let mcp_path = platform::helper_path("tinta-mcp");
         let mut result = {
             let db = s.db.lock().unwrap();
             let setting = |key: &str, default: &str| db.setting(key).ok().flatten().unwrap_or_else(|| default.to_string());
             json!({
-                "self_name": db.setting("self_name").ok().flatten().unwrap_or_else(system::full_name),
+                "self_name": db.setting("self_name").ok().flatten().unwrap_or_else(platform::full_name),
                 "mcp_enabled": setting("mcp_enabled", MCP_ENABLED_DEFAULT) == "true",
                 "last_source": setting("last_source", "com.google.Chrome"),
                 "theme": setting("theme", "system"),
@@ -41,7 +41,7 @@ async fn bootstrap() -> CommandResult<Value> {
                 "audio_retention_days": db.audio_retention_days().map_err(err)?,
                 "call_reading": setting("call_reading", "false") == "true",
                 "meeting_reminders": setting("meeting_reminders", "true") == "true",
-                "call_browser": setting("call_browser", system::DEFAULT_BROWSER),
+                "call_browser": setting("call_browser", platform::DEFAULT_BROWSER),
             })
         };
         // The app takes the locks one at a time.
@@ -52,7 +52,7 @@ async fn bootstrap() -> CommandResult<Value> {
         for (key, value) in [
             ("accessibility", json!(permissions["accessibility"].as_bool().unwrap_or(false))),
             ("summaries", summaries),
-            ("filevault", json!(system::filevault_on())),
+            ("filevault", json!(platform::filevault_on())),
             ("models_installed", json!(models["installed"].as_bool().unwrap_or(false))),
             ("models_path", models["path"].clone()),
             ("microphone", permissions["microphone"].clone()),
@@ -91,15 +91,7 @@ async fn request_accessibility() -> CommandResult<Value> {
 /// Opens a pane of System Settings: "accessibility", "microphone", "calendars", or "internet_accounts".
 #[tauri::command]
 async fn open_privacy_settings(pane: String) -> CommandResult<()> {
-    let url = match pane.as_str() {
-        "accessibility" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
-        "calendars" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
-        "internet_accounts" => "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension",
-        other => return Err(format!("unknown settings pane {other}")),
-    };
-    std::process::Command::new("/usr/bin/open").arg(url).status().map_err(err)?;
-    Ok(())
+    platform::open_privacy_settings(&pane).map_err(err)
 }
 
 /// Reads the calendars again and returns the next meetings.
@@ -121,7 +113,7 @@ async fn set_calendar_hidden(calendar_id: String, hidden: bool) -> CommandResult
 /// The browsers on this Mac, and the default browser, for the browser of call links.
 #[tauri::command]
 async fn list_browsers() -> CommandResult<Value> {
-    blocking(|| Ok(json!({"browsers": system::browsers(), "default": system::default_browser()}))).await
+    blocking(|| Ok(json!({"browsers": platform::browsers(), "default": platform::default_browser()}))).await
 }
 
 /// Opens the meeting of a calendar event and returns its ID. With `join`, it also joins the call and records it.
@@ -286,7 +278,7 @@ async fn set_mic_muted(muted: bool) -> CommandResult<()> {
 #[tauri::command]
 async fn show_meeting(app: tauri::AppHandle, id: String) -> CommandResult<()> {
     state().emit("open_meeting", json!({"id": id}));
-    crate::bubble::show_main(&app);
+    platform::bubble::show_main(&app);
     Ok(())
 }
 
@@ -490,7 +482,7 @@ fn export_to_downloads(id: &str, format: &str) -> CommandResult<String> {
 /// Puts an exported file on the clipboard.
 #[tauri::command]
 async fn copy_file(path: String) -> CommandResult<()> {
-    system::copy_file(std::path::Path::new(&path)).map_err(err)
+    platform::copy_file(std::path::Path::new(&path)).map_err(err)
 }
 
 /// The usual export folder, if it exists.
@@ -538,8 +530,7 @@ async fn move_library(parent: String) -> CommandResult<String> {
 
 #[tauri::command]
 async fn show_library() -> CommandResult<()> {
-    std::process::Command::new("/usr/bin/open").arg(paths::data_dir()).spawn().map_err(err)?;
-    Ok(())
+    platform::open_path(&paths::data_dir()).map_err(err)
 }
 
 /// Copies the bundled Chrome extension to a fixed folder and shows it in Finder.
@@ -550,7 +541,7 @@ async fn prepare_extension(app: tauri::AppHandle) -> CommandResult<String> {
     let source = app.path().resource_dir().map_err(err)?.join("extension");
     blocking(move || {
         let target = system::copy_extension(&source).map_err(err)?;
-        std::process::Command::new("/usr/bin/open").arg("-R").arg(&target).spawn().map_err(err)?;
+        platform::reveal(&target).map_err(err)?;
         Ok(target.to_string_lossy().to_string())
     })
     .await

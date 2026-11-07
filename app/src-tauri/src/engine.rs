@@ -29,13 +29,33 @@ pub struct Engine {
     stopped: AtomicBool,
 }
 
-/// The engine binary: next to the app executable in the bundle, or the SwiftPM build in development.
+/// The engine binary: next to the app executable in the bundle, or the engine's build in development.
+/// Windows bundles the engine as `tinta-engine.exe`, so the name follows the platform suffix.
 pub fn engine_path() -> PathBuf {
+    let file = format!("tinta-engine{}", std::env::consts::EXE_SUFFIX);
     let bundled = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("tinta-engine")))
+        .and_then(|p| p.parent().map(|d| d.join(&file)))
         .filter(|p| p.exists());
-    bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/.build/release/tinta-engine"))
+    if let Some(path) = bundled {
+        return path;
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if cfg!(target_os = "macos") {
+        return manifest.join("../../engine/.build/release").join(file);
+    }
+    // The Rust engine, from `cargo build` on the workspace or on the engine crate alone.
+    // The app still opens when no build exists: the engine shows as unavailable.
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let other = if cfg!(debug_assertions) { "release" } else { "debug" };
+    let dirs = [
+        manifest.join("../../target").join(profile),
+        manifest.join("../../target").join(other),
+        // The Rust engine crate lands in a separate change; these paths work once it does.
+        manifest.join("../../crates/tinta-engine-rs/target").join(profile),
+        manifest.join("../../crates/tinta-engine-rs/target").join(other),
+    ];
+    dirs.iter().map(|d| d.join(&file)).find(|p| p.exists()).unwrap_or_else(|| dirs[0].join(&file))
 }
 
 impl Engine {
@@ -58,10 +78,16 @@ impl Engine {
                 return Ok(());
             }
         }
-        let mut child = Command::new(&self.path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+        let mut command = Command::new(&self.path);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        // A console engine must not open a console window in front of the app on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
             .spawn()
             .with_context(|| format!("cannot start {}", self.path.display()))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no engine stdin"))?;

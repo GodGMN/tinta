@@ -1,13 +1,21 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use hkdf::Hkdf;
-use rand::RngCore;
 use sha2::Sha256;
 
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+#[cfg(target_os = "macos")]
+use rand::RngCore;
+
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "com.usetinta.tinta";
 /// The service of the master key in versions before 0.4.0.
+#[cfg(target_os = "macos")]
 const OLD_SERVICE: &str = "app.tinta";
+#[cfg(target_os = "macos")]
 const ACCOUNT: &str = "library-master-key";
 /// errSecItemNotFound
+#[cfg(target_os = "macos")]
 const ITEM_NOT_FOUND: i32 = -25300;
 
 /// Keys derived from the master key in the Keychain.
@@ -34,6 +42,7 @@ impl Keys {
 
     /// Loads the master key from the Keychain, or creates it on first use.
     /// The item is a generic password that iCloud Keychain does not synchronize.
+    #[cfg(target_os = "macos")]
     pub fn load_or_create() -> Result<Self> {
         use security_framework::passwords::set_generic_password;
         // Debug builds can use a fixed key, so that automated tests do not wait for Keychain prompts.
@@ -73,6 +82,7 @@ impl Keys {
 
 /// Reads the master key item of a service. Only a missing item gives `None`. Any other error,
 /// for example a denied Keychain prompt, must stop the app: a new key would make the library unreadable.
+#[cfg(target_os = "macos")]
 fn read_item(service: &str) -> Result<Option<Vec<u8>>> {
     match security_framework::passwords::get_generic_password(service, ACCOUNT) {
         Ok(value) => Ok(Some(value)),

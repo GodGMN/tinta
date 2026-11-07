@@ -361,7 +361,7 @@ engine must still answer them (see [§10.1](#101-capabilities)).
 | | |
 |---|---|
 | params | none |
-| result | `{"pong": true, "capabilities": {…}}` (`Engine.swift:76-77`; see [§10.1](#101-capabilities)) |
+| result | `{"pong": true, "capabilities": {…}}` (`Engine.swift:85-86`; see [§10.1](#101-capabilities)) |
 | errors | none |
 | events | none |
 | notes | The app calls it on every engine start, including the restart after an exit: `ping` starts the process without side effects and carries the capabilities, and the app then starts the watchers that the engine supports (`lib.rs start_engine`). A second engine should keep it free of side effects and fast. |
@@ -1044,13 +1044,13 @@ the `ping` reply:
 
 | field | `true` means |
 |---|---|
-| `capture_system_audio` | The engine records the audio of the whole system. The app does not read this field yet. |
+| `capture_system_audio` | The engine records the audio of the whole system (the `all` source). |
 | `capture_app_audio` | The engine records the audio of one app, and `list_sources` names the apps. |
 | `calls_detection` | The engine detects calls in desktop apps and emits `call_started`, `call_ended`, and `call_state`. |
 | `call_reader` | The engine reads names, the active speaker, and the mute state from a call window (`read` in `calls`, `request_accessibility`, `call_report`). |
 | `calendar` | The engine reads the calendars (`calendar`, `request_calendar`, `calendar_changed`). |
 | `summaries` | The engine writes summaries (`summarize`). |
-| `echo_cancellation` | The engine removes the meeting audio from the microphone. |
+| `echo_cancellation` | The engine removes the meeting audio from the microphone. The app only changes its hint text; it does not change the audio pipeline. |
 | `import_audio` | The engine imports an audio file (`import_audio`). |
 
 Semantics:
@@ -1072,14 +1072,17 @@ The app turns a feature off like this (`crates/tinta-core/src/capabilities.rs`,
 
 | capability `false` | app behavior |
 |---|---|
-| `capture_app_audio` | The meeting source is always `all`, and the window shows a fixed "System audio" instead of the per-app picker. |
+| `capture_app_audio` | The meeting source is always `all`, and the window shows a fixed "System audio" instead of the per-app picker. This needs `capture_system_audio`. |
 | `calls_detection` | No `calls` polling and no call watcher after a restart (the restart uses `ping`), and no call banners or "call detected" hero. |
 | `call_reader` | `calls` is sent with `read: false`; `request_accessibility` and `call_report` are not sent; the Zoom and Microsoft Teams names setting is hidden. |
 | `calendar` | The calendar thread is not started; `calendar` and `request_calendar` are not sent; the calendar section, the Home cards, and the reminders are hidden. |
 | `summaries` | `summary_status` and `summarize` are not sent, no automatic summary runs, and the summary controls are hidden. An existing summary is still shown. |
-| `echo_cancellation` | The window does not claim that Tinta removes the echo, and suggests headphones. |
+| `echo_cancellation` | The window does not claim that Tinta removes the echo, and suggests headphones. This only changes the text; the audio pipeline is the engine's. |
 | `import_audio` | The import command and button are disabled. |
-| `capture_system_audio` | Not read by the app yet. |
+| `capture_system_audio` | The app never records `all`. With `capture_app_audio` also `false`, no meeting audio can be recorded, so Start is disabled with a reason. |
+
+The two audio capabilities decide whether the app can record at all: with both `false`, there
+is no source to pass to `start`, so the recording never starts.
 
 An old app does not know the object and calls the Mac-only commands anyway. A second engine
 must therefore still **answer these with valid, degraded results**, not errors, or the old

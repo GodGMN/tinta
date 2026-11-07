@@ -140,6 +140,30 @@ jobs:
         run: cargo test --locked -p tinta-core
       - name: Clippy
         run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
 
   helpers-linux:
     # The Meet extension host and the MCP server are Unix-only, and the peer check in

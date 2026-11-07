@@ -1,0 +1,33 @@
+[package]
+name = "tinta-engine-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tinta-engine"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tinta-core = { path = "../tinta-core", default-features = false }
+base64 = "0.22"
+bzip2 = "0.4"
+dirs = "5"
+libc = "0.2"
+rubato = "0.15"
+sha2 = "0.10"
+sherpa-onnx = { version = "2.0.1", features = ["static"] }
+symphonia = { version = "0.5", features = ["all"] }
+tar = "0.4"
+ureq = "2.12"
+whatlang = "0.16"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.29"

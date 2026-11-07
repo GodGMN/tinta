@@ -14,3 +14,6 @@
 /.mcp.json
 /opencode.json
 /.codex/config.toml
+
+# Python bytecode from the fork probes.
+__pycache__/

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Tinta records meetings on Linux. It records your microphone and the sound your computer plays, keeps both when you pause, and transcribes them when you stop. The microphone mute button, the live transcript, and the recording bubble work as on macOS.
+
+### Fixed
+- On Linux, the two tracks stay lined up when the computer is busy. A stall is silence at the right time, not a shift of the rest of the meeting, and a microphone whose clock runs slightly fast or slow is corrected in steps of at most 5 ms during quiet moments instead of cutting or padding a whole 100 ms at once.
+- On Linux, a computer without a microphone records no microphone track. Before, the speaker output was recorded as the microphone and every remote word was attributed to you.
+- On Linux, a microphone that is unplugged in the middle of a meeting is not replaced by the speaker monitor, so the meeting audio is not attributed to you a second time. When a real microphone appears again — a USB headset is plugged in, or a Bluetooth headset switches to its call mode — the recording picks it up where it belongs on the meeting clock.
+- On Linux, a recording follows a change of the default output or input device in the middle of a meeting, and the device watcher reconnects after the audio server restarts. A device that stays missing is retried with backoff and logged at most once every 30 seconds.
+- On Linux, the live transcript cannot add a late turn to the next meeting, and it shares one transcription model with the final pass instead of loading a second copy. It skips one utterance while a final pass holds the model instead of waiting for the whole pass.
+- On Linux, `stop` answers within 5 seconds even if the audio server stops responding, and keeps the audio written so far.
+
 ## 0.9.3 (2026-10-21)
 
 ### Fixed

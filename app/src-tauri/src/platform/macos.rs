@@ -61,10 +61,10 @@ pub fn helper_path(name: &str) -> PathBuf {
 
 /// Writes the Native Messaging host manifest for Chrome. Chrome starts the host only
 /// for the published extension ID.
-pub fn install_native_host() -> Result<()> {
+pub fn install_native_host() -> Result<PathBuf> {
     let dir = native_hosts_dir();
     std::fs::create_dir_all(&dir)?;
-    write_host_manifest(&dir, NATIVE_HOST_NAME)?;
+    let path = write_host_manifest(&dir, NATIVE_HOST_NAME)?;
     // Without the extension folder, no installed extension uses the old name.
     if dir.join(format!("{OLD_NATIVE_HOST_NAME}.json")).exists() {
         if crate::system::extension_dir().exists() {
@@ -73,7 +73,7 @@ pub fn install_native_host() -> Result<()> {
             remove_old_native_host();
         }
     }
-    Ok(())
+    Ok(path)
 }
 
 /// Removes the manifest of the old native host name. The extension calls it when it
@@ -210,15 +210,6 @@ pub fn open_call(link: &tinta_core::calendar::Link, browser: &str) -> String {
     "all".to_string()
 }
 
-/// Opens a link with its default handler.
-pub fn open_url(url: &str) -> Result<()> {
-    let status = Command::new("/usr/bin/open").arg(url).status()?;
-    if !status.success() {
-        bail!("cannot open {url}");
-    }
-    Ok(())
-}
-
 /// Opens a folder in Finder.
 pub fn open_path(path: &Path) -> Result<()> {
     Command::new("/usr/bin/open").arg(path).spawn()?;
@@ -240,7 +231,9 @@ pub fn open_privacy_settings(pane: &str) -> Result<()> {
         "internet_accounts" => "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension",
         other => bail!("unknown settings pane {other}"),
     };
-    open_url(url)
+    // Ignore the exit status, as before the move: `open` reports a missing pane there.
+    Command::new("/usr/bin/open").arg(url).status()?;
+    Ok(())
 }
 
 /// Puts a file on the clipboard, so the user can paste the file in Finder, Mail, or a chat app.

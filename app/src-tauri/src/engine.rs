@@ -51,6 +51,7 @@ pub fn engine_path() -> PathBuf {
     let dirs = [
         manifest.join("../../target").join(profile),
         manifest.join("../../target").join(other),
+        // The Rust engine crate lands in a separate change; these paths work once it does.
         manifest.join("../../crates/tinta-engine-rs/target").join(profile),
         manifest.join("../../crates/tinta-engine-rs/target").join(other),
     ];

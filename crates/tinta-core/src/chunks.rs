@@ -111,12 +111,15 @@ impl ChunkWriter {
     /// Appends samples that start at `start_index` on the meeting clock. A jump of more
     /// than 100 ms flushes the current chunk and starts a new one; a smaller drift is
     /// snapped to the expected next index.
+    /// A failed write at a gap still appends the new samples, like Swift; the error is
+    /// returned after they are buffered.
     pub fn append(&mut self, samples: &[f32], start_index: i64) -> Result<()> {
         let mut start = start_index;
+        let mut gap_result = Ok(());
         if let Some(next_index) = self.next_index {
             let drift = start - next_index;
             if drift > GAP_SAMPLES {
-                self.flush()?;
+                gap_result = self.flush();
             } else {
                 start = next_index;
             }
@@ -130,7 +133,7 @@ impl ChunkWriter {
         if self.buffer.len() >= CHUNK_SAMPLES {
             self.flush()?;
         }
-        Ok(())
+        gap_result
     }
 
     /// Flushes the buffered samples to a chunk file. A failed write drops the buffered
@@ -149,6 +152,10 @@ impl ChunkWriter {
         let name = format!("{:08}.tntc", self.file_counter);
         let part = self.directory.join(format!("{name}.part"));
         let path = self.directory.join(&name);
+        // Swift's moveItem fails on an existing file; never overwrite a chunk.
+        if path.exists() {
+            bail!("chunk {} already exists", path.display());
+        }
         fs::write(&part, &bytes).with_context(|| format!("cannot write {}", part.display()))?;
         fs::rename(&part, &path)
             .with_context(|| format!("cannot rename {} to {}", part.display(), path.display()))?;
@@ -195,6 +202,10 @@ pub fn read_track(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<Ve
     if end <= 0 {
         return Ok(Vec::new());
     }
+    // The header is not authenticated: a corrupted start must not allocate gigabytes.
+    if end > MAX_TRACK_SAMPLES {
+        bail!("track is longer than 12 hours ({end} samples); a chunk header is corrupt");
+    }
     let mut output = vec![0.0f32; end as usize];
     for chunk in chunks {
         for (index, &sample) in chunk.samples.iter().enumerate() {
@@ -209,7 +220,11 @@ pub fn read_track(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<Ve
     Ok(output)
 }
 
+/// The longest track `read_track` accepts: 12 hours at 16 kHz.
+const MAX_TRACK_SAMPLES: i64 = 16_000 * 60 * 60 * 12;
+
 /// Converts a float sample to the stored 16-bit PCM value, clamping to `[-1, 1]`.
+/// NaN becomes 0 here (Rust's saturating cast); Swift stores 32767. Both are noise.
 pub fn f32_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
@@ -516,5 +531,24 @@ mod tests {
         assert!(read_track(dir.path(), &key(), Track::Remote)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn writer_never_overwrites_an_existing_chunk() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = ChunkWriter::new(dir.path(), &key(), Track::Mic).unwrap();
+        let existing = writer.directory().join("00000000.tntc");
+        fs::write(&existing, b"keep").unwrap();
+        writer.append(&[0.5; 10], 0).unwrap();
+        assert!(writer.flush().is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn corrupt_start_is_rejected_instead_of_allocating() {
+        let dir = TempDir::new().unwrap();
+        let file = seal_with_nonce(i64::MAX / 4, &[1, 2, 3], &key(), [7; 12]).unwrap();
+        write_chunk_file(dir.path(), "00000000.tntc", &file);
+        assert!(read_track(dir.path(), &key(), Track::Mic).is_err());
     }
 }

@@ -7,11 +7,14 @@
 //! change, exactly like `Engine.importAudio` in Swift.
 //!
 //! A chunk write failure is an `error` event, not a command error: the import
-//! continues with the next samples, matching `ChunkWriter.flushLocked`.
+//! continues with the next samples, matching `ChunkWriter.flushLocked`. Any
+//! other import error removes the chunks this import already wrote, so a failed
+//! import never leaves a half-written track behind.
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::audio::{AudioDecoder, Resampler48, SAMPLE_RATE};
 use crate::protocol::Output;
@@ -19,6 +22,25 @@ use tinta_core::chunks::{ChunkWriter, Track, MAX_TRACK_SAMPLES};
 
 pub fn import_audio(dir: &Path, key: &[u8; 32], path: &Path, out: &Output) -> Result<Value> {
     let mut decoder = AudioDecoder::open(path)?;
+    // The container's frame count lets a too-long file fail before any chunks
+    // are written; the streaming check below is the fallback when it is absent.
+    ensure_source_within_limit(decoder.total_frames(), decoder.sample_rate())?;
+    let existing = remote_entries(dir);
+    let result = write_remote(&mut decoder, dir, key, out);
+    if result.is_err() {
+        remove_new_entries(dir, &existing);
+    }
+    result
+}
+
+/// Decodes and writes the remote track. Split from [`import_audio`] so a failure
+/// at any point can clean up the chunks written so far.
+fn write_remote(
+    decoder: &mut AudioDecoder,
+    dir: &Path,
+    key: &[u8; 32],
+    out: &Output,
+) -> Result<Value> {
     let source_rate = decoder.sample_rate();
     let mut resampler = if source_rate == SAMPLE_RATE {
         None
@@ -55,6 +77,47 @@ pub fn import_audio(dir: &Path, key: &[u8; 32], path: &Path, out: &Output) -> Re
         );
     }
     Ok(json!({ "duration": index as f64 / SAMPLE_RATE as f64 }))
+}
+
+/// Rejects a file whose declared frame count is past the 12 hour track limit,
+/// before any chunk is written. `n_frames` is in source-rate frames, and the
+/// limit is in 16 kHz samples.
+fn ensure_source_within_limit(frames: Option<u64>, source_rate: u32) -> Result<()> {
+    let (Some(frames), true) = (frames, source_rate > 0) else {
+        return Ok(());
+    };
+    let seconds = frames as f64 / source_rate as f64;
+    if seconds > MAX_TRACK_SAMPLES as f64 / SAMPLE_RATE as f64 {
+        bail!(
+            "the audio is longer than the 12 hour track limit; split or trim the file before importing it"
+        );
+    }
+    Ok(())
+}
+
+/// The files already in `<dir>/audio/remote` before this import started.
+fn remote_entries(dir: &Path) -> HashSet<PathBuf> {
+    match std::fs::read_dir(Track::Remote.directory(dir)) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
+/// Removes the chunks this import wrote. A chunk `.part` file can also be left
+/// behind by a failed write and is removed the same way.
+fn remove_new_entries(dir: &Path, existing: &HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(Track::Remote.directory(dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !existing.contains(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Rejects an import that would pass the 12 hour track limit. `read_track` uses
@@ -206,6 +269,63 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("12 hour"), "{message}");
         assert!(!message.contains("corrupt"), "{message}");
+    }
+
+    #[test]
+    fn a_declared_length_past_the_limit_is_rejected_before_decoding() {
+        let twelve_hours = MAX_TRACK_SAMPLES as u64 / SAMPLE_RATE as u64;
+        // Exactly the limit at the source rate is allowed.
+        assert!(ensure_source_within_limit(Some(twelve_hours * 44_100), 44_100).is_ok());
+        let error =
+            ensure_source_within_limit(Some(twelve_hours * 48_000 + 1), 48_000).unwrap_err();
+        assert!(error.to_string().contains("12 hour"), "{error}");
+        // A container that does not declare its length is left to the stream check.
+        assert!(ensure_source_within_limit(None, 44_100).is_ok());
+        // A zero rate is not a length problem; the decoder rejects it elsewhere.
+        assert!(ensure_source_within_limit(Some(u64::MAX), 0).is_ok());
+    }
+
+    #[test]
+    fn a_failed_import_removes_the_chunks_it_wrote() {
+        let dir = TempDir::new().unwrap();
+        let existing = remote_entries(dir.path());
+        let mut writer = ChunkWriter::new(dir.path(), &key(), Track::Remote).unwrap();
+        writer.append(&vec![0.25f32; CHUNK_SAMPLES], 0).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(remote_entries(dir.path()).len(), 1);
+        remove_new_entries(dir.path(), &existing);
+        assert!(remote_entries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_file_declaring_more_than_twelve_hours_is_rejected_before_writing() {
+        // A sparse WAV header: the data chunk declares 12 h + 1 s at 16 kHz but
+        // the file has no samples. The import must fail from `n_frames` without
+        // creating a single chunk.
+        let dir = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let path = source.path().join("too-long.wav");
+        let bytes = ((MAX_TRACK_SAMPLES + SAMPLE_RATE as i64) * 2) as u32;
+        let mut header = Vec::with_capacity(44);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36 + bytes).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        header.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&bytes.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let out = Output::new(std::io::sink());
+        let error = import_audio(dir.path(), &key(), &path, &out).unwrap_err();
+        assert!(error.to_string().contains("12 hour"), "{error}");
+        assert!(remote_entries(dir.path()).is_empty());
+        assert!(!Track::Remote.directory(dir.path()).exists());
     }
 
     #[test]

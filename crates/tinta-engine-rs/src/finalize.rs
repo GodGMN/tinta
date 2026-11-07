@@ -72,12 +72,14 @@ pub fn finalize_tracks(
     all_text.push_str(&joined(&remote_words));
     all_text.push(' ');
     let mut remote_entry = json!({ "words": words_json(&remote_words) });
+    let mut notes: Vec<String> = Vec::new();
     if !remote_words.is_empty() {
         // Silent audio has no speakers, and the diarizer can fail on it.
         let segments = pass.diarize(&remote, max_speakers, &mut |fraction| {
             emit("diarization", fraction)
         })?;
         remote_entry["diarization"] = segments_json(&segments);
+        notes = pass.notes();
     }
     tracks.insert("remote".to_string(), remote_entry);
 
@@ -97,6 +99,11 @@ pub fn finalize_tracks(
     let mut result = json!({ "tracks": Value::Object(tracks), "duration": duration });
     if let Some(language) = language::detect(&all_text) {
         result["language"] = Value::String(language);
+    }
+    if !notes.is_empty() {
+        // An extra field the app ignores: `FinalResult` deserializes without
+        // denying unknown fields, so older apps are unaffected.
+        result["notes"] = json!(notes);
     }
     Ok(result)
 }
@@ -123,6 +130,7 @@ mod tests {
         mic: Vec<Word>,
         windows: usize,
         diarization: Vec<SpeakerSegment>,
+        notes: Vec<String>,
         calls: usize,
         fail_mic: bool,
     }
@@ -158,6 +166,10 @@ mod tests {
             progress(1.0);
             Ok(self.diarization.clone())
         }
+
+        fn notes(&self) -> Vec<String> {
+            self.notes.clone()
+        }
     }
 
     fn word(text: &str, start: f64, end: f64) -> Word {
@@ -178,6 +190,7 @@ mod tests {
                 s: 0.0,
                 e: 1.0,
             }],
+            notes: Vec::new(),
             calls: 0,
             fail_mic: false,
         }
@@ -248,6 +261,21 @@ mod tests {
         assert_eq!(result["tracks"]["mic"]["words"][0]["w"], "there");
         // The concatenated transcript is long enough for whatlang.
         assert_eq!(result["language"], "en");
+    }
+
+    #[test]
+    fn a_diarization_note_reaches_the_result() {
+        let mut pass = fake(vec![word("remote", 0.0, 0.5)], Vec::new(), 1);
+        pass.notes = vec!["speaker labels stop at 4 h".to_string()];
+        let result = finalize_tracks(
+            &mut pass,
+            vec![0.5f32; 16_000],
+            vec![0.5f32; 16_000],
+            None,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(result["notes"][0], "speaker labels stop at 4 h");
     }
 
     #[test]

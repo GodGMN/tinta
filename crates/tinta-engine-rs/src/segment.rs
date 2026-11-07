@@ -158,7 +158,10 @@ pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, u
             .copied()
             .filter(|&seg| !covers_speech(&pieces, &[seg]))
             .collect();
-        eprintln!("[tinta-engine] {} VAD regions were not grouped; decoding them separately", uncovered.len());
+        eprintln!(
+            "[tinta-engine] {} VAD regions were not grouped; decoding them separately",
+            uncovered.len()
+        );
         for (start, end) in uncovered {
             pieces.extend(split_to_cap(audio, start, end.min(audio.len())));
         }
@@ -168,19 +171,35 @@ pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, u
 }
 
 /// Splits `[start, end)` into pieces of at most [`MAX_ASR_SECONDS`] at the
-/// quietest points. Groups are at most 30 s, so this only fires if a future
-/// change lengthens them; it must split rather than truncate, because truncating
-/// silently drops whatever comes after the cap.
+/// quietest points, with the 10 s minimum and a pre-roll overlap at every cut.
+/// Groups are at most 33 s, so this only fires if a future change lengthens
+/// them; it must split rather than truncate, because truncating silently drops
+/// whatever comes after the cap.
+///
+/// `start` already includes the 2 s pre-roll from [`group_pieces`]. Every cut
+/// after the first backs the next piece up by the pre-roll, so the word boundary
+/// at the cut is seen by both recognizer calls; [`trim_overlaps`] keeps each word
+/// once. The cut is chosen so that both sides keep at least
+/// [`MIN_PIECE_SECONDS`] and neither exceeds the 60 s cap.
 fn split_to_cap(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
     let cap = samples(MAX_ASR_SECONDS);
+    let min_piece = samples(MIN_PIECE_SECONDS);
+    let pre = samples(PRE_ROLL_SECONDS);
     let mut pieces = Vec::new();
     let mut position = start;
     while end.saturating_sub(position) > cap {
-        let hi = position + cap;
-        let lo = position + (cap as f32 * 0.6) as usize;
+        let lo = (position + (cap as f32 * 0.6) as usize).max(position + min_piece);
+        // Keep enough audio after the cut for the last piece to reach the minimum.
+        // With the constants above `hi > lo` always holds; `max` only keeps the
+        // 60 s cap if a future change breaks that relation.
+        let hi = (position + cap)
+            .min(end.saturating_sub(min_piece) + pre)
+            .max(lo);
         let split = quietest_point(audio, lo, hi).clamp(position + 1, hi);
         pieces.push((position, split));
-        position = split;
+        // The next piece starts the pre-roll before the cut, never at or before
+        // the previous start, so the loop always advances.
+        position = split.saturating_sub(pre).max(position + 1);
     }
     if end > position {
         pieces.push((position, end));
@@ -322,9 +341,17 @@ mod tests {
         assert_eq!(pieces.last().unwrap().1, audio.len());
         for &(start, end) in &pieces {
             ensure_recognizer_window(end - start).unwrap();
+            let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
+            assert!(
+                seconds >= MIN_PIECE_SECONDS,
+                "piece {seconds} s under the minimum"
+            );
         }
         for pair in pieces.windows(2) {
-            assert_eq!(pair[0].1, pair[1].0, "the split must not drop samples");
+            // The next piece backs up by the pre-roll: an overlap, never a hole.
+            assert!(pair[1].0 <= pair[0].1, "hole between pieces");
+            let overlap = (pair[0].1 - pair[1].0) as f32 / SAMPLE_RATE as f32;
+            assert!(overlap <= PRE_ROLL_SECONDS + 0.01, "overlap {overlap} s");
             let cut = pair[0].1;
             for loud in [50 * SAMPLE_RATE as usize, 100 * SAMPLE_RATE as usize] {
                 assert!(
@@ -333,6 +360,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_cap_sized_span_plus_a_tail_keeps_the_minimum_on_both_sides() {
+        // 60 s + 5 samples used to split into a 45 s piece and a 14.8 s piece
+        // with no overlap; a shorter tail could fall under the 10 s minimum.
+        let audio = silence(samples(60.0003));
+        let pieces = split_to_cap(&audio, 0, audio.len());
+        assert_eq!(pieces.len(), 2, "pieces {pieces:?}");
+        for &(start, end) in &pieces {
+            let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
+            assert!(
+                seconds >= MIN_PIECE_SECONDS,
+                "piece {seconds} s under the minimum"
+            );
+            ensure_recognizer_window(end - start).unwrap();
+        }
+        // Overlap at the cut, not a hole.
+        assert!(pieces[1].0 <= pieces[0].1);
+        assert_eq!(pieces.last().unwrap().1, audio.len());
     }
 
     #[test]

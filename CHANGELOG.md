@@ -7,6 +7,9 @@
 - The desktop app builds for Windows and Linux. Those builds cannot open the encrypted library yet, so Tinta explains why in a dialog and then closes.
 - On Linux, Google Meet speaker names work again: Tinta registers the extension host in each Chrome, Chromium, or Brave browser that you use, and the extension folder opens with your file manager.
 - On Linux, the MCP server connects to Tinta, so the MCP tools work with an MCP client.
+- On Windows and Linux, meetings separate speakers more accurately: the engine over-clusters the audio and then merges the fragments by voice, so a speaker is no longer split into several "S" labels.
+- On Windows and Linux, when Tinta knows the call participants, the engine never reports more remote speakers than participants.
+- When speaker labels stop at 4 hours of a longer recording, the finalize result carries a note and the engine logs the reason. The app keeps working as before.
 
 ### Changed
 - On Windows and Linux, Tinta never creates a new key when a library already exists. If the system key store does not have the key, Tinta asks you to unlock your keyring instead of making the library unreadable.
@@ -14,6 +17,8 @@
 
 ### Fixed
 - **Record this call** on Home is disabled with a short reason when the engine cannot capture the meeting audio, instead of failing when you click it.
+- On Windows and Linux, a recording longer than 4 hours keeps its full transcript, with speaker labels for the first 4 hours.
+- On Windows and Linux, importing an audio file longer than 12 hours fails immediately, before any audio is written, and a failed import no longer leaves a partially written track behind.
 
 ## 0.9.3 (2026-10-21)
 

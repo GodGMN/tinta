@@ -33,7 +33,10 @@ use std::sync::Mutex;
 use crate::audio::SAMPLE_RATE;
 use crate::clustering::{recluster, Options as ClusterOptions, Unit};
 use crate::manifest::{Manifest, ModelGroup};
-use crate::segment::{ensure_recognizer_window, group_pieces, trim_overlaps, vad_segments};
+use crate::segment::{
+    ensure_recognizer_window, group_pieces_with, merge_hole_words, speech_gaps, trim_overlaps,
+    vad_segments, Settings,
+};
 use crate::threads::Threads;
 use crate::types::{SpeakerSegment, Word};
 
@@ -48,10 +51,34 @@ pub const DIARIZATION_THRESHOLD: f32 = 0.7;
 const UNIT_JOIN_GAP_SECONDS: f32 = 0.5;
 const UNIT_MAX_SECONDS: f32 = 15.0;
 const UNIT_MIN_SECONDS: f32 = 0.8;
-/// The VAD closes a continuous run at this length; the splitter keeps the pieces
-/// at or below 30 s even if a future VAD setting changes.
-const VAD_MAX_SPEECH_SECONDS: f32 = 30.0;
-const VAD_BUFFER_SECONDS: f32 = 60.0;
+/// The VAD buffer must hold a whole segment; sherpa-onnx requires it to be
+/// larger than `max_speech_duration` (60 s by default).
+const VAD_BUFFER_SECONDS: f32 = 120.0;
+/// A decode whose words still leave a hole this long inside VAD speech is
+/// treated as failed and retried. The int8 TDT decoder occasionally emits the
+/// first word and then jumps its token timeline to the end of the window
+/// (measured in task #21), dropping several seconds of speech.
+const RETRY_HOLE_SECONDS: f32 = 2.5;
+/// How far the start of a window moves for each retry. A change of a few hundred
+/// milliseconds leaves the failing feature alignment; a later start is only
+/// allowed while the window still begins before its first speech, and an earlier
+/// one is extra pre-roll. Both keep the piece covering its speech.
+const RETRY_OFFSETS_SECONDS: [f32; 4] = [0.4, -0.4, 0.9, -0.9];
+/// At most this many passes of hole detection and re-decode.
+const GAP_REDECODE_ROUNDS: usize = 2;
+/// The hole re-decode may hand the recognizer at most this many times the first
+/// pass's audio, retries included, largest holes first. Without it a VAD false
+/// positive over music or typing pays the primary decode plus four retries
+/// inside round 1. A stricter 25 % of the track was measured to skip 40 % of the
+/// planned holes on EN2002a and cost 1.8 WER points on ES2004b and 3.5 on
+/// EN2002a, so the cap sits at twice the first pass: the measured meetings spend
+/// 61 % (ES2004b) and 148 % (EN2002a) of the first pass's audio, and a
+/// pathological track still stops at 3x the first pass's compute.
+const REDECODE_BUDGET_SHARE: f64 = 2.0;
+/// The first pass fills this share of the transcription progress; the rest is
+/// the hole re-decode, so the bar keeps moving instead of sitting at 100 %
+/// while the extra pass runs (measured at +31 % to +137 % of the first pass).
+const FIRST_PASS_PROGRESS_SHARE: f64 = 0.8;
 /// `Speech.diarize` skips the diarizer below this much audio.
 const MIN_DIARIZATION_SECONDS: usize = 2 * SAMPLE_RATE as usize;
 
@@ -98,16 +125,29 @@ pub struct SpeechPass {
     manifest: Manifest,
     root: PathBuf,
     threads: Threads,
+    settings: Settings,
     recognizer: Option<OfflineRecognizer>,
     notes: Vec<String>,
 }
 
 impl SpeechPass {
     pub fn new(manifest: Manifest, root: PathBuf, threads: Threads) -> Self {
+        Self::with_settings(manifest, root, threads, Settings::default())
+    }
+
+    /// [`SpeechPass::new`] with explicit segmentation settings, used by the
+    /// segmentation harness in `scripts/fork/segmentation`.
+    pub fn with_settings(
+        manifest: Manifest,
+        root: PathBuf,
+        threads: Threads,
+        settings: Settings,
+    ) -> Self {
         Self {
             manifest,
             root,
             threads,
+            settings,
             recognizer: None,
             notes: Vec::new(),
         }
@@ -175,23 +215,7 @@ impl SpeechPass {
         self.check_installed()?;
         let group = self.group("vad")?;
         let model = self.path(group, "vad")?;
-        let provider = self.provider()?;
-        let config = VadModelConfig {
-            silero_vad: SileroVadModelConfig {
-                model: Some(model),
-                // The benchmark's settings, also used for the quality numbers.
-                threshold: 0.5,
-                min_silence_duration: 0.3,
-                min_speech_duration: 0.1,
-                window_size: 512,
-                max_speech_duration: VAD_MAX_SPEECH_SECONDS,
-            },
-            sample_rate: SAMPLE_RATE as i32,
-            num_threads: self.threads.asr as i32,
-            provider: Some(provider),
-            debug: false,
-            ..Default::default()
-        };
+        let config = vad_config(model, self.threads.asr, self.provider()?, &self.settings);
         VoiceActivityDetector::create(&config, VAD_BUFFER_SECONDS)
             .context("the voice activity model did not load. Install the models again.")
     }
@@ -297,6 +321,154 @@ impl SpeechPass {
             offset,
         ))
     }
+
+    /// Decodes one window, retrying from a different start while the result
+    /// still leaves a hole of [`RETRY_HOLE_SECONDS`] inside the VAD speech the
+    /// window covers. The candidate with the least un-covered speech wins, so a
+    /// retry can never make the transcript worse.
+    ///
+    /// `speech` is the VAD speech inside the window, so silence in the pre- and
+    /// post-roll is never mistaken for a dropped stretch. `max_retries` caps the
+    /// extra decodes so the re-decode budget holds, and `spent` receives the
+    /// samples handed to the recognizer, retries included.
+    fn decode_with_retry(
+        &mut self,
+        samples: &[f32],
+        start: usize,
+        end: usize,
+        speech: &[(usize, usize)],
+        max_retries: usize,
+        spent: &mut usize,
+    ) -> Result<Vec<Word>> {
+        let mut best = self.decode(&samples[start..end], start as f64 / SAMPLE_RATE as f64)?;
+        *spent += end - start;
+        for offset in RETRY_OFFSETS_SECONDS.into_iter().take(max_retries) {
+            if speech_gaps(speech, &best, RETRY_HOLE_SECONDS).is_empty() {
+                break;
+            }
+            let from = if offset > 0.0 {
+                let speech_start = speech.first().map(|&(a, _)| a).unwrap_or(start);
+                (start + seconds(offset)).min(speech_start)
+            } else {
+                start.saturating_sub(seconds(-offset))
+            };
+            if from == start || from >= end {
+                continue;
+            }
+            let candidate = self.decode(&samples[from..end], from as f64 / SAMPLE_RATE as f64)?;
+            *spent += end - from;
+            if missing_seconds(speech, &candidate) < missing_seconds(speech, &best) {
+                best = candidate;
+            }
+        }
+        Ok(best)
+    }
+
+    /// Decodes the hypothesis holes again: a stretch at least
+    /// `gap_redecode_seconds` long inside a VAD speech region with no word from
+    /// the previous pass. A hole is planned like any other speech span, so it
+    /// starts at a quiet point and is split at the piece length if it is long.
+    /// Only words whose midpoint falls inside the hole are kept, and a word that
+    /// repeats a hole-edge word is dropped ([`merge_hole_words`]), so the words
+    /// at its edges stay single. Up to [`GAP_REDECODE_ROUNDS`] passes run,
+    /// because a re-decode can itself drop a stretch; a round that adds nothing
+    /// stops.
+    ///
+    /// The audio handed to the recognizer, retries included, is capped at twice
+    /// the first pass's audio ([`REDECODE_BUDGET_SHARE`]), largest holes first;
+    /// holes that do not fit stay holes. Progress continues from `first_share`.
+    fn redecode_gaps(
+        &mut self,
+        samples: &[f32],
+        segments: &[(usize, usize)],
+        mut words: Vec<Word>,
+        progress: &mut dyn FnMut(f64),
+        first_share: f64,
+        first_pass_audio: usize,
+    ) -> Result<Vec<Word>> {
+        let budget = (first_pass_audio as f64 * REDECODE_BUDGET_SHARE) as usize;
+        let mut spent = 0usize;
+        let mut planned = 0usize;
+        let mut holes_decoded = 0usize;
+        let mut last_fraction = first_share;
+        // Holes that produced no word at all are not retried in a later round:
+        // re-decoding the same window is deterministic, and a VAD false positive
+        // would otherwise pay two rounds of retries for silence.
+        let mut fruitless: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..GAP_REDECODE_ROUNDS {
+            let holes = speech_gaps(segments, &words, self.settings.gap_redecode_seconds);
+            let holes: Vec<(usize, usize)> = holes
+                .into_iter()
+                .filter(|hole| !fruitless.contains(hole))
+                .collect();
+            if holes.is_empty() {
+                break;
+            }
+            let before = words.len();
+            // Largest holes first: under the cap they carry the most missing
+            // speech per recognizer call.
+            for (hole_start, hole_end) in largest_first(holes) {
+                let pieces = group_pieces_with(&self.settings, samples, &[(hole_start, hole_end)]);
+                let cost: usize = pieces.iter().map(|(start, end)| end - start).sum();
+                let remaining = budget.saturating_sub(spent);
+                if cost > remaining || cost == 0 {
+                    continue;
+                }
+                // The primary decode fits; spend what is left over on retries,
+                // so the cap covers every sample the re-decode hands to the
+                // recognizer rather than only the first attempt.
+                let retries = ((remaining - cost) / cost).min(RETRY_OFFSETS_SECONDS.len());
+                planned += cost;
+                holes_decoded += 1;
+                let mut decoded = Vec::with_capacity(pieces.len());
+                for (start, end) in &pieces {
+                    decoded.push(self.decode_with_retry(
+                        samples,
+                        *start,
+                        *end,
+                        &[(hole_start, hole_end)],
+                        retries,
+                        &mut spent,
+                    )?);
+                }
+                let added = merge_hole_words(
+                    &mut words,
+                    trim_overlaps(&pieces, &mut decoded),
+                    (hole_start, hole_end),
+                );
+                if added == 0 {
+                    fruitless.push((hole_start, hole_end));
+                }
+                // Retries can decode more than planned; the fraction is clamped
+                // and still never decreases. The caller emits 1.0 at the end.
+                let fraction =
+                    first_share + (1.0 - first_share) * (spent as f64 / planned as f64).min(1.0);
+                last_fraction = last_fraction.max(fraction.min(0.999));
+                progress(last_fraction);
+            }
+            words.sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
+            if words.len() == before {
+                break;
+            }
+        }
+        if planned > 0 {
+            let rate = SAMPLE_RATE as f64;
+            crate::protocol::log(&format!(
+                "hole re-decode: {holes_decoded} holes, {:.1} s planned, {:.1} s decoded with retries, cap {:.1} s",
+                planned as f64 / rate,
+                spent as f64 / rate,
+                budget as f64 / rate
+            ));
+        }
+        Ok(words)
+    }
+}
+
+/// The holes longest first, so the capped re-decode spends its budget where the
+/// most speech is missing.
+fn largest_first(mut holes: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    holes.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    holes
 }
 
 impl FinalPass for SpeechPass {
@@ -307,18 +479,41 @@ impl FinalPass for SpeechPass {
         self.check_installed()?;
         let vad = self.vad()?;
         let segments = vad_segments(&vad, samples);
-        let pieces = group_pieces(samples, &segments);
+        drop(vad);
+        let pieces = group_pieces_with(&self.settings, samples, &segments);
         if pieces.is_empty() {
             return Ok(Vec::new());
         }
         let total = pieces.len();
+        let total_audio: usize = pieces.iter().map(|(start, end)| end - start).sum();
+        let total_audio = total_audio.max(1);
+        let mut decoded_audio = 0usize;
+        let mut last_fraction = 0.0f64;
         let mut words = Vec::with_capacity(total);
-        for (index, (start, end)) in pieces.iter().enumerate() {
+        for (start, end) in pieces.iter() {
             let offset = *start as f64 / SAMPLE_RATE as f64;
             words.push(self.decode(&samples[*start..*end], offset)?);
-            progress((index + 1) as f64 / total as f64);
+            decoded_audio += end - start;
+            // The first pass fills a fixed share of the transcription stage, so
+            // the hole re-decode below keeps moving the same bar instead of
+            // starting after a 100 % event.
+            let fraction = decoded_audio as f64 / total_audio as f64 * FIRST_PASS_PROGRESS_SHARE;
+            last_fraction = last_fraction.max(fraction);
+            progress(last_fraction);
         }
-        Ok(trim_overlaps(&pieces, &mut words))
+        let mut words = trim_overlaps(&pieces, &mut words);
+        if self.settings.gap_redecode_seconds > 0.0 {
+            words = self.redecode_gaps(
+                samples,
+                &segments,
+                words,
+                progress,
+                last_fraction,
+                total_audio,
+            )?;
+        }
+        progress(1.0);
+        Ok(words)
     }
 
     fn diarize(
@@ -424,6 +619,19 @@ fn log_collapse(outcome: &crate::clustering::Outcome) {
     }
 }
 
+/// Seconds as samples, for the retry offsets.
+fn seconds(value: f32) -> usize {
+    (value.max(0.0) * SAMPLE_RATE as f32) as usize
+}
+
+/// Seconds of `speech` not covered by any word span, the score a retry improves.
+fn missing_seconds(speech: &[(usize, usize)], words: &[Word]) -> f64 {
+    speech_gaps(speech, words, 0.0)
+        .iter()
+        .map(|&(a, b)| (b - a) as f64 / SAMPLE_RATE as f64)
+        .sum()
+}
+
 /// Joins the front end's segments into embedding units: consecutive segments of
 /// the same cluster no further apart than `gap` seconds and no longer than
 /// `max_len` together. A unit is the smallest thing the post-clustering
@@ -490,7 +698,9 @@ pub fn cluster_speakers(threshold: f32) -> FastClusteringConfig {
 
 /// Turns sentencepiece tokens into words with start and end times. A word spans
 /// its tokens; a token with the `▁` marker (or a leading space) starts a new one.
-fn tokens_to_words(
+/// Public so the segmentation harness in `scripts/fork/segmentation` builds the
+/// same words from a bare recognizer call.
+pub fn tokens_to_words(
     tokens: &[String],
     timestamps: Option<&[f32]>,
     durations: Option<&[f32]>,
@@ -535,10 +745,38 @@ fn tokens_to_words(
     words
 }
 
+/// The Silero VAD settings the engine uses. Public so the segmentation harness
+/// in `scripts/fork/segmentation` measures the same detector as `finalize`.
+///
+/// The threshold is not a tuning knob: task #19 measured 0.2 vs 0.5 as no
+/// difference. `max_speech_duration` comes from [`Settings`] and sits well above
+/// the piece length, so the VAD itself never cuts in the middle of speech.
+pub fn vad_config(
+    model: String,
+    threads: usize,
+    provider: String,
+    settings: &Settings,
+) -> VadModelConfig {
+    VadModelConfig {
+        silero_vad: SileroVadModelConfig {
+            model: Some(model),
+            threshold: 0.5,
+            min_silence_duration: 0.3,
+            min_speech_duration: 0.1,
+            window_size: 512,
+            max_speech_duration: settings.vad_max_speech_seconds,
+        },
+        sample_rate: SAMPLE_RATE as i32,
+        num_threads: threads as i32,
+        provider: Some(provider),
+        debug: false,
+        ..Default::default()
+    }
+}
+
 /// Serializes model work across final passes. The 652 MB recognizer is loaded
 /// once per pass; two passes run one after the other so they cannot both hold it.
 static MODEL_LOCK: Mutex<()> = Mutex::new(());
-
 /// Runs `work` while holding the model lock.
 ///
 /// A panic inside `work` unwinds through the guard and poisons the mutex. The
@@ -579,6 +817,30 @@ mod tests {
         assert_eq!(
             words.iter().map(|word| word.w.as_str()).collect::<Vec<_>>(),
             vec!["Hello", "there"]
+        );
+    }
+
+    #[test]
+    fn missing_seconds_counts_speech_the_words_do_not_cover() {
+        let speech = [(10 * SAMPLE_RATE as usize, 20 * SAMPLE_RATE as usize)];
+        let word = |s: f64, e: f64| Word {
+            w: "word".to_string(),
+            s,
+            e,
+        };
+        // Two words cover 10-11 s and 12-13 s, so 8 s are missing.
+        let words = vec![word(10.0, 11.0), word(12.0, 13.0)];
+        assert!((missing_seconds(&speech, &words) - 8.0).abs() < 1e-3);
+        // No word at all: the whole region is missing.
+        assert!((missing_seconds(&speech, &[]) - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_redecode_budget_spends_on_the_largest_holes_first() {
+        let holes = vec![(0, 3_000), (10_000, 30_000), (40_000, 50_000)];
+        assert_eq!(
+            largest_first(holes),
+            vec![(10_000, 30_000), (40_000, 50_000), (0, 3_000)]
         );
     }
 

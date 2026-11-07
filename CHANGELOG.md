@@ -14,6 +14,7 @@
 ### Changed
 - On Windows and Linux, Tinta never creates a new key when a library already exists. If the system key store does not have the key, Tinta asks you to unlock your keyring instead of making the library unreadable.
 - Tinta hides the features that the engine cannot provide, and says why in one short line: the calendars and reminders, the names from Zoom and Microsoft Teams, the detected calls, the summaries, and the audio import. The Mac app keeps all of them.
+- On Windows and Linux, meetings are transcribed more accurately. The engine no longer cuts a sentence when the voice detector reaches its limit, and it transcribes again the stretches where a long sentence came back with missing words. In the measured AMI meetings, the words lost to segmentation dropped by about 5 points of error rate.
 
 ### Fixed
 - **Record this call** on Home is disabled with a short reason when the engine cannot capture the meeting audio, instead of failing when you click it.

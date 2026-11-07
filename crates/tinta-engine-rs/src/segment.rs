@@ -1,17 +1,43 @@
 //! VAD-driven segmentation for the final transcription pass.
 //!
 //! The rules come from the binding "Engine design conditions" in
-//! `docs/fork/benchmark.md`:
+//! `docs/fork/benchmark.md` and the task #21 evidence in
+//! `docs/fork/segmentation.md`:
 //!
-//! - the sherpa-onnx Silero VAD finds speech, with at most 30 s per VAD segment;
-//! - a longer speech run is cut at the quietest 50 ms window in the last 40 % of
-//!   the allowed span, not at an arbitrary boundary;
-//! - every piece gets 2 s of pre-roll and 1 s of post-roll and is extended to at
-//!   least 10 s, because Parakeet can drop the first words of a piece that starts
-//!   mid-speech;
+//! - the sherpa-onnx Silero VAD finds speech. A continuous run is closed by the
+//!   VAD only at [`Settings::vad_max_speech_seconds`], so the VAD itself never
+//!   cuts speech every 20 or 30 s. That forced cut was the largest measured
+//!   source of deletions: the VAD needs about 0.8 s to re-detect, the next piece
+//!   starts mid-speech, and Parakeet can return no words for it;
+//! - speech runs closer than [`Settings::join_gap_seconds`] are decoded as one
+//!   piece, so the recognizer sees a short pause as a pause, not a boundary;
+//! - a span longer than [`Settings::max_piece_seconds`] is cut at the quietest
+//!   50 ms window in the last 40 % of the allowed span, not at an arbitrary
+//!   boundary;
+//! - a piece starts at the quietest point of the
+//!   [`Settings::pre_roll_seconds`] before its first speech, but never less than
+//!   [`Settings::min_pre_roll_seconds`] before it, so no piece starts mid-word
+//!   and a soft onset keeps some context, and every cut after the first backs
+//!   the next piece up by that pre-roll, so both recognizer calls see the join;
+//! - a shorter span is extended to [`Settings::min_piece_seconds`];
 //! - a hard cap of 60 s is checked in code before every recognizer call;
-//! - there is **no forced flush** every 20 s: the VAD closes a segment at 30 s on
-//!   its own, so a flush would only punch a hole larger than the 0.5 s join gap.
+//! - after the first pass, a hypothesis hole of
+//!   [`Settings::gap_redecode_seconds`] or more inside a VAD speech region is
+//!   decoded again on its own, retrying from a shifted start while it still
+//!   leaves a hole. Words that repeat a hole-edge word (same normalized text
+//!   within 0.3 s) are dropped, so the re-decode never duplicates a join. This
+//!   targets the 44-70 % of deletions that fell inside 3 s+ holes; it does not
+//!   cost "a few percent": on the three measured meetings the ASR time grew by
+//!   **+31 % to +137 %** (see `docs/fork/segmentation.md`).
+//!   [`crate::speech::SpeechPass`] caps the re-decoded audio at twice the first
+//!   pass (retries included) and reports that pass as part of the transcription
+//!   progress.
+//!
+//! Cutting *inside* speech at a target of 8-15 s was measured and rejected: it
+//! creates more cuts, the decoder drops words at a cut, and the remaining
+//! long-form loss is crosstalk, which a shorter single-speaker window does not
+//! fix without oracle boundaries. See `docs/fork/segmentation.md` for the table
+//! per variant and meeting.
 
 use crate::audio::SAMPLE_RATE;
 use crate::types::Word;
@@ -21,16 +47,66 @@ use sherpa_onnx::VoiceActivityDetector;
 /// No recognizer call may exceed this many seconds. The benchmark measured a
 /// 240 s window losing whole stretches of speech in the middle.
 pub const MAX_ASR_SECONDS: f32 = 60.0;
-/// The longest piece the VAD and the splitter produce.
-const MAX_PIECE_SECONDS: f32 = 30.0;
-const PRE_ROLL_SECONDS: f32 = 2.0;
-const POST_ROLL_SECONDS: f32 = 1.0;
-const MIN_PIECE_SECONDS: f32 = 10.0;
 const SPLIT_WINDOW_SECONDS: f32 = 0.05;
-const JOIN_GAP_SECONDS: f32 = 0.5;
+
+/// The segmentation knobs, all in seconds. [`Settings::default`] is the
+/// task #21 combination; the harness in `scripts/fork/segmentation` measures
+/// the alternatives against it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settings {
+    /// The longest speech span handed to the recognizer in one piece. The audio
+    /// of a piece can be up to this plus the pre- and post-roll.
+    pub max_piece_seconds: f32,
+    /// Audio kept before a piece's first speech, starting at its quietest point.
+    pub pre_roll_seconds: f32,
+    /// The smallest pre-roll a piece keeps. The quietest point of
+    /// [`Settings::pre_roll_seconds`] can sit a few milliseconds before the
+    /// speech when the VAD onset is late or the talk is continuous, which clips
+    /// the first phoneme; this floor keeps that much audio anyway.
+    pub min_pre_roll_seconds: f32,
+    /// Audio kept after a piece's last speech.
+    pub post_roll_seconds: f32,
+    /// A span shorter than this is extended to this length.
+    pub min_piece_seconds: f32,
+    /// VAD runs no further apart than this are decoded as one piece.
+    pub join_gap_seconds: f32,
+    /// The VAD closes a continuous run at this length. It must stay above
+    /// [`Settings::max_piece_seconds`] so the VAD does not cut mid-speech.
+    pub vad_max_speech_seconds: f32,
+    /// Re-decode a hypothesis hole at least this long when the VAD heard speech
+    /// there. Zero disables the extra pass.
+    pub gap_redecode_seconds: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            // 57 s of speech plus the 3 s of rolls stays at or under the 60 s
+            // hard cap. Task #21 measured longer pieces as better than the
+            // reviewed 8-15 s target on all three ablation meetings: a cut in the
+            // middle of speech costs more than the shorter window gains, because
+            // the recognizer drops words at a cut and the remaining loss is
+            // crosstalk, which a shorter single-speaker window does not fix.
+            max_piece_seconds: 57.0,
+            pre_roll_seconds: 2.0,
+            min_pre_roll_seconds: 0.5,
+            post_roll_seconds: 1.0,
+            min_piece_seconds: 10.0,
+            join_gap_seconds: 0.5,
+            // The VAD's own cut must stay above the piece length: a cut in the
+            // middle of speech is the failure mode this segmentation removes.
+            vad_max_speech_seconds: 60.0,
+            // Task #21: re-decoding the 3 s+ holes the first pass leaves recovers
+            // 4.2 points of WER on ES2004b. It is not cheap: measured ASR time
+            // grows +31 % to +137 % on the three meetings, so speech.rs caps the
+            // re-decoded audio at twice the first pass (retries included).
+            gap_redecode_seconds: 3.0,
+        }
+    }
+}
 
 fn samples(seconds: f32) -> usize {
-    (seconds * SAMPLE_RATE as f32) as usize
+    (seconds.max(0.0) * SAMPLE_RATE as f32) as usize
 }
 
 /// Fails instead of decoding a window over the hard cap. Called before every
@@ -45,8 +121,10 @@ pub fn ensure_recognizer_window(len: usize) -> Result<()> {
 
 /// Runs the VAD over a whole track and returns speech ranges in samples.
 ///
-/// The VAD's `max_speech_duration` closes a continuous run at 30 s, so no extra
-/// flush is needed and no artificial hole is inserted.
+/// There is **no forced flush**: the VAD closes a run on its own at
+/// `max_speech_duration` (60 s by default), and any earlier flush would insert a
+/// hole larger than the VAD's re-detection time, which is the failure mode this
+/// segmentation exists to avoid.
 pub fn vad_segments(vad: &VoiceActivityDetector, audio: &[f32]) -> Vec<(usize, usize)> {
     let block = SAMPLE_RATE as usize;
     let mut segments = Vec::new();
@@ -93,106 +171,36 @@ fn quietest_point(audio: &[f32], lo: usize, hi: usize) -> usize {
     best
 }
 
-/// Splits a speech run into pieces of at most 30 s, cutting at the quietest point
-/// in the last 40 % of each piece.
-fn split_run(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
-    let max_piece = samples(MAX_PIECE_SECONDS);
-    let mut runs = Vec::new();
-    let mut position = start;
-    while end.saturating_sub(position) > max_piece {
-        let hi = position + max_piece;
-        let lo = position + (max_piece as f32 * 0.6) as usize;
-        let split = quietest_point(audio, lo, hi);
-        runs.push((position, split));
-        position = split;
-    }
-    if end > position {
-        runs.push((position, end));
-    }
-    runs
-}
-
-/// Groups VAD speech into decode pieces with pre-roll, post-roll, a 10 s minimum
-/// and the 60 s hard cap. Adjacent runs closer than 0.5 s merge; the pieces
-/// themselves may overlap, and [`trim_overlaps`] de-duplicates their words.
-///
-/// Every piece starts at its own speech start minus the pre-roll, never at 0:
-/// a track whose first speech is at 5 minutes must not produce a 0–60 s piece.
-/// A piece over the hard cap is split at the quietest points, never truncated,
-/// so no speech region is ever left out: [`covers_speech`] asserts that
-/// invariant on every call, and the tests check the awkward cases directly.
-pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let max_piece = samples(MAX_PIECE_SECONDS);
-    let join_gap = samples(JOIN_GAP_SECONDS);
-    let pre = samples(PRE_ROLL_SECONDS);
-    let post = samples(POST_ROLL_SECONDS);
-    let min_piece = samples(MIN_PIECE_SECONDS);
-
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    for (segment_start, segment_end) in segments {
-        for (a, b) in split_run(audio, *segment_start, *segment_end) {
-            if let Some(last) = groups.last_mut() {
-                if b.saturating_sub(last.0) <= max_piece && a.saturating_sub(last.1) <= join_gap {
-                    last.1 = b;
-                    continue;
-                }
-            }
-            groups.push((a, b));
-        }
-    }
-
-    let mut pieces = Vec::new();
-    for (a, b) in groups {
-        let start = a.saturating_sub(pre);
-        let end = (b + post).max(start + min_piece).min(audio.len());
-        if end <= start {
-            continue;
-        }
-        pieces.extend(split_to_cap(audio, start, end));
-    }
-    // Grouping covers every region today; if a later change breaks that, decode the
-    // uncovered regions as extra pieces instead of losing speech or the whole pass.
-    if !covers_speech(&pieces, segments) {
-        let uncovered: Vec<(usize, usize)> = segments
-            .iter()
-            .copied()
-            .filter(|&seg| !covers_speech(&pieces, &[seg]))
-            .collect();
-        eprintln!(
-            "[tinta-engine] {} VAD regions were not grouped; decoding them separately",
-            uncovered.len()
-        );
-        for (start, end) in uncovered {
-            pieces.extend(split_to_cap(audio, start, end.min(audio.len())));
-        }
-        pieces.sort_unstable();
-    }
-    pieces
-}
-
-/// Splits `[start, end)` into pieces of at most [`MAX_ASR_SECONDS`] at the
-/// quietest points, with the 10 s minimum and a pre-roll overlap at every cut.
-/// Groups are at most 33 s, so this only fires if a future change lengthens
-/// them; it must split rather than truncate, because truncating silently drops
-/// whatever comes after the cap.
-///
-/// `start` already includes the 2 s pre-roll from [`group_pieces`]. Every cut
-/// after the first backs the next piece up by the pre-roll, so the word boundary
-/// at the cut is seen by both recognizer calls; [`trim_overlaps`] keeps each word
-/// once. The cut is chosen so that both sides keep at least
-/// [`MIN_PIECE_SECONDS`] and neither exceeds the 60 s cap.
-fn split_to_cap(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
-    let cap = samples(MAX_ASR_SECONDS);
-    let min_piece = samples(MIN_PIECE_SECONDS);
-    let pre = samples(PRE_ROLL_SECONDS);
+/// Splits `[start, end)` into decode pieces of at most
+/// `max_piece + pre_roll + post_roll` seconds, cutting at the quietest point in
+/// the last 40 % of each piece, and backing every cut up by the pre-roll so the
+/// join is seen by both recognizer calls. The tail piece keeps at least
+/// [`Settings::min_piece_seconds`] of audio.
+fn split_span(settings: &Settings, audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let pre = samples(settings.pre_roll_seconds);
+    let min_piece = samples(settings.min_piece_seconds);
+    let limit = samples(
+        (settings.max_piece_seconds + settings.pre_roll_seconds + settings.post_roll_seconds)
+            .min(MAX_ASR_SECONDS),
+    )
+    .max(1);
     let mut pieces = Vec::new();
     let mut position = start;
-    while end.saturating_sub(position) > cap {
-        let lo = (position + (cap as f32 * 0.6) as usize).max(position + min_piece);
-        // Keep enough audio after the cut for the last piece to reach the minimum.
-        // With the constants above `hi > lo` always holds; `max` only keeps the
-        // 60 s cap if a future change breaks that relation.
-        let hi = (position + cap)
+    while end.saturating_sub(position) > limit {
+        let remaining = end.saturating_sub(position);
+        // A span that would leave a tail under the minimum stays one piece when
+        // it still fits the 60 s hard cap; a cut that creates two short pieces
+        // is worse than a piece a little over the target.
+        if remaining < 2 * min_piece && remaining <= samples(MAX_ASR_SECONDS) {
+            break;
+        }
+        // The first piece must also reach the minimum: with small limits the
+        // 60 % point alone is under `min_piece_seconds`.
+        let lo = (position + (limit as f32 * 0.6) as usize).max(position + min_piece);
+        // Keep enough audio after the cut for the last piece to reach the
+        // minimum. `max(lo)` only keeps the search range valid if a future
+        // setting change breaks that relation.
+        let hi = (position + limit)
             .min(end.saturating_sub(min_piece) + pre)
             .max(lo);
         let split = quietest_point(audio, lo, hi).clamp(position + 1, hi);
@@ -207,9 +215,81 @@ fn split_to_cap(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> 
     pieces
 }
 
+/// Groups VAD speech into decode pieces, with the pre-roll starting at a quiet
+/// point and the post-roll, a minimum length and the 60 s hard cap.
+///
+/// Adjacent runs closer than the join gap merge while the speech span stays
+/// under [`Settings::max_piece_seconds`]; a longer continuous run is cut at the
+/// quietest points. Every piece starts at or before its own first speech, never
+/// at 0: a track whose first speech is at 5 minutes must not produce a 0-15 s
+/// piece. [`covers_speech`] asserts on every call that no VAD region is left
+/// out, and the tests check the awkward cases directly.
+pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    group_pieces_with(&Settings::default(), audio, segments)
+}
+
+/// [`group_pieces`] with explicit settings.
+pub fn group_pieces_with(
+    settings: &Settings,
+    audio: &[f32],
+    segments: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let pre = samples(settings.pre_roll_seconds);
+    let floor = samples(settings.min_pre_roll_seconds);
+    let post = samples(settings.post_roll_seconds);
+    let min_piece = samples(settings.min_piece_seconds);
+    let max_speech = samples(settings.max_piece_seconds);
+    let join_gap = samples(settings.join_gap_seconds);
+
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in segments {
+        if end <= start {
+            continue;
+        }
+        if let Some(last) = groups.last_mut() {
+            if start.saturating_sub(last.1) <= join_gap && end.max(last.1) - last.0 <= max_speech {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        groups.push((start, end));
+    }
+
+    let mut pieces = Vec::new();
+    for (speech_start, speech_end) in groups {
+        let quiet = quietest_point(audio, speech_start.saturating_sub(pre), speech_start);
+        // The quietest point can be milliseconds before the speech; keep at
+        // least the floor so a soft onset is not clipped.
+        let start = quiet.min(speech_start.saturating_sub(floor));
+        let end = (speech_end + post).max(start + min_piece).min(audio.len());
+        if end <= start {
+            continue;
+        }
+        pieces.extend(split_span(settings, audio, start, end));
+    }
+    // Grouping covers every region today; if a later change breaks that, decode the
+    // uncovered regions as extra pieces instead of losing speech or the whole pass.
+    if !covers_speech(&pieces, segments) {
+        let uncovered: Vec<(usize, usize)> = segments
+            .iter()
+            .copied()
+            .filter(|&seg| !covers_speech(&pieces, &[seg]))
+            .collect();
+        eprintln!(
+            "[tinta-engine] {} VAD regions were not grouped; decoding them separately",
+            uncovered.len()
+        );
+        for (start, end) in uncovered {
+            pieces.extend(split_span(settings, audio, start, end.min(audio.len())));
+        }
+        pieces.sort_unstable();
+    }
+    pieces
+}
+
 /// True when every VAD speech region lies inside the union of the decode pieces.
-/// A hole means speech the recognizer never sees, so [`group_pieces`] asserts it
-/// and the tests check the awkward cases directly.
+/// A hole means speech the recognizer never sees, so [`group_pieces_with`]
+/// asserts it and the tests check the awkward cases directly.
 pub fn covers_speech(pieces: &[(usize, usize)], segments: &[(usize, usize)]) -> bool {
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in pieces {
@@ -221,6 +301,55 @@ pub fn covers_speech(pieces: &[(usize, usize)], segments: &[(usize, usize)]) -> 
     segments
         .iter()
         .all(|&(start, end)| merged.iter().any(|&(a, b)| a <= start && b >= end))
+}
+
+/// Stretches at least `min_seconds` long inside a VAD speech region where the
+/// first pass produced no word, in samples.
+///
+/// A piece that starts mid-speech can come back empty and leave a hole as long
+/// as the piece; this finds those holes (and the ones between two words) so
+/// [`crate::speech`] can decode them again. A word belongs to a region by its
+/// midpoint, so a word on a boundary is not counted twice. Overlapping VAD
+/// regions produce merged ranges.
+pub fn speech_gaps(
+    segments: &[(usize, usize)],
+    words: &[Word],
+    min_seconds: f32,
+) -> Vec<(usize, usize)> {
+    let rate = SAMPLE_RATE as f64;
+    let min = min_seconds.max(0.0) as f64;
+    let mut gaps: Vec<(usize, usize)> = Vec::new();
+    for &(region_start, region_end) in segments {
+        let (begin, finish) = (region_start as f64 / rate, region_end as f64 / rate);
+        let mut inside: Vec<&Word> = words
+            .iter()
+            .filter(|word| {
+                let middle = (word.s + word.e) / 2.0;
+                middle >= begin && middle < finish
+            })
+            .collect();
+        inside.sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cursor = begin;
+        for word in inside {
+            if word.s - cursor >= min {
+                gaps.push((samples(cursor as f32), samples(word.s.min(finish) as f32)));
+            }
+            cursor = cursor.max(word.e);
+        }
+        if finish - cursor >= min {
+            gaps.push((samples(cursor as f32), samples(finish as f32)));
+        }
+    }
+    gaps.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in gaps {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged.retain(|(start, end)| end > start);
+    merged
 }
 
 /// De-duplicates words in overlapping pieces at the midpoint of the overlap on
@@ -238,12 +367,66 @@ pub fn trim_overlaps(pieces: &[(usize, usize)], words: &mut [Vec<Word>]) -> Vec<
     all
 }
 
+/// A re-decoded word whose start is within this many seconds of an existing word
+/// with the same normalized text is a duplicate of a hole-edge word.
+pub const HOLE_EDGE_DUPLICATE_SECONDS: f64 = 0.3;
+
+/// The form compared when de-duplicating hole edges: lower-case letters and
+/// digits only, so `So` and `so.` are the same word.
+fn normalized_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Adds the words a hole re-decode produced to `words`.
+///
+/// Only words whose midpoint is strictly inside `hole` are kept, so the words at
+/// its edges stay single. A re-decode re-times its window, so a neighbour word
+/// can land just inside the hole and be emitted twice (`So` at 411.51 s and
+/// 411.56 s on EN2002a); a candidate that repeats an existing word (same
+/// normalized text, starts within [`HOLE_EDGE_DUPLICATE_SECONDS`]) is dropped.
+///
+/// Returns the number of words added.
+pub fn merge_hole_words(words: &mut Vec<Word>, decoded: Vec<Word>, hole: (usize, usize)) -> usize {
+    let rate = SAMPLE_RATE as f64;
+    let first = hole.0 as f64 / rate;
+    let last = hole.1 as f64 / rate;
+    // Only the words near the hole can be an edge duplicate; normalizing them
+    // once keeps the check linear in the re-decoded words.
+    let edge: Vec<(f64, String)> = words
+        .iter()
+        .filter(|word| word.e >= first - 2.0 && word.s <= last + 2.0)
+        .map(|word| (word.s, normalized_text(&word.w)))
+        .collect();
+    let before = words.len();
+    for word in decoded {
+        let middle = (word.s + word.e) / 2.0;
+        if middle <= first || middle >= last {
+            continue;
+        }
+        let text = normalized_text(&word.w);
+        let duplicate = edge.iter().any(|(start, edge_text)| {
+            *edge_text == text && (word.s - start).abs() <= HOLE_EDGE_DUPLICATE_SECONDS
+        });
+        if !duplicate {
+            words.push(word);
+        }
+    }
+    words.len() - before
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn silence(len: usize) -> Vec<f32> {
         vec![0.0; len]
+    }
+
+    fn piece_seconds(piece: &(usize, usize)) -> f32 {
+        (piece.1 - piece.0) as f32 / SAMPLE_RATE as f32
     }
 
     #[test]
@@ -255,26 +438,41 @@ mod tests {
     }
 
     #[test]
-    fn pieces_are_at_most_thirty_seconds_and_never_over_the_hard_cap() {
+    fn the_defaults_keep_the_reviewed_conditions() {
+        let settings = Settings::default();
+        // A piece is at most the hard cap, rolls included.
+        assert!(
+            settings.max_piece_seconds + settings.pre_roll_seconds + settings.post_roll_seconds
+                <= MAX_ASR_SECONDS
+        );
+        assert!(settings.vad_max_speech_seconds > settings.max_piece_seconds);
+        assert!(settings.min_piece_seconds >= 3.0);
+        assert!(settings.gap_redecode_seconds >= 3.0);
+        // A piece always keeps some silence before its first speech.
+        assert!(settings.min_pre_roll_seconds >= 0.5);
+        assert!(settings.min_pre_roll_seconds <= settings.pre_roll_seconds);
+    }
+
+    #[test]
+    fn pieces_are_at_most_the_hard_cap() {
         let audio = silence(samples(180.0));
         let run = [(0, samples(180.0))];
         let pieces = group_pieces(&audio, &run);
-        assert!(pieces.len() >= 6, "pieces {}", pieces.len());
-        for (start, end) in &pieces {
-            let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
-            // A 30 s group plus its 2 s pre-roll and 1 s post-roll.
-            let longest = MAX_PIECE_SECONDS + PRE_ROLL_SECONDS + POST_ROLL_SECONDS;
+        assert!(pieces.len() >= 3, "pieces {}", pieces.len());
+        let settings = Settings::default();
+        let longest =
+            settings.max_piece_seconds + settings.pre_roll_seconds + settings.post_roll_seconds;
+        for piece in &pieces {
+            let seconds = piece_seconds(piece);
             assert!(seconds <= longest + 0.01, "piece {seconds} s");
             assert!(seconds <= MAX_ASR_SECONDS, "piece over the hard cap");
-            ensure_recognizer_window(end - start).unwrap();
-            assert!(end <= &audio.len());
+            ensure_recognizer_window(piece.1 - piece.0).unwrap();
+            assert!(piece.1 <= audio.len());
         }
-        // No gaps inside the speech run: each piece starts at or before the
-        // previous one ends (the pre-roll creates the overlap).
+        // The pre-roll makes the pieces overlap, never leaves a hole.
         for pair in pieces.windows(2) {
             assert!(pair[1].0 <= pair[0].1, "hole between pieces");
         }
-        // The run is covered from 0 to the end.
         assert_eq!(pieces.first().unwrap().0, 0);
         assert_eq!(pieces.last().unwrap().1, audio.len());
         assert!(covers_speech(&pieces, &run));
@@ -286,24 +484,31 @@ mod tests {
         let run = [(samples(300.0), samples(305.0))];
         let pieces = group_pieces(&audio, &run);
         assert_eq!(pieces.len(), 1, "pieces {pieces:?}");
-        // The piece starts at the speech minus the 2 s pre-roll, not at 0.
-        assert_eq!(pieces[0].0, samples(298.0));
-        // Five seconds of speech plus 1 s of post-roll, extended to 10 s.
-        assert_eq!(pieces[0].1, samples(308.0));
+        // The piece starts in the 2 s before the speech, not at 0.
+        assert!(pieces[0].0 >= samples(298.0));
+        assert!(pieces[0].0 <= samples(300.0));
+        // Five seconds of speech plus 1 s of post-roll, extended to 10 s from
+        // the quiet point where the piece starts.
+        assert_eq!(piece_seconds(&pieces[0]), 10.0);
         assert!(covers_speech(&pieces, &run));
     }
 
     #[test]
     fn an_opening_run_past_sixty_seconds_is_not_truncated() {
-        let audio = silence(samples(120.0));
-        let run = [(samples(45.0), samples(74.0))];
+        let audio = silence(samples(160.0));
+        // A continuous run over the 60 s cap: the plan must split it, not drop
+        // whatever comes after the cap.
+        let run = [(samples(45.0), samples(110.0))];
         let pieces = group_pieces(&audio, &run);
-        assert_eq!(pieces.len(), 1, "pieces {pieces:?}");
-        assert_eq!(pieces[0].0, samples(43.0));
-        assert_eq!(pieces[0].1, samples(75.0));
-        // The speech after 60 s is inside the piece, so the cap never truncates.
-        assert!(pieces[0].1 > samples(60.0));
+        assert!(pieces.len() >= 2, "pieces {pieces:?}");
+        assert!(pieces[0].0 >= samples(43.0) && pieces[0].0 <= samples(45.0));
+        assert_eq!(pieces.last().unwrap().1, samples(111.0));
+        // The speech after 60 s is inside a piece.
+        assert!(pieces.last().unwrap().1 > samples(60.0));
         assert!(covers_speech(&pieces, &run));
+        for piece in &pieces {
+            ensure_recognizer_window(piece.1 - piece.0).unwrap();
+        }
     }
 
     #[test]
@@ -311,7 +516,7 @@ mod tests {
         let audio = silence(samples(180.0));
         let run = [(0, samples(180.0))];
         let pieces = group_pieces(&audio, &run);
-        assert!(pieces.len() >= 6, "pieces {}", pieces.len());
+        assert!(pieces.len() >= 3, "pieces {}", pieces.len());
         for &(start, end) in &pieces {
             ensure_recognizer_window(end - start).unwrap();
         }
@@ -324,55 +529,17 @@ mod tests {
     }
 
     #[test]
-    fn a_piece_over_the_hard_cap_is_split_at_the_quietest_point() {
-        let mut audio = silence(samples(150.0));
-        for second in [50usize, 100] {
-            for sample in audio
-                .iter_mut()
-                .skip(second * SAMPLE_RATE as usize)
-                .take(samples(0.05))
-            {
-                *sample = 1.0;
-            }
-        }
-        let pieces = split_to_cap(&audio, 0, audio.len());
-        assert!(pieces.len() >= 3, "pieces {pieces:?}");
-        assert_eq!(pieces.first().unwrap().0, 0);
-        assert_eq!(pieces.last().unwrap().1, audio.len());
-        for &(start, end) in &pieces {
-            ensure_recognizer_window(end - start).unwrap();
-            let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
-            assert!(
-                seconds >= MIN_PIECE_SECONDS,
-                "piece {seconds} s under the minimum"
-            );
-        }
-        for pair in pieces.windows(2) {
-            // The next piece backs up by the pre-roll: an overlap, never a hole.
-            assert!(pair[1].0 <= pair[0].1, "hole between pieces");
-            let overlap = (pair[0].1 - pair[1].0) as f32 / SAMPLE_RATE as f32;
-            assert!(overlap <= PRE_ROLL_SECONDS + 0.01, "overlap {overlap} s");
-            let cut = pair[0].1;
-            for loud in [50 * SAMPLE_RATE as usize, 100 * SAMPLE_RATE as usize] {
-                assert!(
-                    cut <= loud || cut >= loud + samples(0.05),
-                    "cut landed in the loud window at {loud}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn a_cap_sized_span_plus_a_tail_keeps_the_minimum_on_both_sides() {
         // 60 s + 5 samples used to split into a 45 s piece and a 14.8 s piece
         // with no overlap; a shorter tail could fall under the 10 s minimum.
+        let settings = Settings::default();
         let audio = silence(samples(60.0003));
-        let pieces = split_to_cap(&audio, 0, audio.len());
+        let pieces = split_span(&settings, &audio, 0, audio.len());
         assert_eq!(pieces.len(), 2, "pieces {pieces:?}");
         for &(start, end) in &pieces {
             let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
             assert!(
-                seconds >= MIN_PIECE_SECONDS,
+                seconds >= settings.min_piece_seconds,
                 "piece {seconds} s under the minimum"
             );
             ensure_recognizer_window(end - start).unwrap();
@@ -383,21 +550,93 @@ mod tests {
     }
 
     #[test]
-    fn split_run_cuts_at_the_quietest_point() {
+    fn the_shorter_piece_settings_keep_the_minimum_on_the_first_piece() {
+        // With a 15 s limit the 60 % cut point is 9 s, under the 10 s minimum.
+        let settings = Settings {
+            max_piece_seconds: 12.0,
+            ..Settings::default()
+        };
+        let audio = silence(samples(70.0));
+        let pieces = split_span(&settings, &audio, 0, audio.len());
+        assert!(pieces.len() >= 3, "pieces {pieces:?}");
+        for &(start, end) in &pieces {
+            let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
+            assert!(
+                seconds >= settings.min_piece_seconds,
+                "piece {seconds} s under the minimum: {pieces:?}"
+            );
+            ensure_recognizer_window(end - start).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_span_that_would_leave_a_short_tail_stays_one_piece() {
+        // 16 s with the 15 s limit: splitting would leave an 8 s tail. It fits
+        // the 60 s hard cap, so it is decoded whole instead.
+        let settings = Settings {
+            max_piece_seconds: 12.0,
+            ..Settings::default()
+        };
+        let audio = silence(samples(16.0));
+        let pieces = split_span(&settings, &audio, 0, audio.len());
+        assert_eq!(pieces.len(), 1, "pieces {pieces:?}");
+        ensure_recognizer_window(pieces[0].1 - pieces[0].0).unwrap();
+    }
+
+    #[test]
+    fn a_piece_over_the_hard_cap_is_split_at_the_quietest_point() {
+        // A settings value over the hard cap must still split at 60 s.
+        let settings = Settings {
+            max_piece_seconds: 120.0,
+            ..Settings::default()
+        };
+        let mut audio = silence(samples(150.0));
+        for second in [50usize, 100] {
+            for sample in audio
+                .iter_mut()
+                .skip(second * SAMPLE_RATE as usize)
+                .take(samples(0.05))
+            {
+                *sample = 1.0;
+            }
+        }
+        let pieces = split_span(&settings, &audio, 0, audio.len());
+        assert!(pieces.len() >= 3, "pieces {pieces:?}");
+        assert_eq!(pieces.first().unwrap().0, 0);
+        assert_eq!(pieces.last().unwrap().1, audio.len());
+        for &(start, end) in &pieces {
+            ensure_recognizer_window(end - start).unwrap();
+            assert!(
+                piece_seconds(&(start, end)) >= Settings::default().min_piece_seconds,
+                "piece {} s under the minimum",
+                piece_seconds(&(start, end))
+            );
+        }
+        for pair in pieces.windows(2) {
+            // The next piece backs up by the pre-roll: an overlap, never a hole.
+            assert!(pair[1].0 <= pair[0].1, "hole between pieces");
+        }
+    }
+
+    #[test]
+    fn a_cut_at_the_quietest_point_avoids_a_loud_window() {
+        // A 30 s target splits a 60 s span, so the cut lands in the search range.
+        let settings = Settings {
+            max_piece_seconds: 30.0,
+            ..Settings::default()
+        };
         let mut audio = silence(samples(60.0));
         // Make one 50 ms window in the search range much louder.
-        let quiet = 40 * SAMPLE_RATE as usize;
+        let quiet = 25 * SAMPLE_RATE as usize;
         for sample in audio.iter_mut().skip(quiet).take(samples(0.05)) {
             *sample = 1.0;
         }
-        let pieces = split_run(&audio, 0, samples(60.0));
+        let pieces = split_span(&settings, &audio, 0, samples(60.0));
         let cut = pieces[0].1;
         assert!(
             cut < quiet || cut > quiet + samples(0.05),
             "cut landed in the loud window"
         );
-        assert!(cut >= (samples(30.0) as f32 * 0.6) as usize);
-        assert!(cut <= samples(30.0));
     }
 
     #[test]
@@ -406,9 +645,10 @@ mod tests {
         let pieces = group_pieces(&audio, &[(samples(0.5), samples(1.0))]);
         assert_eq!(pieces.len(), 1);
         let (start, end) = pieces[0];
-        // First piece starts at 0; the half-second run is extended to ten seconds.
-        assert_eq!(start, 0);
-        assert_eq!((end - start) as f32 / SAMPLE_RATE as f32, 10.0);
+        // The half-second run is wrapped by the pre-roll and extended to ten
+        // seconds; it starts in the silence before the run, not after it.
+        assert!(start <= samples(0.5), "start {start}");
+        assert_eq!(piece_seconds(&(start, end)), 10.0);
     }
 
     #[test]
@@ -423,7 +663,8 @@ mod tests {
         );
         assert_eq!(pieces.len(), 2);
         let (start, end) = pieces[1];
-        assert_eq!(start, samples(18.0));
+        // The pre-roll starts at or just before the 2 s before the run.
+        assert!(start >= samples(18.0) && start <= samples(20.0));
         assert_eq!(end, samples(31.0));
     }
 
@@ -447,6 +688,203 @@ mod tests {
             ],
         );
         assert_eq!(pieces.len(), 2);
+    }
+
+    #[test]
+    fn a_merged_group_is_never_longer_than_the_max_speech_span() {
+        // Eight 1 s runs 0.4 s apart merge while they fit in max_piece_seconds.
+        let audio = silence(samples(60.0));
+        let settings = Settings {
+            max_piece_seconds: 8.0,
+            ..Settings::default()
+        };
+        let runs: Vec<(usize, usize)> = (0..8)
+            .map(|index| {
+                let start = samples(10.0 + index as f32 * 1.4);
+                (start, start + samples(1.0))
+            })
+            .collect();
+        let pieces = group_pieces_with(&settings, &audio, &runs);
+        assert!(covers_speech(&pieces, &runs));
+        let longest =
+            settings.max_piece_seconds + settings.pre_roll_seconds + settings.post_roll_seconds;
+        for piece in &pieces {
+            assert!(
+                piece_seconds(piece) <= longest + 0.01,
+                "piece {} s",
+                piece_seconds(piece)
+            );
+        }
+    }
+
+    #[test]
+    fn the_pre_roll_starts_at_the_quietest_point_before_the_speech() {
+        let settings = Settings::default();
+        // Loud from 18 s to 19.5 s, silence after it: the pre-roll of a speech
+        // run at 20 s must start in that silence, not at the fixed 18 s.
+        let mut audio = vec![0.0f32; samples(30.0)];
+        for sample in audio
+            .iter_mut()
+            .skip(18 * SAMPLE_RATE as usize)
+            .take(samples(1.5))
+        {
+            *sample = 1.0;
+        }
+        let pieces = group_pieces_with(&settings, &audio, &[(samples(20.0), samples(21.0))]);
+        let start = pieces[0].0;
+        assert!(
+            start >= samples(19.5),
+            "start {}",
+            start as f32 / SAMPLE_RATE as f32
+        );
+        assert!(start <= samples(20.0));
+    }
+
+    #[test]
+    fn the_pre_roll_keeps_a_floor_before_a_soft_onset() {
+        let settings = Settings::default();
+        // Loud right up to 19.9 s, silence after: the quietest window is
+        // 19.9-19.95 s, only 0.075 s before the speech at 20 s.
+        let mut audio = vec![0.0f32; samples(30.0)];
+        for sample in audio
+            .iter_mut()
+            .skip(18 * SAMPLE_RATE as usize)
+            .take(samples(1.9))
+        {
+            *sample = 1.0;
+        }
+        let pieces = group_pieces_with(&settings, &audio, &[(samples(20.0), samples(21.0))]);
+        let start = pieces[0].0;
+        assert!(
+            start <= samples(20.0) - samples(settings.min_pre_roll_seconds),
+            "start {} s leaves under {} s of pre-roll",
+            start as f32 / SAMPLE_RATE as f32,
+            settings.min_pre_roll_seconds
+        );
+    }
+
+    #[test]
+    fn a_redecoded_word_that_repeats_a_hole_edge_word_is_dropped() {
+        // The first pass ends with `So` at 411.51 s; the hole is its end
+        // (411.54) to the next word's start (413.0). The re-decode re-times that
+        // neighbour to 411.56 s, inside the hole, and must not add it again.
+        let mut words = vec![Word {
+            w: "So".to_string(),
+            s: 411.49,
+            e: 411.54,
+        }];
+        let decoded = vec![
+            Word {
+                w: "so.".to_string(),
+                s: 411.56,
+                e: 411.8,
+            },
+            Word {
+                w: "yeah".to_string(),
+                s: 412.1,
+                e: 412.4,
+            },
+        ];
+        let added = merge_hole_words(&mut words, decoded, (samples(411.54), samples(413.0)));
+        assert_eq!(added, 1);
+        let texts: Vec<&str> = words.iter().map(|word| word.w.as_str()).collect();
+        assert_eq!(texts, vec!["So", "yeah"]);
+    }
+
+    #[test]
+    fn the_hole_merge_keeps_repeats_inside_the_hole_and_words_at_its_edges() {
+        let mut words = vec![
+            Word {
+                w: "no".to_string(),
+                s: 10.0,
+                e: 10.4,
+            },
+            Word {
+                w: "Right.".to_string(),
+                s: 15.0,
+                e: 15.2,
+            },
+        ];
+        let hole = (samples(10.4), samples(15.0));
+        let decoded = vec![
+            // The next neighbour re-timed 0.2 s earlier: same word, dropped.
+            Word {
+                w: "right".to_string(),
+                s: 14.8,
+                e: 15.0,
+            },
+            // A word just inside the hole is kept.
+            Word {
+                w: "stray".to_string(),
+                s: 10.42,
+                e: 10.52,
+            },
+            // Real repetitions inside the hole, far from the edge word: kept.
+            Word {
+                w: "no".to_string(),
+                s: 11.0,
+                e: 11.2,
+            },
+            Word {
+                w: "no".to_string(),
+                s: 11.3,
+                e: 11.5,
+            },
+        ];
+        let added = merge_hole_words(&mut words, decoded, hole);
+        assert_eq!(added, 3);
+        let texts: Vec<&str> = words.iter().map(|word| word.w.as_str()).collect();
+        assert_eq!(texts, vec!["no", "Right.", "stray", "no", "no"]);
+    }
+
+    #[test]
+    fn speech_gaps_find_empty_regions_and_word_holes() {
+        let rate = SAMPLE_RATE as f32;
+        let word = |s: f32, e: f32| Word {
+            w: "word".to_string(),
+            s: s as f64,
+            e: e as f64,
+        };
+        let words = vec![word(10.0, 10.5), word(15.0, 15.5), word(30.0, 30.5)];
+        // One region 10-16 s (a 4.5 s hole between 10.5 and 15), one region
+        // 25-40 s (a 5 s hole at its start and a 9.5 s hole at its end).
+        let segments = [
+            (samples(10.0), samples(16.0)),
+            (samples(25.0), samples(40.0)),
+        ];
+        let gaps = speech_gaps(&segments, &words, 3.0);
+        assert_eq!(
+            gaps,
+            vec![
+                (samples(10.5), samples(15.0)),
+                (samples(25.0), samples(30.0)),
+                (samples(30.5), samples(40.0)),
+            ]
+        );
+        // Under the largest hole nothing is reported.
+        assert!(speech_gaps(&segments, &words, 9.6).is_empty());
+        let _ = rate;
+    }
+
+    #[test]
+    fn speech_gaps_merge_overlapping_regions() {
+        let words = vec![Word {
+            w: "word".to_string(),
+            s: 14.0,
+            e: 14.5,
+        }];
+        let segments = [
+            (samples(10.0), samples(20.0)),
+            (samples(10.0), samples(20.0)),
+        ];
+        let gaps = speech_gaps(&segments, &words, 3.0);
+        assert_eq!(
+            gaps,
+            vec![
+                (samples(10.0), samples(14.0)),
+                (samples(14.5), samples(20.0))
+            ]
+        );
     }
 
     #[test]

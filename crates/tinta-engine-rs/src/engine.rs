@@ -1,29 +1,33 @@
 //! The engine command loop.
 //!
 //! Commands are handled one at a time on the stdin reader thread, except
-//! `install_models`: it runs on its own worker thread and replies when it
-//! finishes, so `ping`, `models_status`, `calendar` and the other quick commands
-//! keep answering while a 487 MB install runs. A second install is rejected
-//! while one is in flight. Commands whose features are not implemented yet fail
-//! with an `unsupported` error, and macOS-only commands return the degraded
-//! replies from `docs/engine-protocol.md` so the app does not show errors or
-//! retry loops.
+//! `install_models`, `import_audio` and `finalize`: those run on worker threads
+//! and reply when they finish, so `ping`, `models_status`, `calendar`, `sample`
+//! and the other quick commands keep answering during a 487 MB install or a long
+//! final pass. A second install is rejected while one is in flight. Commands
+//! whose features are not implemented yet fail with an `unsupported` error, and
+//! macOS-only commands return the degraded replies from `docs/engine-protocol.md`
+//! so the app does not show errors or retry loops.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::install;
 use crate::manifest::Manifest;
 use crate::protocol::{log, Output, Request};
+use crate::speech::SpeechPass;
 use crate::threads::Threads;
+use tinta_core::chunks::Track;
 
 /// What the engine can do today. The app does not read this yet; the fields name
-/// the features a later app can switch on. Everything is false in the skeleton.
+/// the features a later app can switch on.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Capabilities {
     pub capture_system_audio: bool,
@@ -37,16 +41,7 @@ pub struct Capabilities {
 }
 
 /// Commands that belong to the protocol but whose feature is not built yet.
-const UNIMPLEMENTED: &[&str] = &[
-    "start",
-    "pause",
-    "resume",
-    "mic_muted",
-    "stop",
-    "finalize",
-    "sample",
-    "import_audio",
-];
+const UNIMPLEMENTED: &[&str] = &["start", "pause", "resume", "mic_muted", "stop"];
 
 pub struct Engine {
     out: Output,
@@ -74,7 +69,10 @@ impl Engine {
             "ready",
             json!({
                 "version": env!("CARGO_PKG_VERSION"),
-                "capabilities": Capabilities::default(),
+                "capabilities": Capabilities {
+                    import_audio: true,
+                    ..Default::default()
+                },
             }),
         )?;
 
@@ -110,6 +108,16 @@ impl Engine {
             return Ok(false);
         }
 
+        if request.cmd == "finalize" {
+            self.start_finalize(&request)?;
+            return Ok(false);
+        }
+
+        if request.cmd == "import_audio" {
+            self.start_import(&request)?;
+            return Ok(false);
+        }
+
         match self.handle_command(&request.cmd, &request.params) {
             Ok(result) => self.out.reply(&request.id, result)?,
             Err(error) => self.out.fail(&request.id, &error.to_string())?,
@@ -117,11 +125,7 @@ impl Engine {
         Ok(false)
     }
 
-    fn handle_command(
-        &mut self,
-        command: &str,
-        _params: &serde_json::Map<String, Value>,
-    ) -> Result<Value> {
+    fn handle_command(&mut self, command: &str, params: &Map<String, Value>) -> Result<Value> {
         match command {
             "ping" => Ok(json!({ "pong": true })),
             "models_status" => Ok(json!({
@@ -160,11 +164,63 @@ impl Engine {
             })),
             "call_report" => bail!("Call reading is not available on this platform."),
             "summarize" => bail!("Summaries are not available on this platform."),
+            "sample" => {
+                let dir = param_string(params, "dir")?;
+                let track = match param_string(params, "track")?.as_str() {
+                    "mic" => Track::Mic,
+                    "remote" => Track::Remote,
+                    _ => bail!("invalid track"),
+                };
+                let start = param_f64(params, "s")?;
+                let end = param_f64(params, "e")?;
+                let key = audio_key(params)?;
+                crate::sample::sample(Path::new(&dir), &key, track, start, end)
+            }
             other if UNIMPLEMENTED.contains(&other) => {
                 bail!("unsupported command: {other}")
             }
             other => bail!("unknown command {other}"),
         }
+    }
+
+    /// Runs one final pass on a worker thread. Two passes may overlap; the speech
+    /// layer serializes them while the models are loaded.
+    fn start_finalize(&mut self, request: &Request) -> io::Result<()> {
+        let out = self.out.clone();
+        let id = request.id.clone();
+        let params = request.params.clone();
+        let manifest = self.manifest.clone();
+        let root = self.models_root.clone();
+        let threads = self.threads;
+        std::thread::spawn(move || {
+            let result = (|| -> Result<Value> {
+                let dir = param_string(&params, "dir")?;
+                let key = audio_key(&params)?;
+                let max_speakers = param_usize(&params, "max_speakers");
+                let mut pass = SpeechPass::new(manifest, root, threads);
+                crate::finalize::finalize(&mut pass, Path::new(&dir), &key, max_speakers, &out)
+            })();
+            reply(&out, &id, result);
+        });
+        Ok(())
+    }
+
+    /// Runs one import on a worker thread, like `Engine.importAudio` on its
+    /// detached task.
+    fn start_import(&mut self, request: &Request) -> io::Result<()> {
+        let out = self.out.clone();
+        let id = request.id.clone();
+        let params = request.params.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<Value> {
+                let dir = param_string(&params, "dir")?;
+                let key = audio_key(&params)?;
+                let path = param_string(&params, "path")?;
+                crate::import::import_audio(Path::new(&dir), &key, Path::new(&path), &out)
+            })();
+            reply(&out, &id, result);
+        });
+        Ok(())
     }
 
     /// Starts one install on a worker thread. The reply is written when the
@@ -194,6 +250,50 @@ impl Engine {
         });
         Ok(())
     }
+}
+
+/// Reads a required, non-empty string parameter. The message matches Swift's
+/// `params.string`.
+fn param_string(params: &Map<String, Value>, key: &str) -> Result<String> {
+    match params.get(key).and_then(Value::as_str) {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        _ => bail!("missing parameter: {key}"),
+    }
+}
+
+fn param_f64(params: &Map<String, Value>, key: &str) -> Result<f64> {
+    params
+        .get(key)
+        .and_then(Value::as_f64)
+        .with_context(|| format!("missing parameter: {key}"))
+}
+
+/// An optional positive speaker limit; Swift ignores zero and negative values.
+fn param_usize(params: &Map<String, Value>, key: &str) -> Option<usize> {
+    params
+        .get(key)
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .map(|value| value as usize)
+}
+
+/// Decodes `audio_key`, a base64 string of exactly 32 bytes. Anything else is
+/// `invalid audio key`, like `Controller.key` in Swift.
+fn audio_key(params: &Map<String, Value>) -> Result<[u8; 32]> {
+    let text = param_string(params, "audio_key")?;
+    let bytes = STANDARD
+        .decode(text)
+        .map_err(|_| anyhow::anyhow!("invalid audio key"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid audio key"))
+}
+
+fn reply(out: &Output, id: &Value, result: Result<Value>) {
+    let _ = match result {
+        Ok(value) => out.reply(id, value),
+        Err(error) => out.fail(id, &error.to_string()),
+    };
 }
 
 #[cfg(test)]
@@ -293,9 +393,12 @@ mod tests {
         assert_eq!(ready["version"], env!("CARGO_PKG_VERSION"));
         let capabilities = ready["capabilities"].as_object().unwrap();
         assert_eq!(capabilities.len(), 8);
-        assert!(capabilities
-            .values()
-            .all(|value| value == &Value::Bool(false)));
+        assert_eq!(capabilities["import_audio"], true);
+        for (name, value) in capabilities {
+            if name != "import_audio" {
+                assert_eq!(value, &Value::Bool(false), "{name}");
+            }
+        }
     }
 
     #[test]
@@ -375,6 +478,60 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unsupported command: start"));
+    }
+
+    #[test]
+    fn finalize_reports_a_missing_parameter_from_its_worker() {
+        let mut harness = harness();
+        harness
+            .engine
+            .handle_line("{\"id\":8,\"cmd\":\"finalize\",\"params\":{}}")
+            .unwrap();
+        let reply = wait_for_reply(&harness.sink, 1);
+        assert_eq!(reply["id"], 8);
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "missing parameter: dir");
+    }
+
+    #[test]
+    fn sample_validates_its_track_and_rejects_a_short_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = STANDARD.encode([1u8; 32]);
+        let lines = run(&format!(
+            "{{\"id\":1,\"cmd\":\"sample\",\"params\":{{\"dir\":\"{}\",\"track\":\"left\",\"s\":0,\"e\":1,\"audio_key\":\"{key}\"}}}}\n\
+             {{\"id\":2,\"cmd\":\"sample\",\"params\":{{\"dir\":\"{}\",\"track\":\"mic\",\"s\":0,\"e\":1,\"audio_key\":\"AAAA\"}}}}",
+            dir.path().display(),
+            dir.path().display()
+        ));
+        assert_eq!(lines[1]["error"], "invalid track");
+        assert_eq!(lines[2]["error"], "invalid audio key");
+    }
+
+    #[test]
+    fn sample_returns_a_wav_for_an_empty_meeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = STANDARD.encode([1u8; 32]);
+        let lines = run(&format!(
+            "{{\"id\":1,\"cmd\":\"sample\",\"params\":{{\"dir\":\"{}\",\"track\":\"remote\",\"s\":0,\"e\":1,\"audio_key\":\"{key}\"}}}}",
+            dir.path().display()
+        ));
+        let wav = lines[1]["result"]["wav_base64"].as_str().unwrap();
+        assert_eq!(STANDARD.decode(wav).unwrap().len(), 44);
+    }
+
+    fn wait_for_reply(sink: &Sink, expected_lines: usize) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lines = sink.lines();
+            if lines.len() >= expected_lines {
+                return lines[expected_lines - 1].clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the worker reply"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

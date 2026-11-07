@@ -614,7 +614,12 @@ Behavioral details:
 - `duration` is `max(samples in each track) / 16000` — sample count, not wall clock
   (`Engine.swift:213-216`). The app stores it as the meeting duration.
 - `language` is present only when the concatenated transcript is longer than 20 characters
-  (`Engine.swift:230`; `Speech.swift:219-224`).
+  (`Engine.swift:230`; `Speech.swift:219-224`). On Windows and Linux the Rust engine
+  detects it with `whatlang` on the same concatenated text and maps the result to an
+  ISO 639-1 tag (`en`, `es`, …), the same shape Apple returns. `whatlang` and
+  `NLLanguageRecognizer` disagree on short or mixed-language text: they use different
+  models and different confidence rules, so the tag is advisory. The app only uses it to
+  choose the summary language (`lib.rs:637`). See `crates/tinta-engine-rs/src/language.rs`.
 - The microphone track is filtered against speaker echo: microphone words are dropped when
   remote audio is playing and the microphone level is below 20 % of the remote level
   (`Engine.swift:218-220`; `Echo.swift:32-57`). A second engine should keep the intent
@@ -623,7 +628,17 @@ Behavioral details:
 - Final transcription is VAD-driven: speech regions with at least 0.2 s of speech and
   0.5 s of silence, grouped into windows of at most ~25 s and at most 14 s of continuous
   speech (`Speech.swift:183-196`). Windows are transcribed one at a time
-  (`Speech.swift:197-204`).
+  (`Speech.swift:197-204`). The Rust engine follows the binding "Engine design
+  conditions" in `docs/fork/benchmark.md` instead: Silero VAD pieces of at most 30 s cut
+  at the quietest 50 ms window, 2 s of pre-roll, 1 s of post-roll and a 10 s minimum,
+  with a 60 s cap checked in code before every recognizer call and no forced 20 s flush.
+  Overlapping pieces are de-duplicated at the overlap midpoint and sorted by time
+  (`crates/tinta-engine-rs/src/segment.rs`). The result shape and the event order do not
+  change. The Rust engine does not apply `max_speakers` yet: Swift treats it as a cap,
+  while sherpa-onnx can only force an exact cluster count, and the binding design
+  conditions say never to force a fixed count. The parameter is accepted and reaches the
+  single `cluster_speakers` function (`crates/tinta-engine-rs/src/speech.rs`), which a
+  later task replaces with over-cluster + merge, where the cap fits.
 - Diarization loads a fresh diarizer per final pass and releases it, because Core ML keeps
   GPU memory proportional to audio length (`Speech.swift:135-147`).
 - A missing `audio/remote` or `audio/mic` directory reads as an empty track
@@ -649,7 +664,7 @@ Behavioral details:
 | result | `{"duration": number}` (seconds) (`Engine.swift:253`) |
 | errors | `"missing parameter: …"`, `"cannot allocate buffer"`, AVFoundation open/read errors, chunk write errors (the latter are events, not errors) |
 | events | `error` if a chunk write fails (`ChunkStore.swift:89-91`) |
-| notes | Imports a file as the **remote** track so the final pass separates all voices in it: decode with `AVAudioFile`, resample to 16 kHz mono, append sequential samples starting at index 0, flush (`Engine.swift:235-254`). Only `audio/remote/*.tntc` is written; there is no `audio/mic`, no session JSON, and no database change. The app creates the meeting first, calls this, marks it stopped, then finalizes on a new thread (`commands.rs:323-343`). 10-minute timeout. |
+| notes | Imports a file as the **remote** track so the final pass separates all voices in it: decode with `AVAudioFile`, resample to 16 kHz mono, append sequential samples starting at index 0, flush (`Engine.swift:235-254`). Only `audio/remote/*.tntc` is written; there is no `audio/mic`, no session JSON, and no database change. The app creates the meeting first, calls this, marks it stopped, then finalizes on a new thread (`commands.rs:323-343`). 10-minute timeout. The Rust engine decodes wav, mp3, m4a/AAC, ogg/Vorbis and flac with symphonia, averages the channels into mono and resamples with rubato (`crates/tinta-engine-rs/src/audio.rs`); a 16 kHz input is appended without resampling. A chunk write failure is an `error` event and the import continues, as in Swift. |
 
 ---
 

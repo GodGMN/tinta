@@ -4,16 +4,24 @@
 //! `docs/engine-protocol.md`. It runs as `tinta-engine`, talks JSON lines on
 //! stdin/stdout and logs to stderr with the `[tinta-engine]` prefix.
 //!
-//! The skeleton implements the process lifecycle, `ping`, `models_status`,
-//! `install_models`, `permissions`, `list_sources` and the documented degraded
-//! replies for the macOS-only commands. Recording, transcription and
-//! diarization are later tasks; their commands fail with an `unsupported` error
-//! and every capability is false.
+//! The engine implements the process lifecycle, `ping`, `models_status`,
+//! `install_models`, `permissions`, `list_sources`, `sample`, `import_audio`,
+//! `finalize` and the documented degraded replies for the macOS-only commands.
+//! Recording commands are a later task and fail with an `unsupported` error.
 
+pub mod audio;
+pub mod echo;
 pub mod engine;
+pub mod finalize;
+pub mod import;
 pub mod install;
+pub mod language;
 pub mod manifest;
 pub mod paths;
 pub mod protocol;
+pub mod sample;
+pub mod segment;
 pub mod sherpa;
+pub mod speech;
 pub mod threads;
+pub mod types;

@@ -4,6 +4,7 @@
 
 ### Added
 - The desktop app builds for Windows and Linux. Those builds cannot open the encrypted library yet, so Tinta explains why in a dialog and then closes.
+- Tinta has a Linux build, as a `.deb` package and an AppImage. It is a preview: the README section **Linux (preview)** lists what works and what does not.
 
 ## 0.9.3 (2026-10-21)
 

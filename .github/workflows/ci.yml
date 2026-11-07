@@ -48,6 +48,61 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -p tinta --all-targets -- -D warnings
 
+  bundle-linux:
+    # Ubuntu 22.04 keeps the build on glibc 2.35, so the bundles run on Debian 12 (glibc 2.36)
+    # and Ubuntu 24.04 (glibc 2.39). `ubuntu-latest` is 24.04, and a build there needs glibc
+    # 2.39, which rules out both. 22.04 has libwebkit2gtk-4.1-dev in universe; if GitHub retires
+    # the image, build the bundle in a 22.04 container instead of moving to ubuntu-latest.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the bundles
+        run: ./scripts/build-linux.sh
+      - name: Check the bundles
+        run: |
+          set -euo pipefail
+          deb="$(ls target/release/bundle/deb/*.deb)"
+          dpkg-deb -c "$deb"
+          dpkg-deb -I "$deb"
+          for name in tinta tinta-engine tinta-mcp tinta-native-host; do
+            dpkg-deb -c "$deb" | grep -q "usr/bin/$name$" || { echo "missing usr/bin/$name"; exit 1; }
+          done
+          tmp="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$tmp"
+          grep -qx 'Categories=Office;AudioVideo;' "$tmp/usr/share/applications/Tinta.desktop"
+          appimage="$(ls target/release/bundle/appimage/*.AppImage)"
+          work="$(mktemp -d)"
+          cd "$work"
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          ls -l squashfs-root/usr/bin
+          for name in tinta tinta-engine; do
+            if ldd "squashfs-root/usr/bin/$name" | grep 'not found'; then
+              echo "unresolved libraries for $name"
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinta-linux-x86_64
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
   app-macos:
     # The Intel image for the same capacity reason as `core-macos`. This compiles the macOS
     # platform module, so it proves that the Mac code still builds, but only for

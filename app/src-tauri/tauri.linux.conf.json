@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "externalBin": ["binaries/tinta-engine", "binaries/tinta-mcp", "binaries/tinta-native-host"],
+    "shortDescription": "Meeting notes. On your Linux desktop.",
+    "longDescription": "Write your notes, get a transcript with speaker names, and keep everything on your own computer.",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libpulse0",
+          "libssl3 | libssl3t64",
+          "libstdc++6"
+        ],
+        "recommends": ["gnome-keyring | kwalletmanager"],
+        "section": "sound",
+        "desktopTemplate": "linux.desktop"
+      }
+    }
+  }
+}

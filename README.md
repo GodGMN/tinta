@@ -82,6 +82,63 @@ Tinta has no signed download yet. Build it from source:
 6. Open Tinta. macOS blocks apps without Apple notarization. Open System Settings, then Privacy & Security, and click **Open Anyway**.
 7. If macOS asks whether Tinta can use its key in the Keychain, click **Always Allow**.
 
+## Linux (preview)
+
+Tinta builds for x86_64 Linux. This section covers the Linux build only; the rest of this
+README describes the Mac app. The Linux build is a preview: it installs and opens, and
+the port is still in progress.
+
+### Requirements
+
+- x86_64 Linux with glibc 2.35 or later: Debian 12, Ubuntu 22.04 or later, and their
+  derivatives.
+- PipeWire or PulseAudio. Most desktops run one; a minimal window manager may not.
+- A Secret Service provider for the key of the library: GNOME Keyring, KWallet, or another
+  implementation of the `org.freedesktop.secrets` D-Bus interface. Without one, Tinta
+  cannot open its library.
+- Headphones. Linux records the monitor of the default output device, so with speakers
+  the call audio comes back through the microphone. Tinta has no echo cancellation on
+  Linux yet.
+
+### Install
+
+Get the `.deb` and the `.AppImage` from the `bundle-linux` artifact of the CI run, or
+build them with `./scripts/build-linux.sh`.
+
+The `.deb`:
+
+```sh
+sudo apt install ./Tinta_*_amd64.deb
+```
+
+The `.AppImage`, which needs no install:
+
+```sh
+chmod +x Tinta_*_amd64.AppImage
+./Tinta_*_amd64.AppImage
+```
+
+There is no signed build or package repository yet.
+
+The speech models take about 700 MB on disk, from about 490 MB of download. The setup
+installs them, as it does on the Mac.
+
+### Privacy
+
+Tinta records the monitor of the default output device: the whole system output, not one
+application. Everything that plays while it records, including your music and
+notifications, goes into the meeting audio, and Tinta does not know which window made a
+sound. Tell the people in the call that you record.
+
+### Not on Linux yet
+
+- The calendar and **Next meetings**.
+- Summaries: Linux has no local model to write them.
+- Speaker names from the Zoom and Microsoft Teams windows.
+- Per-app audio. Tinta records the whole system output: everything that plays while it
+  records, including your music and notifications, goes into the meeting audio. Tell the
+  people in the call that you record.
+
 ## Set up
 
 When you open Tinta for the first time, a short setup guides you through these steps. You can skip each step, or skip all of setup. Steps that you skip stay on Home, under Get ready. To see the setup again, open Settings and click **Run setup again**.

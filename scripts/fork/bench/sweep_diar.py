@@ -26,10 +26,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--meetings", required=True, help="comma separated")
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--diar-tag", default=None,
+                    help="model whose over-clustered partition is the starting point")
+    ap.add_argument("--table", default=None)
     ap.add_argument("--merge", default="0.20,0.25,0.30,0.35")
     ap.add_argument("--loyalty", default="0,0.3")
     ap.add_argument("--min-share", default="0.01,0.02,0.03")
-    ap.add_argument("--table", default=None)
     args = ap.parse_args()
 
     meetings = args.meetings.split(",")
@@ -42,7 +44,10 @@ def main():
         ders = []
         for meeting in meetings:
             emb = os.path.join(ROOT, "results", f"emb-{meeting}-{args.tag}.json")
-            raw = os.path.join(ROOT, "results", f"diar-{meeting}-{args.tag}.json")
+            raw = os.path.join(
+                ROOT, "results",
+                f"diar-{meeting}-{args.diar_tag or args.tag}.json",
+            )
             if not (os.path.exists(emb) and os.path.exists(raw)):
                 print(f"missing {emb} or {raw}", file=sys.stderr)
                 sys.exit(1)

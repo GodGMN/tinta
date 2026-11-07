@@ -51,7 +51,7 @@ def pct(v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--merge", type=float, default=0.25)
-    ap.add_argument("--loyalty", type=float, default=0.5)
+    ap.add_argument("--loyalty", type=float, default=0.0)
     ap.add_argument("--share", type=float, default=0.02)
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--meetings", required=True)
@@ -75,11 +75,11 @@ def main():
     for model in models:
         for meeting in meetings:
             ref = os.path.join(ROOT, "results", f"ref-{meeting}.json")
-            raw = os.path.join(ROOT, "results", f"diar-{meeting}-{model}.json")
             final = os.path.join(
                 ROOT, "results",
                 f"pc-{meeting}-{model}-m{args.merge:g}-l{args.loyalty:g}-s{args.share:g}.json",
             )
+            raw = raw_source(meeting, model, final)
             # Raw over-clustered output, scored the way task #2 scored it.
             r0 = score(ref, raw, os.path.join(ROOT, "results", f"score-table-raw0-{meeting}-{model}.json"), 0.0)
             rf = score(ref, raw, os.path.join(ROOT, "results", f"score-table-raw2-{meeting}-{model}.json"), 0.02)
@@ -138,11 +138,11 @@ def main():
     for model in models:
         for meeting in meetings:
             ref = os.path.join(ROOT, "results", f"ref-{meeting}.json")
-            raw = os.path.join(ROOT, "results", f"diar-{meeting}-{model}.json")
             final = os.path.join(
                 ROOT, "results",
                 f"pc-{meeting}-{model}-m{args.merge:g}-l{args.loyalty:g}-s{args.share:g}.json",
             )
+            raw = raw_source(meeting, model, final)
             r0 = score(ref, raw, os.path.join(ROOT, "results", f"score-table-raw0-{meeting}-{model}.json"), 0.0)
             fin = score(ref, final, os.path.join(ROOT, "results", f"score-table-fin-{meeting}-{model}.json"), 0.0)
             oraw = oracle(ref, raw, os.path.join(ROOT, "results", f"oracle-table-raw-{meeting}-{model}.json"))
@@ -157,6 +157,18 @@ def main():
     if args.out:
         with open(args.out, "w") as f:
             f.write(text + "\n")
+
+
+def raw_source(meeting, model, final):
+    """The over-clustered partition a run started from, recorded in its output."""
+    if os.path.exists(final):
+        try:
+            src = json.load(open(final))["postcluster"]["diar_source"]
+            if src and os.path.exists(src):
+                return src
+        except (KeyError, TypeError):
+            pass
+    return os.path.join(ROOT, "results", f"diar-{meeting}-{model}.json")
 
 
 def d0(d):

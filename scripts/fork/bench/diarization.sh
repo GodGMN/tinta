@@ -22,10 +22,11 @@ SCORE="$BENCH/scripts/fork/bench/score.py"
 THREADS="${THREADS:-2}"
 
 DEV="${DEV:-IS1008b ES2011c}"
-TEST="${TEST:-ES2004b IS1009b EN2002a TS3003b}"
+TEST="${TEST:-ES2004b IS1009b TS3003b EN2002a}"
 MODELS="${MODELS:-campplus wespeaker}"
 
 SEG="$ROOT/models/sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx"
+SETUP="$ROOT/data/ami-diarization-setup"
 CAMPPLUS="$ROOT/models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 WESPEAKER="$ROOT/models/wespeaker_en_voxceleb_resnet34.onnx"
 
@@ -37,20 +38,47 @@ embedding_for() {
   esac
 }
 
+# The over-clustered partition every model starts from. CAMPPlus at threshold
+# 0.7 over-clusters to 24-60 clusters; the same threshold with WeSpeaker already
+# merges to 6, so the model comparison holds the partition fixed and varies only
+# the embeddings (see docs/fork/diarization.md).
+PARTITION_TAG="${PARTITION_TAG:-campplus}"
+
 # Frozen after the dev sweep; see docs/fork/diarization.md.
-MERGE="${MERGE:-0.25}"
-LOYALTY="${LOYALTY:-0.5}"
-SHARE="${SHARE:-0.02}"
+MERGE="${MERGE:-0.15}"
+LOYALTY="${LOYALTY:-0}"
+SHARE="${SHARE:-0.03}"
+
+# Reference JSON from the pinned BUT RTTM. The setup's own test/dev lists decide
+# which directory a meeting lives in.
+build_refs() {
+  local meeting dir
+  for meeting in $DEV $TEST; do
+    dir=dev
+    [ -f "$SETUP/only_words/rttms/test/$meeting.rttm" ] && dir=test
+    [ -s "$ROOT/results/ref-$meeting.json" ] && continue
+    "$PY" "$SCORE" ref-rttm \
+      --rttm "$SETUP/only_words/rttms/$dir/$meeting.rttm" \
+      --uem "$SETUP/uems/$dir/$meeting.uem" \
+      --meeting "$meeting" --out "$ROOT/results/ref-$meeting.json"
+  done
+}
+
+partition_for() { # meeting
+  echo "$ROOT/results/diar-$1-$PARTITION_TAG.json"
+}
 
 run_raw() {
   mkdir -p "$ROOT/results" "$ROOT/logs"
+  build_refs
   for model in $MODELS; do
     for meeting in $DEV $TEST; do
       local wav="$ROOT/data/$meeting.Mix-Headset.wav"
-      local raw="$ROOT/results/diar-$meeting-$model.json"
+      local raw
+      raw="$(partition_for "$meeting")"
       local emb="$ROOT/results/emb-$meeting-$model.json"
       [ -s "$wav" ] || { echo "missing $wav" >&2; exit 1; }
-      if [ ! -s "$raw" ]; then
+      if [ "$model" = "$PARTITION_TAG" ] && [ ! -s "$raw" ]; then
         echo "diarize $meeting ($model)"
         nice -n 19 "$BIN" diarize \
           --wav "$wav" \
@@ -59,6 +87,7 @@ run_raw() {
           --threads "$THREADS" --threshold 0.7 --window-shift 0.2 --spin 0 \
           --output "$raw" >"$ROOT/logs/diar-$meeting-$model.out" 2>&1
       fi
+      [ -s "$raw" ] || { echo "missing partition $raw" >&2; exit 1; }
       if [ ! -s "$emb" ]; then
         echo "embeddings $meeting ($model)"
         nice -n 19 "$BIN" postcluster \
@@ -78,6 +107,7 @@ sweep() {
   # Tuning only touches the dev meetings.
   "$PY" "$BENCH/scripts/fork/bench/sweep_diar.py" \
     --meetings "$(echo $DEV | tr ' ' ',')" \
+    --diar-tag "$PARTITION_TAG" \
     --merge 0.15,0.20,0.25,0.30,0.35 \
     --loyalty 0,0.3,0.5 \
     --min-share 0.0,0.01,0.02,0.03 \
@@ -87,7 +117,8 @@ sweep() {
 run_one() { # meeting model merge loyalty share
   local meeting="$1" model="$2" merge="$3" loyalty="$4" share="$5"
   local wav="$ROOT/data/$meeting.Mix-Headset.wav"
-  local raw="$ROOT/results/diar-$meeting-$model.json"
+  local raw
+  raw="$(partition_for "$meeting")"
   local emb="$ROOT/results/emb-$meeting-$model.json"
   local name="pc-$meeting-$model-m${merge}-l${loyalty}-s${share}"
   nice -n 19 "$BIN" postcluster \
@@ -114,7 +145,8 @@ run_test() {
 run_oracle() {
   for model in $MODELS; do
     for meeting in $TEST; do
-      local raw="$ROOT/results/diar-$meeting-$model.json"
+      local raw
+      raw="$(partition_for "$meeting")"
       local fin="$ROOT/results/pc-$meeting-$model-m${MERGE}-l${LOYALTY}-s${SHARE}.json"
       "$PY" "$SCORE" oracle --ref "$ROOT/results/ref-$meeting.json" \
         --result "$raw" --out "$ROOT/results/oracle-raw-$meeting-$model.json" >/dev/null
@@ -125,7 +157,11 @@ run_oracle() {
 }
 
 tables() {
-  "$PY" "$BENCH/scripts/fork/bench/diarization_tables.py"
+  "$PY" "$BENCH/scripts/fork/bench/diarization_tables.py" \
+    --merge "$MERGE" --loyalty "$LOYALTY" --share "$SHARE" \
+    --models "$(echo $MODELS | tr ' ' ',')" \
+    --meetings "$(echo $TEST | tr ' ' ',')" \
+    --out "$ROOT/results/tables.md"
 }
 
 case "${1:-}" in

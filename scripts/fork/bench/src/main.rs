@@ -1153,6 +1153,7 @@ fn main() {
             "loadavg_start": loadavg(),
             "machine": machine,
             "postcluster": {
+                "diar_source": block["diar_source"],
                 "clusters_before": block["clusters_before"],
                 "num_speakers": block["num_speakers"],
                 "merges": block["merges"],

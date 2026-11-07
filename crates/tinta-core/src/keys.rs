@@ -661,4 +661,37 @@ mod tests {
         }
     }
 
+    /// Creates a key through a real Secret Service. Ignored by default: it needs a
+    /// running `org.freedesktop.secrets` provider and empty data folders. The
+    /// `integration-smoke` job runs it inside a `dbus-run-session` with
+    /// `gnome-keyring-daemon --unlock`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a running Secret Service; set TINTA_SECRET_SERVICE_TEST=1"]
+    fn creates_a_library_key_through_the_secret_service() {
+        if std::env::var("TINTA_SECRET_SERVICE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let entry = keyring::Entry::new(SERVICE, ACCOUNT).expect("entry");
+        // Start from no item, so the test proves creation rather than reuse.
+        let _ = entry.delete_credential();
+
+        let created = Keys::load_or_create().expect("create the key in the Secret Service");
+        let stored = entry
+            .get_password()
+            .expect("read the key back from the Secret Service");
+        assert_eq!(stored.len(), 64, "the master key is 32 bytes as hex");
+        assert_eq!(
+            created.database,
+            Keys::derive(&decode_master_key(&stored).expect("stored key"))
+                .expect("derive")
+                .database
+        );
+
+        // A second load reads the stored item instead of writing another key.
+        let again = Keys::load_or_create().expect("read the existing key");
+        assert_eq!(created.database, again.database);
+
+        let _ = entry.delete_credential();
+    }
 }

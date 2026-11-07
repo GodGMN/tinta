@@ -131,6 +131,14 @@ both sides of a PR boundary:
   so it is ignored everywhere else.
 - **`integration/linux` on push** in the workflow, so every push builds the
   bundle and runs the smoke test.
+- **Model pin refresh** (`crates/tinta-engine-rs/assets/models.json`): the
+  k2-fsa release re-uploaded `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2`
+  on 2026-11-07, so the archive size/hash and the encoder, decoder and joiner
+  pins from #7 no longer matched and `install_models` failed on every machine.
+  The new pins are the bytes served that day; `tokens.txt`, Silero VAD, the
+  segmentation archive and the CAMPPlus embedding file are unchanged. Upstream
+  with #7 (or as a separate "refresh the pinned models" PR). The CI model cache
+  key follows the manifest hash, so the refreshed set downloads once.
 
 ## What the smoke test proves
 

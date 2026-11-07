@@ -28,6 +28,7 @@ installed models; `WAV` is a speech clip.
 | `mute_probe.py ENGINE WAV OUT` | `mic_muted` silences the exact wall-clock window (the 0.8 s hold) |
 | `reopen_probe.py ENGINE OUT` | the remote capture follows a changed default sink mid-recording |
 | `rss_probe.py ENGINE MODELS WAV OUT` | RSS over `TINTA_RSS_MINUTES` (default 10) with speech in a loop, so the ASR model is loaded |
+| `finalize_rss_probe.py ENGINE MODELS WAV OUT` | RSS while a final pass of an imported meeting runs during a recording with speech, the worst case for memory |
 | `recovery_probe.py ENGINE MODELS WAV OUT` | `kill -9` mid-recording, then `finalize` from the chunks on disk |
 
 `mute_probe.py` and `reopen_probe.py` create two null sinks and a remapped

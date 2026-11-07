@@ -3,6 +3,8 @@ name = "tinta-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# std::fs::File::lock (key.lock) needs Rust 1.89.
+rust-version = "1.89"
 
 [dependencies]
 anyhow.workspace = true

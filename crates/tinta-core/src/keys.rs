@@ -80,7 +80,19 @@ impl Keys {
     /// Manager. The item has the same service and account as the macOS Keychain item.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn load_or_create() -> Result<Self> {
-        Self::load_or_create_in(&crate::paths::data_dir(), &SystemStore)
+        // Debug builds can use a fixed key, like on macOS, so tests and the self-test never
+        // touch (or, with a locked keyring, overwrite) the user's real key.
+        #[cfg(debug_assertions)]
+        if let Ok(value) = std::env::var("TINTA_DEV_MASTER_KEY") {
+            return Self::derive(&hex::decode(value).context("TINTA_DEV_MASTER_KEY must be hex")?);
+        }
+        // There is one key per user, so the lock and the "existing library" check also cover
+        // the fixed per-user folder, whatever TINTA_DATA_DIR or the configured library says.
+        let user_dir = dirs::data_dir()
+            .ok_or_else(|| anyhow!("cannot find the user data folder"))?
+            .join("Tinta");
+        let library_dirs = [crate::paths::data_dir(), user_dir.clone()];
+        Self::load_or_create_in(&user_dir, &library_dirs, &SystemStore)
     }
 
     /// A non-macOS build for a platform without a secure store. It refuses to create a key,
@@ -101,12 +113,16 @@ impl Keys {
     /// entry" result creates a key, and only when the library is still empty: any other failure,
     /// or an existing library without a stored key, would make the library unreadable.
     #[cfg(any(target_os = "linux", target_os = "windows", test))]
-    fn load_or_create_in(library_dir: &std::path::Path, store: &dyn KeyStore) -> Result<Self> {
-        let _lock = lock_library(library_dir)?;
+    fn load_or_create_in(
+        lock_dir: &std::path::Path,
+        library_dirs: &[std::path::PathBuf],
+        store: &dyn KeyStore,
+    ) -> Result<Self> {
+        let _lock = lock_library(lock_dir)?;
         let value = match store.get()? {
             Some(value) => value,
             None => {
-                if has_existing_data(library_dir) {
+                if library_dirs.iter().any(|dir| has_existing_data(dir)) {
                     return Err(anyhow!(
                         "The key for your existing library was not found. Unlock your keyring \
                          (GNOME Keyring, KWallet, KeePassXC) and open Tinta again."
@@ -142,20 +158,48 @@ fn decode_master_key(value: &str) -> Result<[u8; 32]> {
     })
 }
 
-/// True when the library already holds encrypted data: the database, or recorded audio.
+/// True when the folder may already hold a library: any `library.db*` file (including WAL and
+/// SHM), anything under `meetings/`, or a `config.json` that points at a moved library (which
+/// may sit on an unmounted drive). Any error other than "not found" counts as existing data,
+/// because guessing "empty" could create a second key.
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn has_existing_data(dir: &std::path::Path) -> bool {
-    if dir.join("library.db").exists() {
-        return true;
-    }
-    let Ok(meetings) = std::fs::read_dir(dir.join("meetings")) else {
-        return false;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
     };
-    meetings.flatten().any(|meeting| {
-        std::fs::read_dir(meeting.path().join("audio"))
-            .map(|mut audio| audio.next().is_some())
-            .unwrap_or(false)
-    })
+    for entry in entries {
+        let Ok(entry) = entry else { return true };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("library.db") {
+            return true;
+        }
+        if name == "config.json" && configured_library(&entry.path()) {
+            return true;
+        }
+        if name == "meetings" {
+            match std::fs::read_dir(entry.path()) {
+                Ok(mut meetings) => {
+                    if meetings.next().is_some() {
+                        return true;
+                    }
+                }
+                Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+            }
+        }
+    }
+    false
+}
+
+/// True when a `config.json` names a library folder, or cannot be read.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn configured_library(config: &std::path::Path) -> bool {
+    match std::fs::read_to_string(config) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .map(|v| !v["library_dir"].is_null())
+            .unwrap_or(true),
+        Err(_) => true,
+    }
 }
 
 /// Holds an exclusive lock on the library folder until the returned file is dropped.
@@ -236,6 +280,63 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    fn load_in(dir: &std::path::Path, store: &dyn KeyStore) -> Result<Keys> {
+        Keys::load_or_create_in(dir, &[dir.to_path_buf()], store)
+    }
+
+    /// A store where another instance wins the write: reads after a write return its key.
+    struct RacingStore {
+        winner: String,
+        written: Mutex<bool>,
+    }
+
+    impl KeyStore for RacingStore {
+        fn get(&self) -> Result<Option<String>> {
+            Ok(self.written.lock().unwrap().then(|| self.winner.clone()))
+        }
+        fn set(&self, _value: &str) -> Result<()> {
+            *self.written.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn uses_the_stored_key_when_another_instance_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RacingStore { winner: hex::encode([9u8; 32]), written: Mutex::new(false) };
+        let keys = load_in(dir.path(), &store).unwrap();
+        assert_eq!(keys.database, Keys::derive(&[9u8; 32]).unwrap().database);
+    }
+
+    #[test]
+    fn wal_files_meetings_and_a_moved_library_count_as_existing_data() {
+        for (name, contents) in [
+            ("library.db-wal", "x"),
+            ("library.db-shm", "x"),
+            ("config.json", r#"{"library_dir":"/mnt/usb/Tinta"}"#),
+            ("config.json", "not json"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), contents).unwrap();
+            assert!(has_existing_data(dir.path()), "{name}: {contents}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("meetings/m1")).unwrap();
+        assert!(has_existing_data(dir.path()), "meeting folder without audio");
+    }
+
+    #[test]
+    fn any_library_folder_with_data_blocks_creation() {
+        let lock = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(real.path().join("library.db"), "x").unwrap();
+        let store = MockStore::empty();
+        let dirs = [empty.path().to_path_buf(), real.path().to_path_buf()];
+        assert!(Keys::load_or_create_in(lock.path(), &dirs, &store).is_err());
+        assert_eq!(store.writes(), 0);
+    }
+
     struct MockStore {
         value: Mutex<Option<String>>,
         read_error: Option<&'static str>,
@@ -313,7 +414,7 @@ mod tests {
     fn first_run_creates_and_stores_a_key() {
         let dir = library();
         let store = MockStore::empty();
-        let keys = Keys::load_or_create_in(dir.path(), &store).expect("load or create");
+        let keys = load_in(dir.path(), &store).expect("load or create");
         let stored = store.value().expect("a new key is stored");
         assert_eq!(store.writes(), 1);
         assert_eq!(stored.len(), 64, "the master key is 32 bytes of hex");
@@ -326,7 +427,7 @@ mod tests {
         let dir = library();
         let stored = "ab".repeat(32);
         let store = MockStore::with_value(&stored);
-        let keys = Keys::load_or_create_in(dir.path(), &store).expect("load");
+        let keys = load_in(dir.path(), &store).expect("load");
         assert_eq!(store.writes(), 0);
         assert_eq!(store.value().as_deref(), Some(stored.as_str()));
         let expected = Keys::derive(&stored_master(&stored)).expect("derive");
@@ -339,7 +440,7 @@ mod tests {
         std::fs::write(dir.path().join("library.db"), b"encrypted library").expect("library");
         let stored = "cd".repeat(32);
         let store = MockStore::with_value(&stored);
-        let keys = Keys::load_or_create_in(dir.path(), &store).expect("load");
+        let keys = load_in(dir.path(), &store).expect("load");
         assert_eq!(store.writes(), 0);
         assert_eq!(keys.database, Keys::derive(&stored_master(&stored)).expect("derive").database);
     }
@@ -349,7 +450,7 @@ mod tests {
         let dir = library();
         std::fs::write(dir.path().join("library.db"), b"encrypted library").expect("library");
         let store = MockStore::empty();
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("an existing library must not get a new key");
         assert!(error.to_string().contains("key for your existing library"));
@@ -364,7 +465,7 @@ mod tests {
         std::fs::create_dir_all(&audio).expect("audio dir");
         std::fs::write(audio.join("0.wav"), b"encrypted audio").expect("audio");
         let store = MockStore::empty();
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("existing recordings must not get a new key");
         assert!(error.to_string().contains("key for your existing library"));
@@ -376,7 +477,7 @@ mod tests {
     fn malformed_stored_value_errors_without_writing() {
         let dir = library();
         let store = MockStore::with_value("not hex");
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("a malformed key must not create a key");
         assert!(error.to_string().contains("invalid master key"));
@@ -388,7 +489,7 @@ mod tests {
     fn empty_stored_value_errors_without_writing() {
         let dir = library();
         let store = MockStore::with_value("");
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("an empty key must not be used");
         assert!(error.to_string().contains("expected 32 bytes"));
@@ -401,7 +502,7 @@ mod tests {
         let dir = library();
         let short = "ab".repeat(31);
         let store = MockStore::with_value(&short);
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("a 31-byte key must not be used");
         assert!(error.to_string().contains("expected 32 bytes"));
@@ -413,7 +514,7 @@ mod tests {
     fn locked_store_errors_without_writing() {
         let dir = library();
         let store = MockStore::with_read_error("the key store is locked");
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("a locked store must not create a key");
         assert!(error.to_string().contains("locked"));
@@ -425,7 +526,7 @@ mod tests {
     fn unavailable_store_errors_without_writing() {
         let dir = library();
         let store = MockStore::with_read_error("no Secret Service is running");
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("an unavailable store must not create a key");
         assert!(error.to_string().contains("Secret Service"));
@@ -437,7 +538,7 @@ mod tests {
     fn store_write_failure_errors() {
         let dir = library();
         let store = MockStore::with_write_error("access denied");
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("a failed write must fail");
         assert!(error.to_string().contains("access denied"));
@@ -462,7 +563,7 @@ mod tests {
 
         let dir = library();
         let store = DroppingStore(MockStore::empty());
-        let error = Keys::load_or_create_in(dir.path(), &store)
+        let error = load_in(dir.path(), &store)
             .err()
             .expect("a store that drops the write must fail");
         assert!(error.to_string().contains("did not keep"));
@@ -482,7 +583,7 @@ mod tests {
                 let store = Arc::clone(&store);
                 let path = path.clone();
                 std::thread::spawn(move || {
-                    Keys::load_or_create_in(&path, store.as_ref()).expect("load or create")
+                    load_in(&path, store.as_ref()).expect("load or create")
                 })
             })
             .collect();

@@ -66,8 +66,14 @@ Unlock the keyring and start Tinta again. A new key would make the existing libr
 permanently unreadable.
 
 Two instances started at once do not race: Tinta holds an exclusive lock on
-`key.lock` in the library folder while it reads or creates the key, and after
-writing it reads the stored value back and uses that.
+`key.lock` in the per-user Tinta folder (`~/.local/share/Tinta`, or
+`%APPDATA%\Tinta`) while it reads or creates the key, and after writing it reads
+the stored value back and uses that. There is one key per user, so a key is only
+created when neither that folder nor the configured library folder has data
+(`library.db*`, `meetings/`, or a `config.json` that names a moved library).
+Debug builds accept `TINTA_DEV_MASTER_KEY` (hex) like on macOS, so tests never use
+the real key. The lock has no timeout; on NFS mounted with `nolock` it fails and
+Tinta refuses to start, which is safe.
 
 If the `default` collection alias points at the in-memory `session` collection (a
 minimal setup can do this, and no login keyring is created), the key is written

@@ -50,6 +50,8 @@ export function Home({
 
   const inCall = !!(extension?.meeting_code && extension.last_seen && now - extension.last_seen < 30_000);
   const caps = capabilitiesOf(boot);
+  // The engine can capture a meeting only when it captures an app or the whole system.
+  const canRecordMeetingAudio = caps.capture_app_audio || caps.capture_system_audio;
   const appCall = caps.calls_detection ? calls[0] : undefined;
   const everConnected = !!extension?.connected_at;
   const recording = active ? meetings.find((m) => m.id === active.meeting_id) : undefined;
@@ -120,7 +122,12 @@ export function Home({
               {people(extension?.participants.length ?? 0)} Tell everyone that you record the call.
             </p>
           </div>
-          <RecordButton ready={ready} busy={busy} onClick={() => onRecordCall("com.google.Chrome", callEvent?.id)} />
+          <RecordButton
+            ready={ready}
+            busy={busy}
+            canRecord={canRecordMeetingAudio}
+            onClick={() => onRecordCall("com.google.Chrome", callEvent?.id)}
+          />
         </section>
       ) : appCall ? (
         <section className="hero hero-call">
@@ -135,7 +142,12 @@ export function Home({
               Tell everyone that you record the call.
             </p>
           </div>
-          <RecordButton ready={ready} busy={busy} onClick={() => onRecordCall(appCall.app)} />
+          <RecordButton
+            ready={ready}
+            busy={busy}
+            canRecord={canRecordMeetingAudio}
+            onClick={() => onRecordCall(appCall.app)}
+          />
         </section>
       ) : soon?.link ? (
         <section className="hero hero-call">
@@ -307,9 +319,14 @@ function people(count: number): string {
   return count === 1 ? "1 person in the call." : `${count} people in the call.`;
 }
 
-function RecordButton({ ready, busy, onClick }: { ready: boolean; busy: boolean; onClick: () => void }) {
+function RecordButton({ ready, busy, canRecord, onClick }: { ready: boolean; busy: boolean; canRecord: boolean; onClick: () => void }) {
+  const title = !ready
+    ? "Install the speech models first"
+    : !canRecord
+      ? "This engine cannot capture meeting audio."
+      : "";
   return (
-    <button className="primary big" disabled={!ready || busy} onClick={onClick} title={ready ? "" : "Install the speech models first"}>
+    <button className="primary big" disabled={!ready || busy || !canRecord} onClick={onClick} title={title}>
       {busy ? "Starting…" : "Record this call"}
     </button>
   );

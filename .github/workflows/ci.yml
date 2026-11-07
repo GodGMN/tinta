@@ -56,6 +56,20 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      # FoundationModels exists only in the macOS 26 SDK. The image ships Xcode 26 next to
+      # an older default, so select the newest 26.x before the Swift build.
+      - name: Use Xcode 26
+        run: |
+          echo "Installed Xcode versions:"
+          ls -d /Applications/Xcode_*.app
+          xcode="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$xcode" ]; then
+            echo "::error::No Xcode 26 found in /Applications. The engine needs the macOS 26 SDK to build FoundationModels."
+            exit 1
+          fi
+          echo "Selecting $xcode"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
       - uses: Swatinem/rust-cache@v2
       # The Tauri build script copies the sidecar binaries that the bundle declares.
       - name: Create placeholder sidecars

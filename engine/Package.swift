@@ -1,13 +1,6 @@
 // swift-tools-version: 5.10
 import PackageDescription
 
-// The framework exists only in the macOS 26 SDK, so link it weakly only when the SDK has it.
-#if canImport(FoundationModels)
-let summaryLinkerFlags = ["-Xlinker", "-weak_framework", "-Xlinker", "FoundationModels"]
-#else
-let summaryLinkerFlags: [String] = []
-#endif
-
 let package = Package(
     name: "TintaEngine",
     platforms: [.macOS("14.2")],
@@ -26,7 +19,7 @@ let package = Package(
             dependencies: [.product(name: "FluidAudio", package: "FluidAudio")],
             path: "Sources/TintaEngine",
             // The Apple on-device model exists only on macOS 26 and later. Older systems run without summaries.
-            linkerSettings: [.unsafeFlags(summaryLinkerFlags)]
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-weak_framework", "-Xlinker", "FoundationModels"])]
         )
     ]
 )

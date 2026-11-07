@@ -968,29 +968,57 @@ impl Drop for FinalizeGuard {
 /// the engine stops, so the work runs on its own thread.
 pub fn start_engine(delay: Duration) {
     std::thread::spawn(move || {
-        std::thread::sleep(delay);
-        let state = state();
-        // `ready` also carries the capabilities. A reply without them keeps what `ready` said, because
-        // an engine may report the capabilities only there.
-        let reply = state.engine.call("ping", json!({}), Duration::from_secs(20)).ok();
-        let Some(capabilities) = capabilities_after_ping(reply.as_ref(), state.capabilities()) else {
-            // The engine did not answer, so it is not running. The `engine_exit` of that process
-            // starts the next attempt with the backoff, and this chain ends here: starting the
-            // watchers now would send `calls`, which starts a second engine with no backoff and
-            // doubles the restart chains on every failure.
-            return;
-        };
-        state.set_capabilities(capabilities);
-        state.start_watchers();
+        let mut delay = delay;
+        loop {
+            std::thread::sleep(delay);
+            let state = state();
+            // `ready` also carries the capabilities. A reply without them keeps what `ready` said, because
+            // an engine may report the capabilities only there.
+            let reply = state.engine.call("ping", json!({}), Duration::from_secs(20)).ok();
+            match ping_outcome(reply.as_ref(), state.engine.is_running(), state.capabilities()) {
+                PingOutcome::Ready(capabilities) => {
+                    state.set_capabilities(capabilities);
+                    state.start_watchers();
+                    return;
+                }
+                // The process runs but did not answer: a slow start, or an engine that does not know
+                // `ping`. Retry in this thread with the restart backoff instead of losing the
+                // watchers until the next exit.
+                PingOutcome::Retry => delay = state.next_restart_delay(),
+                // The process is gone. Its `engine_exit` starts the next attempt with the backoff,
+                // and this chain ends here: starting the watchers now would send `calls`, which
+                // starts a second engine with no backoff and doubles the restart chains.
+                PingOutcome::Stop => return,
+            }
+        }
     });
 }
 
-/// The capabilities to use after a `ping` attempt. `None` means that the engine did not answer:
-/// the `engine_exit` of that process schedules the next attempt, so this one stops. `Some` keeps
-/// the current capabilities when the reply has no `capabilities` object.
-fn capabilities_after_ping(reply: Option<&Value>, current: Capabilities) -> Option<Capabilities> {
-    let reply = reply?;
-    Some(if Capabilities::reported(reply) { Capabilities::from_json(reply) } else { current })
+/// What to do after one `ping` attempt.
+#[derive(Debug, PartialEq)]
+enum PingOutcome {
+    /// The engine answered: use these capabilities and start the watchers.
+    Ready(Capabilities),
+    /// The process is still running but did not answer; retry after the restart backoff.
+    Retry,
+    /// The process is gone; its `engine_exit` schedules the next attempt.
+    Stop,
+}
+
+/// The outcome of a `ping` attempt. `reply` is `None` when the call failed, which includes an error
+/// reply and a timeout, so the process state decides: a running process gets another ping, a gone
+/// one leaves the next attempt to `engine_exit`. A reply without a `capabilities` object keeps the
+/// current capabilities, because an engine may report them only in `ready`.
+fn ping_outcome(reply: Option<&Value>, running: bool, current: Capabilities) -> PingOutcome {
+    match reply {
+        Some(reply) => PingOutcome::Ready(if Capabilities::reported(reply) {
+            Capabilities::from_json(reply)
+        } else {
+            current
+        }),
+        None if running => PingOutcome::Retry,
+        None => PingOutcome::Stop,
+    }
 }
 
 /// Sends the call reading setting to the engine and reads the current calls.
@@ -1153,23 +1181,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_ping_ends_the_restart_chain() {
+    fn a_failed_ping_without_a_process_ends_the_restart_chain() {
         let current = Capabilities::default();
-        // No reply: the process is gone and `engine_exit` owns the next attempt.
-        assert_eq!(capabilities_after_ping(None, current), None);
+        // No reply and no process: `engine_exit` owns the next attempt.
+        assert_eq!(ping_outcome(None, false, current), PingOutcome::Stop);
+    }
+
+    #[test]
+    fn a_failed_ping_with_a_running_process_retries() {
+        let current = Capabilities::default();
+        // An error reply or a timeout leaves the process running. The watchers wait for a reply,
+        // and the chain retries instead of ending until the next exit.
+        assert_eq!(ping_outcome(None, true, current), PingOutcome::Retry);
     }
 
     #[test]
     fn a_ping_reply_without_capabilities_keeps_the_current_ones() {
         let current = Capabilities::default();
         let reply = json!({"pong": true});
-        assert_eq!(capabilities_after_ping(Some(&reply), current), Some(current));
+        assert_eq!(ping_outcome(Some(&reply), true, current), PingOutcome::Ready(current));
     }
 
     #[test]
     fn a_ping_reply_with_capabilities_replaces_them() {
         let reply = json!({"pong": true, "capabilities": {"calendar": false}});
-        let capabilities = capabilities_after_ping(Some(&reply), Capabilities::default()).unwrap();
+        let PingOutcome::Ready(capabilities) = ping_outcome(Some(&reply), true, Capabilities::default()) else {
+            panic!("a reply is ready");
+        };
         assert!(!capabilities.calendar);
         assert!(capabilities.summaries);
     }

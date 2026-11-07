@@ -178,6 +178,11 @@ made resumable from the files on disk rather than retried blindly.
   command spawns a fresh process if none is running (`engine.rs:56-66`), and the app
   starts the supported watchers again after its reply. Any other command (bootstrap,
   `start`, ...) also respawns immediately; the backoff delays only the `ping`.
+- A `ping` that fails while the process still runs (an error reply or a timeout) does
+  not end the chain: the app pings again with the same backoff, because no `engine_exit`
+  follows to restart it. Only a reply from a gone process stops this chain, and that
+  process's `engine_exit` schedules the next attempt (`lib.rs start_engine`,
+  `ping_outcome`, `Engine::is_running`).
 - Backoff: first wait 1 s, doubled after each run that lasted less than 60 s, capped at
   60 s; a run of at least 60 s resets the next wait to 1 s
   (`lib.rs:165-169`, `429-436`). A `ready` event records the start of the current run
@@ -364,7 +369,7 @@ engine must still answer them (see [§10.1](#101-capabilities)).
 | result | `{"pong": true, "capabilities": {…}}` (`Engine.swift:85-86`; see [§10.1](#101-capabilities)) |
 | errors | none |
 | events | none |
-| notes | The app calls it on every engine start, including the restart after an exit: `ping` starts the process without side effects and carries the capabilities, and the app then starts the watchers that the engine supports (`lib.rs start_engine`). A second engine should keep it free of side effects and fast. |
+| notes | The app calls it on every engine start, including the restart after an exit: `ping` starts the process without side effects and carries the capabilities, and the app then starts the watchers that the engine supports (`lib.rs start_engine`). A failed `ping` retries with the restart backoff while the process still runs; only an exit ends the chain. A second engine should keep it free of side effects and fast. |
 
 ### 3.2 `models_status`
 

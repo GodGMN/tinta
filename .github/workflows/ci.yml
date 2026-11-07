@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # integration/linux is the fork's download-and-test branch. Every job runs
+    # there, including bundle-linux and integration-smoke.
+    branches: [main, integration/linux]
 
 permissions:
   contents: read
@@ -130,6 +132,81 @@ jobs:
             target/release/bundle/deb/*.deb
             target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
+
+  integration-smoke:
+    # Installs the .deb in a clean Ubuntu 24.04 container and runs the two things
+    # that need a real session: the engine protocol end to end (ping, model
+    # install, import, finalize) and a tinta-core test that creates the library
+    # key through the Secret Service. The container has no display, so this does
+    # not start the app: the bundle itself is checked by `bundle-linux`.
+    needs: bundle-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tinta-linux-x86_64
+          path: bundle
+      # The models are ~600 MB. The key is the pinned manifest, so a changed
+      # model set downloads once and every later run restores the cache.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.tinta-models
+          key: tinta-models-${{ hashFiles('crates/tinta-engine-rs/assets/models.json') }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tinta-core test binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev
+          cargo test --locked -p tinta-core --lib --no-run
+          binary="$(find target/debug/deps -maxdepth 1 -type f -executable -name 'tinta_core-*' | head -n 1)"
+          test -n "$binary"
+          echo "TINTA_CORE_TEST=$PWD/$binary" >> "$GITHUB_ENV"
+      - name: Install the .deb and run the session smoke test
+        env:
+          TINTA_ENGINE_MODELS_DIR: ${{ github.workspace }}/.tinta-models
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -w "$GITHUB_WORKSPACE" \
+            -e GITHUB_WORKSPACE -e TINTA_CORE_TEST -e TINTA_ENGINE_MODELS_DIR \
+            ubuntu:24.04 bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              # dbus-run-session and gnome-keyring provide the Secret Service; the
+              # speech clip is generated, so no large fixture is committed.
+              apt-get install -y -qq --no-install-recommends \
+                gnome-keyring dbus dbus-x11 libsecret-tools espeak-ng ffmpeg \
+                python3 ca-certificates
+              deb="$(find bundle -name "*.deb" -print -quit)"
+              test -n "$deb"
+              apt-get install -y -qq --no-install-recommends "$deb"
+              for binary in /usr/bin/tinta /usr/bin/tinta-engine /usr/bin/tinta-mcp \
+                /usr/bin/tinta-native-host; do
+                test -x "$binary"
+              done
+
+              work="$(mktemp -d)"
+              export WORK="$work"
+              mkdir -p "$work/runtime"
+              chmod 700 "$work/runtime"
+              export XDG_RUNTIME_DIR="$work/runtime"
+              export XDG_DATA_HOME="$work/data"
+              export TINTA_DATA_DIR="$work/app-data"
+              mkdir -p "$XDG_DATA_HOME" "$TINTA_DATA_DIR"
+
+              espeak-ng -v en-us -s 145 -w "$work/speech.wav" \
+                "Hello. This is the Tinta integration smoke test. The quick brown fox \
+                 jumps over the lazy dog. The transcription should find these words, \
+                 and the diarization should find at least one speaker."
+              ffmpeg -y -loglevel error -i "$work/speech.wav" -ar 16000 -ac 1 \
+                "$work/speech-16k.wav"
+
+              export CLIP="$work/speech-16k.wav"
+              dbus-run-session -- bash scripts/fork/integration-session.sh
+            '
 
   app-macos:
     # The Intel image for the same capacity reason as `core-macos`. This compiles the macOS

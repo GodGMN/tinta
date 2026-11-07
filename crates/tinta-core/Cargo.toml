@@ -6,11 +6,18 @@ license.workspace = true
 # std::fs::File::lock (key.lock) needs Rust 1.89.
 rust-version = "1.89"
 
+[features]
+# The app and the helper binaries need the SQLCipher database. The Rust engine
+# only links the audio chunks, and leaving the database out keeps SQLCipher and
+# its system OpenSSL out of the engine build on Windows.
+default = ["database"]
+database = ["dep:rusqlite"]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 uuid.workspace = true
 hkdf = "0.12"
 sha2 = "0.10"

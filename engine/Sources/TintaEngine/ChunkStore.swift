@@ -10,6 +10,17 @@ enum ChunkFormat {
     static let sampleRate = 16_000
     static let magic = Data("TNTC".utf8)
     static let chunkSamples = 5 * sampleRate
+
+    /// The 16-byte header in front of the AES-GCM combined box. The fixture
+    /// scripts compile this file, so they write the same header as the engine.
+    static func header(startSample: Int64, sampleCount: Int) -> Data {
+        var file = magic
+        var start = startSample.littleEndian
+        var count = UInt32(sampleCount).littleEndian
+        file.append(Data(bytes: &start, count: 8))
+        file.append(Data(bytes: &count, count: 4))
+        return file
+    }
 }
 
 enum Track: String, CaseIterable {
@@ -74,11 +85,7 @@ final class ChunkWriter: @unchecked Sendable {
         do {
             let sealed = try AES.GCM.seal(pcm, using: key)
             guard let combined = sealed.combined else { throw EngineError("seal failed") }
-            var file = ChunkFormat.magic
-            var start = bufferStart.littleEndian
-            var count = UInt32(buffer.count).littleEndian
-            file.append(Data(bytes: &start, count: 8))
-            file.append(Data(bytes: &count, count: 4))
+            var file = ChunkFormat.header(startSample: bufferStart, sampleCount: buffer.count)
             file.append(combined)
             let name = String(format: "%08d.tntc", fileCounter)
             let tmp = directory.appendingPathComponent(name + ".part")

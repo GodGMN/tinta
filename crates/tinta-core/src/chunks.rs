@@ -164,9 +164,9 @@ impl ChunkWriter {
     }
 }
 
-/// Decrypts every `*.tntc` file of a track. A missing track directory is an empty
-/// track. The sample count in the header is ignored, exactly as `ChunkReader.chunks`.
-pub fn read_chunks(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<Vec<Chunk>> {
+/// The `*.tntc` files of a track, sorted by name. A missing track directory has
+/// no chunks.
+fn chunk_names(meeting_dir: &Path, track: Track) -> Result<Vec<(String, PathBuf)>> {
     let directory = track.directory(meeting_dir);
     if !directory.exists() {
         return Ok(Vec::new());
@@ -182,7 +182,13 @@ pub fn read_chunks(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<V
         }
     }
     names.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(names)
+}
 
+/// Decrypts every `*.tntc` file of a track. A missing track directory is an empty
+/// track. The sample count in the header is ignored, exactly as `ChunkReader.chunks`.
+pub fn read_chunks(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<Vec<Chunk>> {
+    let names = chunk_names(meeting_dir, track)?;
     let mut chunks = Vec::with_capacity(names.len());
     for (name, path) in names {
         let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -192,36 +198,53 @@ pub fn read_chunks(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<V
 }
 
 /// Reads a whole track on the meeting clock, filling every gap with silence.
+///
+/// Chunks are decrypted and copied one at a time, so the f32 track is the only
+/// large allocation: the i16 plaintext of a single 5 s chunk is freed before the
+/// next file is read. At the 12 h cap that is 2.8 GB per track instead of 2.8 GB
+/// plus 1.4 GB of decrypted chunks.
 pub fn read_track(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<Vec<f32>> {
-    let chunks = read_chunks(meeting_dir, key, track)?;
-    let end = chunks
-        .iter()
-        .map(|chunk| chunk.start + chunk.samples.len() as i64)
-        .max()
-        .unwrap_or(0);
-    if end <= 0 {
-        return Ok(Vec::new());
+    let names = chunk_names(meeting_dir, track)?;
+    // Size the output once from the headers, so a 12 h track is not reallocated (and briefly
+    // doubled) while it grows. The header is unauthenticated, so the size is only a hint:
+    // it is capped, and the loop below still resizes if a chunk ends later.
+    let mut hint = 0i64;
+    for (_, path) in &names {
+        let mut header = [0u8; HEADER_LEN];
+        if fs::File::open(path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header)).is_ok() {
+            let start = i64::from_le_bytes(header[4..12].try_into().unwrap());
+            let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as i64;
+            hint = hint.max(start.saturating_add(count));
+        }
     }
-    // The header is not authenticated: a corrupted start must not allocate gigabytes.
-    if end > MAX_TRACK_SAMPLES {
-        bail!("track is longer than 12 hours ({end} samples); a chunk header is corrupt");
-    }
-    let mut output = vec![0.0f32; end as usize];
-    for chunk in chunks {
+    let mut output: Vec<f32> = Vec::with_capacity(hint.clamp(0, MAX_TRACK_SAMPLES) as usize);
+    for (name, path) in names {
+        let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let chunk = open_chunk(&name, &bytes, key)?;
+        // The header is not authenticated: a corrupted start must not allocate gigabytes.
+        let end = chunk.start.saturating_add(chunk.samples.len() as i64);
+        if end > MAX_TRACK_SAMPLES {
+            bail!("track is longer than 12 hours ({end} samples); a chunk header is corrupt");
+        }
+        if chunk.start >= 0 && (chunk.start as usize) > output.len() {
+            output.resize(chunk.start as usize, 0.0);
+        }
         for (index, &sample) in chunk.samples.iter().enumerate() {
-            let position = chunk.start + index as i64;
+            let position = chunk.start.saturating_add(index as i64);
             if let Ok(position) = usize::try_from(position) {
-                if let Some(slot) = output.get_mut(position) {
-                    *slot = i16_to_f32(sample);
+                if position >= output.len() {
+                    output.resize(position + 1, 0.0);
                 }
+                output[position] = i16_to_f32(sample);
             }
         }
     }
     Ok(output)
 }
 
-/// The longest track `read_track` accepts: 12 hours at 16 kHz.
-const MAX_TRACK_SAMPLES: i64 = 16_000 * 60 * 60 * 12;
+/// The longest track the engine accepts: 12 hours at 16 kHz. `read_track`
+/// rejects a longer one and `import_audio` stops at the same limit.
+pub const MAX_TRACK_SAMPLES: i64 = SAMPLE_RATE as i64 * 60 * 60 * 12;
 
 /// Converts a float sample to the stored 16-bit PCM value, clamping to `[-1, 1]`.
 /// NaN becomes 0 here (Rust's saturating cast); Swift stores 32767. Both are noise.

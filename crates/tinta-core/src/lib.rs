@@ -3,8 +3,11 @@
 pub mod calendar;
 pub mod chunks;
 pub mod capabilities;
+#[cfg(feature = "database")]
 pub mod db;
+#[cfg(feature = "database")]
 pub mod export;
+#[cfg(feature = "database")]
 pub mod granola;
 pub mod keys;
 pub mod naming;
@@ -12,7 +15,9 @@ pub mod paths;
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod protocol;
+#[cfg(feature = "database")]
 pub mod tools;
+#[cfg(feature = "database")]
 pub mod transcript;
 
 pub fn now_ms() -> i64 {

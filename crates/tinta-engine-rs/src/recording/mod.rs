@@ -105,21 +105,37 @@ impl RecordingSession {
 
         let mut workers = Vec::new();
         for (track, source) in [(Track::Mic, mic), (Track::Remote, remote)] {
-            let shared = shared.clone();
-            workers.push(
-                thread::Builder::new()
-                    .name(format!("capture-{}", track.dir_name()))
-                    .spawn(move || run_capture(shared, track, source))
-                    .context("cannot start the capture thread")?,
-            );
+            let thread_shared = shared.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("capture-{}", track.dir_name()))
+                .spawn(move || run_capture(thread_shared, track, source));
+            match spawned {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    shared.stop.store(true, Ordering::SeqCst);
+                    for worker in workers.drain(..) {
+                        let _ = worker.join();
+                    }
+                    return Err(
+                        anyhow::Error::new(error).context("cannot start the capture thread")
+                    );
+                }
+            }
         }
         let levels = shared.clone();
-        workers.push(
-            thread::Builder::new()
-                .name("levels".to_string())
-                .spawn(move || run_levels(levels))
-                .context("cannot start the levels thread")?,
-        );
+        match thread::Builder::new()
+            .name("levels".to_string())
+            .spawn(move || run_levels(levels))
+        {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                shared.stop.store(true, Ordering::SeqCst);
+                for worker in workers.drain(..) {
+                    let _ = worker.join();
+                }
+                return Err(anyhow::Error::new(error).context("cannot start the levels thread"));
+            }
+        }
 
         Ok(Self {
             shared,

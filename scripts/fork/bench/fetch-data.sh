@@ -9,7 +9,7 @@
 # Only dev is used to tune the clustering threshold; test is held out.
 set -euo pipefail
 
-ROOT="${ROOT:-/home/sergio/code/evidence/tinta-fork/2}"
+ROOT="${ROOT:?export ROOT to the task-2 evidence directory}"
 BENCH="$(cd "$(dirname "$0")" && pwd)"
 PY="${PY:-$ROOT/venv/bin/python}"
 [ -x "$PY" ] || PY=python3
@@ -124,7 +124,8 @@ fi
 #    single-headset condition the Open ASR Leaderboard and the Parakeet v3 model
 #    card use (11.31% WER). Public, no token. The revision is pinned; the LFS oid
 #    of each parquet file is its SHA-256, checked here again.
-BASE19="${BASE19:-/home/sergio/code/evidence/tinta-fork/19}"
+BASE19="${BASE19:-${ROOT19:-}}"
+[ -n "$BASE19" ] || { echo "export BASE19 or ROOT19 to the task-19 evidence directory" >&2; exit 1; }
 AMI_REV="46f28f2503e2ec48f8867a84eef356c70476beab"
 IHM_BASE="https://huggingface.co/datasets/edinburghcstr/ami/resolve/$AMI_REV/ihm"
 mkdir -p "$BASE19/data/ihm-test"

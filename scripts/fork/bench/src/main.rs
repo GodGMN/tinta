@@ -19,16 +19,17 @@
 //! Leaderboard condition.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, BufWriter};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
     OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
     OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
-    SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector, Wave,
+    SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector,
+    Wave,
 };
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::io::{BufRead, BufReader, BufWriter};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::Instant;
@@ -141,12 +142,7 @@ fn ms_since(t: Instant) -> f64 {
 fn affinity_ids() -> Vec<usize> {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &mut set,
-        ) != 0
-        {
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
             return Vec::new();
         }
         (0..libc::CPU_SETSIZE as usize)
@@ -463,11 +459,19 @@ fn vad_segments(
         }
         vad.pop();
     }
-    let speech_s: f64 = segs.iter().map(|(a, b)| (b - a) as f64 / SAMPLE_RATE as f64).sum();
+    let speech_s: f64 = segs
+        .iter()
+        .map(|(a, b)| (b - a) as f64 / SAMPLE_RATE as f64)
+        .sum();
     let seg_count = segs.len();
     let ranges: Vec<Value> = segs
         .iter()
-        .map(|(a, b)| json!([*a as f64 / SAMPLE_RATE as f64, *b as f64 / SAMPLE_RATE as f64]))
+        .map(|(a, b)| {
+            json!([
+                *a as f64 / SAMPLE_RATE as f64,
+                *b as f64 / SAMPLE_RATE as f64
+            ])
+        })
         .collect();
     (
         segs,
@@ -613,7 +617,8 @@ fn run_asr_stage(cfg: &AsrStage) -> Value {
     let mut vad_seconds = 0.0;
     if let Some(vad_model) = cfg.vad_model {
         let t = Instant::now();
-        let (segs, _load_ms, info) = vad_segments(cfg.samples, vad_model, 1, cfg.provider, cfg.vad_threshold);
+        let (segs, _load_ms, info) =
+            vad_segments(cfg.samples, vad_model, 1, cfg.provider, cfg.vad_threshold);
         pieces = group_vad_pieces(cfg.samples, &segs, cfg.samples.len(), VAD_PIECE_SECONDS);
         vad_seconds = t.elapsed().as_secs_f64();
         vad_json = info;
@@ -639,8 +644,8 @@ fn run_asr_stage(cfg: &AsrStage) -> Value {
     let load_cold = ms_since(t);
 
     let t = Instant::now();
-    let rec2 = build_recognizer(cfg.models, cfg.threads, cfg.provider)
-        .expect("create recognizer (warm)");
+    let rec2 =
+        build_recognizer(cfg.models, cfg.threads, cfg.provider).expect("create recognizer (warm)");
     let load_warm = ms_since(t);
     drop(rec);
     drop(rec2);
@@ -749,12 +754,42 @@ fn run_batch(args: &Args) {
     if let Some(dir) = Path::new(&out_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut out = BufWriter::new(File::create(&out_path).expect("create output"));
+    // Resume: keep the rows already written and append the missing ones. A
+    // crash in the middle of a write leaves a partial last line; drop it so the
+    // next JSONL line starts clean. The id set is read from the file itself, so
+    // the manifest order does not matter and re-running is always safe.
+    let done: HashSet<String> = if Path::new(&out_path).exists() {
+        let bytes = std::fs::read(&out_path).unwrap_or_default();
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            match bytes.iter().rposition(|b| *b == b'\n') {
+                Some(pos) => {
+                    std::fs::write(&out_path, &bytes[..=pos]).expect("truncate partial row")
+                }
+                None => std::fs::write(&out_path, b"").expect("truncate partial row"),
+            }
+        }
+        let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|v| v.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut out = BufWriter::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)
+            .expect("open output"),
+    );
+    eprintln!("batch: {} rows already in {out_path}", done.len());
 
     let cpu_start = cpu_seconds();
     let t_all = Instant::now();
     let mut cached: Option<(String, Vec<f32>)> = None;
     let mut rows = 0usize;
+    let mut skipped = 0usize;
     let mut audio_s = 0.0f64;
     for line in BufReader::new(file).lines() {
         let line = line.expect("read manifest line");
@@ -764,6 +799,10 @@ fn run_batch(args: &Args) {
         let cols: Vec<&str> = line.split('\t').collect();
         assert!(cols.len() >= 2, "bad manifest line: {line}");
         let id = cols[0];
+        if done.contains(id) {
+            skipped += 1;
+            continue;
+        }
         let wav_path = cols[1];
         let (start_s, end_s) = if cols.len() >= 4 && !cols[2].is_empty() && !cols[3].is_empty() {
             (
@@ -780,7 +819,9 @@ fn run_batch(args: &Args) {
         }
         let samples = &cached.as_ref().expect("cached wav").1;
         let a = ((start_s * SAMPLE_RATE as f64) as usize).min(samples.len());
-        let b = ((end_s * SAMPLE_RATE as f64) as usize).min(samples.len()).max(a);
+        let b = ((end_s * SAMPLE_RATE as f64) as usize)
+            .min(samples.len())
+            .max(a);
         assert!(b > a, "empty span for {id}");
         let piece_s = (b - a) as f64 / SAMPLE_RATE as f64;
         audio_s += piece_s;
@@ -812,12 +853,13 @@ fn run_batch(args: &Args) {
     out.flush().expect("flush output");
     let wall = t_all.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu_start;
+    let rtf = if audio_s > 0.0 { wall / audio_s } else { 0.0 };
     eprintln!(
-        "batch: {rows} rows, {:.2} min audio, {:.1} min wall, {:.0} CPU-s, RTF {:.3}, peak RSS {:.0} MB -> {out_path}",
+        "batch: {rows} new rows, {skipped} skipped, {:.2} min audio, {:.1} min wall, {:.0} CPU-s, RTF {:.3}, peak RSS {:.0} MB -> {out_path}",
         audio_s / 60.0,
         wall / 60.0,
         cpu,
-        wall / audio_s.max(1e-9),
+        rtf,
         peak_rss_mb()
     );
     if let Some(path) = provider_conf {
@@ -879,8 +921,7 @@ fn run_diar_stage(cfg: &DiarStage) -> Value {
     let process_seconds = t.elapsed().as_secs_f64();
     let cpu_end = cpu_seconds();
     let segs = result.sort_by_start_time();
-    let segments: Vec<(f32, f32, i32)> =
-        segs.iter().map(|s| (s.start, s.end, s.speaker)).collect();
+    let segments: Vec<(f32, f32, i32)> = segs.iter().map(|s| (s.start, s.end, s.speaker)).collect();
     json!({
         "seg_model": cfg.seg_model,
         "embedding_model": cfg.embedding,
@@ -967,11 +1008,10 @@ fn main() {
     let out_path = args.req("output");
     let machine = machine_info();
     let logical = machine["logical_cpus"].as_u64().unwrap_or(1) as i32;
-    let physical = (machine["physical_cores"].as_u64().unwrap_or(logical as u64) as i32).min(logical);
-    let usable = (machine["usable_cpus"]
-        .as_u64()
-        .unwrap_or(physical as u64) as i32)
-        .clamp(1, physical);
+    let physical =
+        (machine["physical_cores"].as_u64().unwrap_or(logical as u64) as i32).min(logical);
+    let usable =
+        (machine["usable_cpus"].as_u64().unwrap_or(physical as u64) as i32).clamp(1, physical);
 
     // Defaults scale with the CPUs the process actually gets: ASR gets half of
     // them, capped at 4; diarization gets 2-4.
@@ -991,7 +1031,13 @@ fn main() {
     let process_start = Instant::now();
     if args.cmd == "vad" {
         let model = args.req("vad-model");
-        let (segs, _load, info) = vad_segments(samples, &model, asr_threads, &provider, args.f32_or("vad-threshold", 0.5));
+        let (segs, _load, info) = vad_segments(
+            samples,
+            &model,
+            asr_threads,
+            &provider,
+            args.f32_or("vad-threshold", 0.5),
+        );
         let pieces = group_vad_pieces(samples, &segs, samples.len(), VAD_PIECE_SECONDS);
         let out = json!({
             "command": "vad",
@@ -1005,10 +1051,15 @@ fn main() {
             "peak_rss_mb": peak_rss_mb(),
             "loadavg_end": loadavg(),
         });
-        if let Some(dir) = Path::new(&out_path).parent() { let _ = std::fs::create_dir_all(dir); }
+        if let Some(dir) = Path::new(&out_path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let mut f = File::create(&out_path).expect("create output");
-        f.write_all(serde_json::to_string_pretty(&out).unwrap().as_bytes()).expect("write output");
-        if let Some(path) = provider_conf { let _ = std::fs::remove_file(path); }
+        f.write_all(serde_json::to_string_pretty(&out).unwrap().as_bytes())
+            .expect("write output");
+        if let Some(path) = provider_conf {
+            let _ = std::fs::remove_file(path);
+        }
         return;
     }
     let cpu_start = cpu_seconds();

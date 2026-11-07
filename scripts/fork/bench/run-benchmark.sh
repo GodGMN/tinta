@@ -6,7 +6,15 @@
 # rapidfuzz pyannote.metrics whisper-normalizer, ffmpeg, GNU time.
 #
 # Meetings follow the official AMI full-corpus partition. Only DEV is used to
-# tune clustering; TEST is scored with the frozen setting.
+# tune clustering; TEST is scored with the frozen setting. TS3007b and ES2003b
+# are TEST/DEV here but TRAIN meetings in BUT's AMI-diarization-setup, which is
+# the split pyannote uses; the document says so, and the engine acceptance list
+# (ES2004*, IS1009*, TS3003*, EN2002*) avoids them.
+#
+# Timing note: the published ASR rows used 8 threads, which oversubscribed the
+# host's 6-CPU cgroup quota. This script defaults to 4: it reproduces the WER
+# and the 4-vs-4 spin table, but not the published wall times of the 8-thread
+# rows. Keep THREADS at or below `nproc` and the cgroup quota.
 set -euo pipefail
 
 ROOT="${ROOT:-/home/sergio/code/evidence/tinta-fork/2}"
@@ -25,8 +33,9 @@ SEG_MODEL="$ROOT/models/sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx"
 EMB_MODEL="$ROOT/models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 VAD_MODEL="$ROOT/models/silero_vad.onnx"
 
-THREADS="${THREADS:-8}"
+THREADS="${THREADS:-4}"
 DIAR_THREADS="${DIAR_THREADS:-4}"
+SPIN_THREADS="${SPIN_THREADS:-4}"  # the spin table compares 4 default vs 4 spin 0
 THRESHOLDS="${THRESHOLDS:-0.7 0.9 1.0 1.1}"
 FILTER="${FILTER:-0.02}"
 ALLOW_BUSY="${ALLOW_BUSY:-0}"
@@ -175,7 +184,7 @@ check_idle
   --vad-model "$VAD_MODEL" \
   --encoder "$ASR_MODEL/encoder.int8.onnx" --decoder "$ASR_MODEL/decoder.int8.onnx" \
   --joiner "$ASR_MODEL/joiner.int8.onnx" --tokens "$ASR_MODEL/tokens.txt" \
-  --threads "$THREADS" --output "$RESULTS/asr-clean5m.json" \
+  --threads "$THREADS" --spin "$SPIN" --output "$RESULTS/asr-clean5m.json" \
   2> "$ROOT/logs/asr-clean5m.time"
 "$PY" "$BENCH/score.py" score --ref "$ROOT/data/ES2002a.clean5m.ref.json" \
   --result "$RESULTS/asr-clean5m.json" --out "$RESULTS/score-asr-clean5m.json" >/dev/null
@@ -184,12 +193,16 @@ check_idle
   --vad-model "$VAD_MODEL" \
   --encoder "$ASR_MODEL/encoder.int8.onnx" --decoder "$ASR_MODEL/decoder.int8.onnx" \
   --joiner "$ASR_MODEL/joiner.int8.onnx" --tokens "$ASR_MODEL/tokens.txt" \
-  --threads "$THREADS" --output "$RESULTS/asr-librispeech30.json" \
+  --threads "$THREADS" --spin "$SPIN" --output "$RESULTS/asr-librispeech30.json" \
   2> "$ROOT/logs/asr-librispeech30.time"
 "$PY" "$BENCH/score.py" score --ref "$ROOT/data/librispeech_testclean_30.ref.json" \
   --result "$RESULTS/asr-librispeech30.json" --out "$RESULTS/score-asr-librispeech30.json" >/dev/null
 
-# 6. Threads and ONNX Runtime spin ablation on the 6 min slice.
+# 6. Threads and ONNX Runtime spin ablation on the 6 min slice. The first loop
+#    runs both stages with ORT's default spinning at 1, 2 and 4 threads; the
+#    second runs them at SPIN_THREADS (4 by default) with spinning off, so the
+#    document's table is a 4-vs-4 comparison. Keep SPIN_THREADS in 1 2 4 so the
+#    default-spin side exists.
 for t in 1 2 4; do
   check_idle
   "$TIMEBIN" -v "$BIN" asr --wav "$ROOT/data/ES2002a.sample6m.wav" \
@@ -213,14 +226,14 @@ for stage in asr diar; do
       --vad-model "$VAD_MODEL" \
       --encoder "$ASR_MODEL/encoder.int8.onnx" --decoder "$ASR_MODEL/decoder.int8.onnx" \
       --joiner "$ASR_MODEL/joiner.int8.onnx" --tokens "$ASR_MODEL/tokens.txt" \
-      --threads "$THREADS" --spin 0 --output "$RESULTS/slice-asr-t$THREADS-spin0.json" \
-      2> "$ROOT/logs/slice-asr-t$THREADS-spin0.time"
+      --threads "$SPIN_THREADS" --spin 0 --output "$RESULTS/slice-asr-t$SPIN_THREADS-spin0.json" \
+      2> "$ROOT/logs/slice-asr-t$SPIN_THREADS-spin0.time"
   else
     "$TIMEBIN" -v "$BIN" diarize --wav "$ROOT/data/ES2002a.sample6m.wav" \
       --seg-model "$SEG_MODEL" --embedding "$EMB_MODEL" \
-      --threads "$THREADS" --threshold 1.0 --window-shift 0.2 --spin 0 \
-      --output "$RESULTS/slice-diar-t$THREADS-spin0.json" \
-      2> "$ROOT/logs/slice-diar-t$THREADS-spin0.time"
+      --threads "$SPIN_THREADS" --threshold 1.0 --window-shift 0.2 --spin 0 \
+      --output "$RESULTS/slice-diar-t$SPIN_THREADS-spin0.json" \
+      2> "$ROOT/logs/slice-diar-t$SPIN_THREADS-spin0.time"
   fi
 done
 
@@ -231,6 +244,11 @@ done
 for th in $THRESHOLDS; do diar IS1008b "$DIAR_THREADS" "$th" "$FILTER"; done
 diar ES2003b "$DIAR_THREADS" 1.0 "$FILTER"
 for th in 0.7 0.8 0.9; do diar_slice ES2003b "$DIAR_THREADS" "$th" "$FILTER"; done
+# Aggregate the dev sweep before any test meeting exists in $RESULTS, so the
+# table cannot silently include held-out runs (the document's "tuned on dev"
+# claim depends on this ordering).
+"$PY" "$BENCH/score.py" tune --ref-dir "$ROOT/data" \
+  --results-glob "$RESULTS/diar-*.json" > "$RESULTS/tune-dev.txt"
 CHOSEN_TH="${CHOSEN_TH:-0.7}"
 CHOSEN_F="${CHOSEN_F:-0.02}"
 echo "frozen from dev: threshold=$CHOSEN_TH small-cluster-filter=$CHOSEN_F" | tee "$RESULTS/frozen.txt"
@@ -239,7 +257,9 @@ echo "frozen from dev: threshold=$CHOSEN_TH small-cluster-filter=$CHOSEN_F" | te
 for m in $TEST; do diar "$m" "$DIAR_THREADS" "$CHOSEN_TH" "$CHOSEN_F"; done
 
 # 9. Parallel pipeline: ASR and diarization at the same time, default threads
-#    from the CPUs the process actually gets.
+#    from the CPUs the process actually gets. CHOSEN_TH is the frozen 0.7. The
+#    document's published TS3007b row predates the freeze and ran at 1.0; its
+#    DER is therefore not the pipeline's quality number.
 for m in IN1014 TS3007b; do combined "$m"; done
 
 # 10. Tables.

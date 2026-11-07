@@ -21,57 +21,58 @@ not used for tuning.
 
 ## Verdict
 
-**Pass on memory; pass on speed by projection (the host never went idle); fail on
-meeting WER, DER and speaker counting. The port can proceed on sherpa-onnx, but
-not with this segmenter and a fixed clustering threshold.**
+**Pass on memory. Pass on speed by projection on an idle 8-core machine, but not
+on 4 cores for a full pass. The quality gap is now explained rather than
+unexplained: the remaining WER is AMI mixed-channel difficulty and the DER gap
+is the final cluster merge. The port can proceed on sherpa-onnx.**
 
-The VAD-segmented pipeline removes the 240 s-chunk failure on some meetings but
-not all: Silero VAD misses quiet meeting speech on ES2004b and TS3007b, so long
-gaps remain. On the held-out test meetings the Whisper-normalized WER is
-**27.3-27.4%** on the two full meetings (22.7% on the IS1009b 6 min sample) and
-the no-collar DER with overlap counted is **24.6-29.1%** (mean 27.4%). Peak RSS
-is **2.1 GB**. The measured 1 h ASR critical path was **22.8 min** at a 1-minute
-load average of 22-45; the host never went below 2 during the session, so that
-wall is pessimistic. The same run used 944 CPU-s for 56 min, which projects to
-**3.2-4.4 min per hour at 4 threads** on an idle 8-core machine and **6.4-8.8
-min for ASR alone at 2 threads** on a 4-core machine.
+The held-out test meetings give a Whisper-normalized WER of **27.0-27.1%** on the
+two full meetings (22.5% on the IS1009b 6 min sample) and a no-collar DER with
+overlap counted of **24.6-29.1%** (mean 27.4%). Peak RSS is **2.1 GB**. The
+measured 1 h ASR critical path was **21.2 min** at a 1-minute load average of
+22-45; the host never went idle, so that wall is pessimistic. The same run used
+944 CPU-s. Per *decoded* second the ASR costs **0.16 CPU-s idle to 0.21 CPU-s
+loaded**, and a dense meeting decodes about **1.1x** its audio, which projects to
+**4-6 min per audio hour on an idle 8-core machine** and **about 6-7 min of ASR
+on 4 cores**. A full single pass on 4 cores is **10-11 min**, i.e. over the bar.
 
 | Bar | Result | Verdict |
 |---|---|---|
-| 1 h meeting in <= 10 min on CPU | 22.8 min measured at load 22-45; projection 3.2-4.4 min at 4 threads on an idle 8-core | **pass by projection, not demonstrated** |
+| 1 h meeting in <= 10 min on CPU | 21.2 min measured at load 22-45; projection 4-6 min at 4 threads on an idle 8-core | **pass by projection, not demonstrated** |
 | 16 GB RAM | 2.1 GB peak | pass |
 | Parakeet v3 2-5% WER on clean speech | 4.1% on LibriSpeech test-clean | pass |
-| WER on real meetings (AMI mix) | 27.3-27.4% full, 22.7% 6 min sample; ~22-24% without overlap | **fail** against the remembered ~11% published AMI figure |
-| pyannote 3.1-level DER on AMI | 24.6-29.1% no collar, overlap counted, held-out (collar 0.25: 20.8-25.7%) | **worse than the ~18.8% remembered reference** |
+| WER on real meetings (AMI mix) | 27.0-27.1% full, 22.5% 6 min sample; 22-24% without overlap | **expected for this channel**; not comparable to the remembered ~11% IHM figure |
+| pyannote 3.1-level DER on AMI | 24.6-29.1% no collar, overlap counted, held-out (collar 0.25: 20.8-25.7%) | **worse than the remembered ~18.8%, but the front end is not the cause** |
 | Speaker count | 30/35/33 raw, 6/5/5 after the 2% filter (4 reference) | **fail**; a global threshold cannot fix it, user override needed |
 
-The AMI mix channel contains 10-25% overlapped reference words (40% on TS3006b)
-that a single-stream ASR cannot recover, plus spontaneous disfluencies. The
-clean read-speech result stays inside the published 2-5% band. The meeting WER is
-therefore not evidence of a broken model, but it is also not a clean-speech
-number.
+Three findings decide the engineering:
 
-Two findings decide the engineering:
-
-1. **Never feed Parakeet an arbitrary long window.** A 240 s input drops whole
-   stretches in the middle (IN1014: 1,947 deletions, 163 s of gaps with 254
-   reference words). VAD pieces of 10-30 s with a 2 s pre-roll remove that failure
-   on IS1009b, but the segmenter's own recall becomes the limit on ES2004b and
-   TS3007b. A piece that starts mid-speech with no context can also return *zero*
-   words (a 20 s piece at 155.3 s on ES2002a did), while the same audio with 1 s of
-   pre-roll returned 39 words.
-2. **Set ONNX Runtime's intra-op spinning off and run the stages concurrently.**
-   `SessionConfig.session.intra_op.allow_spinning=0` (passed through sherpa-onnx's
-   provider config file) cut the 6 min slice from 317.9 to
-   78.4 CPU-s and from 759.9 to 93.9 wall
-   on the same 4 threads. Diarization then fits under the ASR wall.
+1. **The VAD is not losing speech.** 99.6% (ES2004b) and 99.9% (TS3007b) of the
+   reference words have their midpoint inside a decoded piece; against the raw
+   VAD regions alone the figure is 94.1% and 95.6%, and the 2 s pre-roll, 1 s
+   post-roll and 10 s minimum recover the rest. The deletions are Parakeet on
+   the mixed channel: in overlap regions the hypothesis has only 0.30-0.35 words
+   per reference word, and backchannels (`yeah`, `mm-hmm`, `okay`, `uh`) are
+   dropped wholesale. A better segmenter will not close the WER gap.
+2. **The DER gap comes from the final cluster merge.** The clustering finds the
+   four speakers: the top four clusters are 81-91% pure and each maps to one
+   reference speaker. If every raw cluster is mapped to the reference speaker it
+   overlaps most, the over-clustered output scores **13.8-16.6% DER** against
+   pyannote's word-level reference. The pipeline loses 8-14 points when it
+   collapses 30-35 clusters into 4, not in segmentation or embeddings.
+3. **Never feed Parakeet an arbitrary long window.** A 240 s input drops whole
+   stretches in the middle (IN1014: 1,839 deletions, 163 s of gaps with 254
+   reference words). VAD pieces of 10-30 s with a 2 s pre-roll remove that
+   failure. Separately, `SessionConfig.session.intra_op.allow_spinning=0` cut the
+   6 min ASR slice from 317.9 to 78.4 CPU-s and from 759.9 to 93.9 s wall on the
+   same 4 threads; diarization then fits under the ASR wall.
 
 ## Machine
 
 | | |
 |---|---|
-| CPU | AMD Ryzen 7 5825U, 8 logical CPUs (KVM guest), 1 thread per core |
-| CPUs available to the process | 7 (`sched_getaffinity` mask 1-7); 7 physical cores |
+| CPU | AMD Ryzen 7 5825U, 8 logical CPUs exposed (KVM guest), 1 thread per core |
+| CPUs available to the process | **6**: affinity mask 1-7 (7 logical), cgroup v2 `cpu.max` `600000 100000` (6), `available_parallelism` 6 |
 | RAM | 22 GiB (the bar is 16 GB) |
 | OS | Debian 12, kernel 6.1.0-54-amd64 |
 | Toolchain | Rust 1.100 (nightly), sherpa-onnx crate 2.0.1, static build |
@@ -81,8 +82,17 @@ The host is a shared development VM. Other agents' builds kept the 1-minute load
 average between 5 and 66 on 8 CPUs; it never dropped below 2,
 so no timing run in this document is clean. Every result JSON records
 `loadavg_start`/`loadavg_end` and GNU time records user CPU seconds. Wall times
-are pessimistic; CPU seconds per audio second and the critical-path projection
+are pessimistic; CPU seconds per decoded second and the critical-path projection
 are the stable numbers.
+
+The first version of this document reported seven CPUs available. That was the
+affinity mask. The process's own cgroup (`user-1000.slice`) has a 6-CPU quota,
+and the harness missed it because it read `/sys/fs/cgroup/cpu.max`, which is the
+root cgroup and does not exist here. `cgroup_cpus()` now reads the process's own
+path from `/proc/self/cgroup` and walks up to the root, taking the smallest
+`cpu.max`. The 8-thread ASR test runs therefore oversubscribed a 6-CPU quota;
+the defaults (3 ASR + 3 diarization) did not. Inside a VM, `core_id` reflects the
+hypervisor's topology, not the physical one, so it is only a fallback.
 
 ## Data
 
@@ -95,6 +105,12 @@ partition (the same one lhotse and the AMI site publish):
 | train | ES2002a, IS1000a, IN1014 (context only) |
 | dev (tuning) | ES2003b, IS1008b (TS3006b was started but not needed) |
 | test (held out) | ES2004b, IS1009b, TS3007b |
+
+This is not the split pyannote uses. In BUT's `AMI-diarization-setup`,
+**TS3007b and ES2003b are training meetings**, so pyannote segmentation 3.0 saw
+them during training. That makes any pyannote figure on TS3007b optimistic and
+ES2003b a weak dev meeting. The engine acceptance list in the design conditions
+uses BUT's test meetings instead: `ES2004*`, `IS1009*`, `TS3003*`, `EN2002*`.
 
 | Meeting | Split | Audio | Speech end | Speakers | Words | Overlapped words | Character |
 |---|---|---|---|---|---|---|---|
@@ -141,6 +157,10 @@ Full hashes, audio hashes and download URLs are in
   (the upstream release tag is misspelled "recongition"; the URL is correct)
 - <https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx>
 
+The CAMPPlus model is trained on Chinese (`zh-cn_16k-common`). It is the right
+size and licence for the spike, but it is not the last word for English
+meetings; see design condition 6.
+
 Data (~700 MB of wav, 23 MB of annotations) and models (~1.2 GB) live outside
 the repo under `/home/sergio/code/evidence/tinta-fork/2/`. Nothing is committed
 except the harness and this document.
@@ -154,7 +174,11 @@ except the harness and this document.
 - Silero VAD (`threshold` 0.5, `min_silence_duration` 0.3 s,
   `min_speech_duration` 0.1 s, `window_size` 512, `max_speech_duration` 30 s)
   detects speech. Continuous speech is flushed every 20 s so the VAD's circular
-  buffer cannot grow without bound.
+  buffer cannot grow without bound. **That flush is a defect**: it creates 0.83 s
+  holes, larger than the 0.5 s join gap, so a word can fall between two pieces.
+  The engine should use the existing `split_run` quietest-point split instead, or
+  raise the join gap above the flush hole. It is not the main WER gap, but it is
+  free to remove.
 - Speech runs are cut into pieces of at most 30 s at the **quietest 50 ms
   window** in the last 40% of the allowed span, not at an arbitrary boundary.
 - Every piece gets **2 s of pre-roll and 1 s of post-roll**, and a piece is
@@ -198,7 +222,11 @@ except the harness and this document.
   separately, each divided by reference speech time.
 - **WER**: two normalizers. The legacy one (lowercase, strip punctuation, one
   token per word) and Whisper's `EnglishTextNormalizer`, which handles numbers,
-  spellings and fillers. Both report substitutions, insertions and deletions.
+  spellings and fillers. Both map AMI's spelled-out acronyms first: the manual
+  annotation writes `T_V_`, Parakeet writes `TV`, and without the mapping each
+  one costs a substitution plus two deletions (24-54 tokens per meeting). Every
+  WER figure in this document includes the mapping; it moves them by 0.1-1.0
+  points from the pre-mapping draft.
 - **WER without overlap**: reference words fully inside single-speaker regions,
   hypothesis words whose midpoint falls in those regions. Isolates the part of
   the error caused by overlapping speech.
@@ -206,6 +234,9 @@ except the harness and this document.
   the reference has speech. This is the diagnostic for the old chunk failure.
 - **Speaker count**: number of clusters with `num_clusters = -1` (automatic),
   raw and after the small-cluster filter, against the four reference speakers.
+- **Oracle marker**: every raw cluster is mapped to the reference speaker it
+  overlaps most, then DER is scored again. This bounds what a perfect final
+  merge could recover from the existing segmentation and embeddings.
 
 ### Held-out tuning
 
@@ -215,31 +246,62 @@ ES2003b, plus 6 min ES2003b samples for the lower thresholds). The selected
 setting is frozen and then run once on each **test** meeting. The test results in
 this document were not used to choose any value.
 
+Two caveats belong with that claim:
+
+- `logs/diar-{ES2004b,IS1009b}-t4-th{0.9,1.0}.out` show test-meeting runs that
+  started at 00:32 and 00:39, before the freeze at 00:47. No result JSON was
+  written for them, so nothing from them reached the tables, but they were
+  launched. The frozen run is the 0.7 one.
+- ES2003b's low-threshold evidence is a 6 min sample for 0.7-0.9 (the full
+  meeting only at 1.0). A full sweep would be better; it is not needed to
+  justify 0.7, which fails safe by over-clustering.
+
 ## Results
 
 ### ASR on the held-out test meetings
 
 VAD segmentation, greedy transducer decoding, 8 threads for the two standalone
-runs (the quality does not depend on the thread count; 8 was used to get through
-the contended host). The TS3007b row is the combined pipeline at the engine
-defaults (3 ASR + 3 diarization threads), so its wall is the critical path.
+runs. Eight threads oversubscribed the 6-CPU quota (see Machine); the quality
+does not depend on the thread count, and the engine's own default would be 3.
+The TS3007b row is the combined pipeline at the engine defaults (3 ASR + 3
+diarization threads), so its wall is the critical path.
 
 | Meeting | Audio | Threads | ASR wall | RTF | CPU-s / audio-s | WER legacy | WER Whisper | del/ins/sub | WER no-overlap | Long gaps | Peak RSS |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| ES2004b | 39.1 min | 8 | 15:26 | 0.395 | 0.228 | 29.7% | **27.4%** | 1606/46/218 | 22.3% | 431 s / 889 words | 1.9 GB |
-| IS1009b (6 min sample) | 6.0 min | 8 | 3:05 | 0.515 | 0.240 | 24.2% | **22.7%** | 233/10/47 | 12.9% | 7 s / 11 words | 1.7 GB |
-| TS3007b | 55.9 min | 3+3 | 21:13 | 0.379 | — | 28.4% | **27.3%** | 1347/58/305 | 23.7% | 321 s / 485 words | 2.1 GB |
+| ES2004b | 39.1 min | 8 | 15:26 | 0.395 | 0.228 | 29.4% | **27.1%** | 1575/57/207 | 22.1% | 431 s / 889 words | 1.9 GB |
+| IS1009b (6 min sample) | 6.0 min | 8 | 3:05 | 0.515 | 0.240 | 23.9% | **22.5%** | 230/11/45 | 12.6% | 7 s / 11 words | 1.7 GB |
+| TS3007b | 55.9 min | 3+3 | 21:13 | 0.379 | — | 28.1% | **27.0%** | 1296/70/305 | 23.5% | 321 s / 485 words | 2.1 GB |
 
 The full IS1009b ASR run did not finish before the host was needed for the other
-runs; the 6 min sample is reported and marked as such. The two full meetings
-agree: about 27% Whisper-normalized WER on the AMI mix, 22-24% when overlapping
-reference words are removed. This is far above Parakeet's published AMI figure
-remembered as about 11% (IHM short segments, a different channel and
-segmentation), and the long gaps show the VAD still misses quiet meeting speech:
-on ES2004b the Silero VAD marks 547-595 s as silence while a plain 60 s decode of
-530-600 s returns 18 words. Lowering the VAD threshold to 0.2 did not fix it (a
-6 min ES2004b sample: 34.1% vs 33.9% Whisper WER, 132.6 s vs 134.5 s of gaps).
-The ASR deletion failure is therefore **reduced but not solved** by Silero VAD.
+runs; the 6 min sample is reported and marked as such.
+
+The 431 s and 321 s "long gaps" are not silence that the VAD skipped. Re-scoring
+the same outputs against the word-level reference shows **99.6% of ES2004b's
+reference words and 99.9% of TS3007b's inside a decoded piece** (29 and 5 words
+outside, after the pre-roll, post-roll and 10 s minimum). Inside the decoded
+audio the hypothesis has only 0.77-0.80 words per reference word, uniformly
+across speakers (0.81-0.89 per speaker in single-speaker regions), so no quiet
+speaker explains it. The two measured causes are:
+
+- **Overlap.** The hypothesis has 0.35 (ES2004b) and 0.30 (TS3007b) words per
+  reference word in overlapping regions: 65-70% of overlapped words are lost to
+  a single-stream model.
+- **Backchannels and fillers.** `yeah` (-87 on ES2004b, -136 on TS3007b),
+  `mm-hmm`, `okay`, `uh`/`um` are not transcribed. Parakeet has a clean-transcript
+  style, and that is what these numbers measure.
+
+Raising VAD recall (threshold 0.2) changed nothing (a 6 min ES2004b sample: 34.1%
+vs 33.9% Whisper WER, 132.6 s vs 134.5 s of gaps), which is consistent with the
+VAD already covering the speech. A 30 s fixed-chunk ablation on one 90 s clip
+scored 40.2% Whisper WER versus 45.3% for VAD pieces (n = 179 words, one clip);
+the forced 20 s flush may account for part of that, but neither number is a
+reason to drop the VAD.
+
+The remembered Parakeet TDT v3 figure of about 11% is the Open ASR Leaderboard
+condition: AMI **IHM**, reference-segmented short utterances. Mix-channel
+long-form audio with 18-22% overlapped words is a different task, and the
+no-overlap column (22.1-23.5%) is the closest this harness gets to it. There is
+no cheap ASR knob that closes the rest.
 
 ### What the old 240 s chunks did
 
@@ -248,30 +310,38 @@ pipeline; the 240 s rows are the same meetings from `results/asr-*-c240.json`.
 
 | Design | Meeting | WER Whisper | Deletions | Long gaps |
 |---|---|---|---|---|
-| 240 s / 2 s, 8 threads | ES2002a | 25.0% | 463 | 270 s / 48 words |
-| 240 s / 2 s, 8 threads | IS1000a | 41.9% | 993 | 488 s / 542 words |
-| 240 s / 2 s, 8 threads | IN1014 | 24.1% | 1947 | 163 s / 254 words |
-| VAD, 8 threads | ES2004b | 27.4% | 1606 | 431 s / 889 words |
-| VAD, 3+3 threads | TS3007b | 27.3% | 1347 | 321 s / 485 words |
-| VAD, 8 threads | IS1009b, 6 min | 22.7% | 233 | 7 s / 11 words |
+| 240 s / 2 s, 8 threads | ES2002a | 24.5% | 453 | 270 s / 48 words |
+| 240 s / 2 s, 8 threads | IS1000a | 41.8% | 986 | 488 s / 542 words |
+| 240 s / 2 s, 8 threads | IN1014 | 23.1% | 1839 | 163 s / 254 words |
+| VAD, 8 threads | ES2004b | 27.1% | 1575 | 431 s / 889 words |
+| VAD, 3+3 threads | TS3007b | 27.0% | 1296 | 321 s / 485 words |
+| VAD, 8 threads | IS1009b, 6 min | 22.5% | 230 | 7 s / 11 words |
 
-The 240 s windows lose whole mid-chunk stretches; the VAD pieces remove them on
-IS1009b but not on ES2004b and TS3007b, where the segmenter misses speech. The
-lesson is not "shorter is always better": the segmenter's **recall** is the new
-failure mode, and it has to be measured against reference speech.
+The 240 s windows lose whole mid-chunk stretches; VAD pieces at most 22.2 s long
+(observed maximum) do not have that failure, and they bound memory. The lesson is
+about **input length and compute**, not about VAD recall: the pieces contain
+99.6-99.9% of the reference words.
 
 ### Clean speech
 
 | Sample | Audio | WER legacy | WER Whisper | del/ins/sub | RTF |
 |---|---|---|---|---|---|
 | LibriSpeech `test-clean`, 30 utterances | 3.7 min | 4.0% | **4.1%** | 4/4/17 | 0.346 |
-| ES2002a single-speaker regions | 5.0 min | 26.3% | **24.3%** | 125/22/23 | 0.298 |
+| ES2002a single-speaker regions | 5.0 min | 26.1% | **24.1%** | 124/23/21 | 0.298 |
 
-The read-speech result is inside the published 2-5% band, at its top end. The
-single-speaker AMI sample is still 24.3%, and it has 54 s of hypothesis gaps with
-50 reference words: the VAD is dropping quiet spontaneous speech, not just
-overlap. This is the same recall problem as ES2004b.
+The read-speech result is inside the 2-5% band Parakeet publishes (from memory),
+at its top end. The single-speaker AMI sample is still 24.1% because it keeps
+AMI's spontaneous speech: fillers, false starts and backchannels that Parakeet
+does not write. The
+VAD is not the cause here either: with the sample's word times remapped to the
+concatenated audio, **100% of its 705 reference words fall inside a decoded
+piece**. The 54 s of hypothesis gaps are the model's deletions.
 
+An earlier draft of this document said the VAD was dropping quiet speech on this
+sample. That was wrong: `clean-sample` copied the source timestamps into the
+concatenated wav, so the gap diagnostic compared two different timelines. The
+script now shifts each word by the output offset of its region. The WER is
+token-based and was unaffected; the gap and no-overlap figures were.
 
 ### Diarization tuning on dev, then test
 
@@ -304,13 +374,40 @@ that over-segments rather than merging speakers.
 | TS3007b | 0.7 | 30.2% | 25.7% | **29.1%** | 7.0 / 3.0 / 20.2 | 33 / 5 / 4 | 11:10 | 0.111 | 842 MB |
 
 The corrected no-collar DER is **24.6-29.1%**, not the 4-18% the old frame-based
-scorer reported. With the 0.25 s collar it is 20.8-25.7%. For comparison,
-pyannote 3.1 on AMI headset-mix is remembered as about 18.8% no collar with
-overlap scored, and community-1 about 17%; the sherpa-onnx pipeline is therefore
-**worse than the reference on these three held-out meetings**, by roughly 6-11
-points. The raw cluster counts are 30-35 and the 2% filter only brings them to
-5-6, not 4: clustering is over-segmenting and confusion (17-20 points on
-IS1009b/TS3007b) shows speakers being merged as well.
+scorer reported. With the 0.25 s collar it is 20.8-25.7%.
+
+The reference choice explains little. Against BUT's `only_words` RTTMs, the
+reference pyannote uses, the same filtered outputs score 21.5% / 26.8% / 28.0%,
+1-3 points lower. Confusion dominates: 8-20% of reference speech on `only_words`,
+against 3-9% miss and 3-5% false alarm. That is a labelling problem between
+speakers, not missing or invented speech.
+
+The oracle marker shows where it comes from. Each raw cluster was mapped to the
+reference speaker it overlaps most:
+
+| Meeting (th 0.7) | Raw DER | Filtered DER | Oracle DER | Oracle confusion | Speech in top-4 clusters | Largest wrong cluster |
+|---|---|---|---|---|---|---|
+| ES2004b | 22.4% | 21.5% | **16.6%** | 3.2% | 91% | 51 s |
+| IS1009b | 28.0% | 26.8% | **15.3%** | 5.0% | 82% | 216 s (a split of FIO089) |
+| TS3007b | 28.9% | 28.0% | **13.8%** | 5.4% | 81% | 252 s (a split of MTD027ID) |
+
+These rows were re-scored against the `only_words` reference by the second
+review of this work. Against the manual-segment reference used in the table
+above, the same oracle mapping gives 20.0% / 17.3% / 15.5% including miss and
+false alarm, with confusion 3.3% / 4.8% / 5.6%; the conclusion is identical.
+
+On all three test meetings the top four clusters are the four reference
+speakers, each 81-91% pure. Segmentation and CAMPPlus embeddings work. What
+fails is the final merge:
+
+- a fifth cluster holding 9-11% of speech, which the 2%-of-time filter by design
+  cannot touch;
+- 66-132 s spread over 23-28 tiny clusters, reassigned **by time** rather than
+  by voice.
+
+ES2003b at 1.0 shows the opposite failure: complete linkage merged two speakers,
+and the oracle is no better (confusion 32.6%). Over-clustering and merging by
+centroid is the fix; see design condition 6.
 
 ### Threads, ONNX Runtime spinning, and the timing
 
@@ -327,34 +424,57 @@ effect:
 | Diarization | 6 min | 4 | **0** | **111.3 s** | **39.3** |
 
 The 6 min ASR slice is 4x cheaper in CPU and 8x faster in wall with spinning
-off. The wall numbers are load-bound; the CPU ratio is the stable result.
+off. The wall numbers are load-bound; the CPU ratio is the stable result. The
+40 s ASR check went from 17.2 to 9.8 CPU-s and from 27.4 to 20.1 s wall at 2
+threads. Spinning off is now the default for every benchmark run and should be
+the engine default for the ASR, VAD and embedding sessions.
 
+The 8-thread rows in the ASR table above predate the cgroup fix and oversubscribed
+6 CPUs. That is why "8 threads" looked slower than 4 in an earlier draft; it is
+not a property of ONNX Runtime.
 
-The 6 min diarization slice went from 70.5 to 39.3 CPU-s (-44%) and from 125.1
-to 111.3 s wall. The 40 s ASR check went from 17.2 to 9.8 CPU-s and from 27.4 to
-20.1 s wall at 2 threads. Spinning off is now the default for every benchmark
-run and should be the engine default.
+A separate low-load check on a 90 s clip of ES2004b (480-570 s), run at 1 and 2
+threads under `nice -n 19` with a 1-minute load of 1-11:
+
+| Threads | Decode wall | CPU-s |
+|---|---|---|
+| 1 | 13.4-13.6 s | 13.2-13.3 |
+| 2 | **8.0 s** best (13.0 s when load hit 11) | 13.8-15.5 |
+
+That is **1.68x** from one to two threads and about 0.16 CPU-s per decoded
+second at low load. The contended-host figures in this document are about 30%
+inflated by preemption.
 
 ### Combined pipeline
 
 The combined run starts ASR and diarization at the same time. On this host the
-default is 3 ASR + 3 diarization threads (7 CPUs available, `physical_cores / 2`
+default is 3 ASR + 3 diarization threads (6 usable CPUs, `usable_cpus / 2`
 clamped to 4).
 
-| Meeting | ASR wall | Diarization wall | Critical path | Total wall | Total CPU | Peak RSS | Load at start/end |
-|---|---|---|---|---|---|---|---|
-| TS3007b (55.9 min) | 21:13 | 15:19 | **21:13** | 21:13 | 944 s | 2.1 GB | 22.3 / 36.7 |
+| Meeting | Threshold | ASR wall | Diarization wall | Critical path | Total wall | Total CPU | Peak RSS | Load at start/end |
+|---|---|---|---|---|---|---|---|---|
+| TS3007b (55.9 min) | 1.0 | 21:13 | 15:19 | **21:13** | 21:13 | 944 s | 2.1 GB | 22.3 / 36.7 |
+
+**This row ran at threshold 1.0 (8 raw clusters), not at the frozen 0.7.** It was
+recorded before the freeze and is kept as the timing measurement; its DER
+(31.7% filtered, 3 clusters) is not the pipeline's quality number. The frozen
+0.7 diarization of the same meeting is in the table above (29.1%). `run-benchmark.sh`
+now feeds the combined run the frozen 0.7.
 
 Diarization finishes under the ASR wall, so the critical path is the ASR wall.
-The 1 h projection from that critical path is **22.8 min** under this load. The
-same run used 944 CPU-s for 56 min (0.281 CPU-s per audio second including both
-stages); the ASR part is about 572 CPU-s after subtracting the standalone
-diarization CPU, or **614 CPU-s per audio hour**. At 4 threads with 70-80%
-scaling that is **3.2-4.4 min per hour**, and at 2 threads (a 4-core
-transcript-first pass) **6.4-8.8 min** for ASR alone. The bar is therefore
-reachable on an idle 8-core CPU and even the ASR transcript fits in 10 min on 4
-cores; the measured 22.8 min is a busy-host number, not the engine's ceiling.
+The 1 h projection from that critical path is **21.2 min** under this load. Do
+not project from total CPU / 8, and do not subtract a standalone diarization run
+from the combined CPU: `cpu_seconds()` is `RUSAGE_SELF`, so each stage's figure
+in `combined` mode includes the other stage. Use standalone runs for stage CPU.
 
+The stable rate is per **decoded** second: 0.16 CPU-s at low load and 0.21 on
+this contended host. Dense meetings decode 1.07-1.11x their audio because of
+pre/post-roll and the 10 s minimum, so one audio hour needs **600-900 ASR
+CPU-s**. At 4 threads with 60-75% scaling that is **4-5.5 min**; on an idle
+8-core machine the realistic estimate is **4-6 min per hour**, so the bar holds.
+At 2 threads the measured 1.68x gives **about 6 min** of ASR, **6-7 min** with
+the usual variance, which is what a 4-core transcript-first pass gets. The full
+single pass on 4 cores, ASR then diarization, is **10-11 min**: over the bar.
 
 ## Engine design conditions
 
@@ -367,51 +487,84 @@ the measurements above, not from the model cards.
    `MAX_ASR_SECONDS = 60` must be asserted in code before every recognizer call.
    Never decode a whole file: the old whole-file attempt hit 10.9 GB at 21 min.
    De-duplicate overlapping pieces at the overlap midpoint and sort by time.
-2. **Threads from the CPUs the process actually has.** Read
-   `sched_getaffinity` (or `available_parallelism`), then count distinct
-   `(physical_package_id, core_id)` pairs and any cgroup quota. Default ASR to
-   `min(4, max(1, physical_cores / 2))`; diarization to
-   `clamp(physical_cores / 2, 2, 4)`. Run the two stages concurrently. Never
-   hard-code 8; on this host 8 threads oversubscribed 7 available CPUs.
+   The justification is compute and the long-input failure, not recall: measured
+   VAD coverage is 99.6-99.9% of reference words. Budget about 1.1x the audio in
+   decoded seconds. Remove the forced `flush()` every 20 s (0.83 s holes, larger
+   than the 0.5 s join gap): use `split_run`'s quietest-point split, or make the
+   join gap larger than the hole.
+2. **Threads from the CPUs the process actually has.**
+   `min(affinity, the process's own cgroup quota, available_parallelism)`. Read
+   the quota by taking the path from `/proc/self/cgroup` and walking from it up
+   to `/sys/fs/cgroup`, keeping the smallest `cpu.max`; the root file alone is
+   wrong on this host (the harness reported 7 from the affinity mask, not the
+   6-CPU quota). `core_id` inside a VM is the
+   hypervisor's topology, so treat the `(package, core)` count as a fallback
+   only. Default ASR to `min(4, max(1, usable / 2))`, diarization to
+   `clamp(usable / 2, 2, 4)`, and run the stages concurrently. Never hard-code 8.
 3. **Disable ONNX Runtime intra-op spinning.** sherpa-onnx 2.0.1 forwards keys
    prefixed `SessionConfig.` from the provider config file
    (`provider = "cpu:/path/to/config"`). Write
    `SessionConfig.session.intra_op.allow_spinning=0`. Measured on the 6 min
-   slice: ASR 6 min 317.9 -> 78.4 CPU-s (-75%), 759.9 -> 93.9 s wall; diarization 70.5 -> 39.3 CPU-s (-44%). Keep the default available for comparison, but make
-   spinning off the engine default for predictable CPU on laptops and shared
-   machines.
-4. **CPU budget per audio second.** The measured rate is ASR **0.17-0.23 CPU-s
-   per audio second** and diarization **0.11-0.13**, about **0.28-0.36 total**
-   with spinning off. One hour is then **600-850 ASR CPU-s** and **400-470
-   diarization CPU-s**. Show a progress/ETA estimate from audio seconds and the
-   measured rate, not from a fixed promise.
-5. **4-core machines use transcript-first.** ASR needs about 600-850 CPU-s per
-   audio hour, which is 6-9 minutes at 2 threads and 80% scaling, before
-   diarization. On 4 cores, run ASR first with 2-3 threads, show the transcript,
-   then run diarization in the background. A single pass with both stages on 4
-   cores is over the ten-minute bar; the transcript alone still fits.
-6. **Diarization: per-recording threshold plus small-cluster reassignment.**
-   Keep the cosine distance threshold adjustable; the dev sweep selected **0.7**
-   as a safe default (it over-segments instead of merging speakers), but a single
-   global value does not fit every meeting. Estimate it per recording from the
-   cluster-distance distribution, or let the user adjust it. Dissolve clusters
-   under 2% of speech time and reassign their segments to the nearest large
-   cluster by embedding; never force a fixed `num_clusters`. Let the user merge,
-   split or rename speakers. The raw count is not trustworthy; the filtered count
-   is the default the UI should show, with an override.
-7. **Acceptance test.** A release candidate passes when, on held-out AMI
-   full-corpus test meetings (at least ES2004b, IS1009b and one ~1 h meeting
-   such as TS3007b), with settings frozen on dev:
+   slice: ASR 317.9 -> 78.4 CPU-s (-75%), 759.9 -> 93.9 s wall; diarization
+   70.5 -> 39.3 CPU-s (-44%). Apply it to the VAD and embedding sessions too,
+   not only the recognizer.
+4. **CPU budget per decoded second.** ASR is **0.16 CPU-s per decoded second at
+   idle and 0.21 under load**; decoded audio is about 1.1x the audio on dense
+   meetings, so one hour is **600-900 ASR CPU-s** and diarization adds roughly
+   **0.11-0.13 CPU-s per audio second**. Show a progress/ETA estimate from audio
+   seconds and the measured rate, not from a fixed promise. Measure stage CPU
+   only in standalone runs; `RUSAGE_SELF` in a combined run is not separable.
+5. **4-core machines use transcript-first.** Two threads give 1.68x over one; ASR
+   alone is about **6-7 min per audio hour**, then diarization needs about 3-4
+   min more. Run ASR first with 2-3 threads, show the transcript, then run
+   diarization in the background. A single pass with both stages on 4 cores is
+   **10-11 min**, over the ten-minute bar; the transcript alone still fits.
+6. **Diarization: over-cluster, then merge by centroid.** Keep the 0.7 cosine
+   distance threshold and let complete linkage over-cluster. Compute one
+   embedding per segment (sherpa-onnx `SpeakerEmbeddingExtractor` with the same
+   model), merge cluster pairs whose centroid cosine distance is below a second
+   threshold (average linkage on centroids), then reassign the remaining small
+   clusters to the nearest centroid by embedding, not by time. A larger
+   time-based filter cannot fix the fifth cluster (9-11% of speech) or the
+   216-252 s splits. Test an English speaker-embedding model (sherpa-onnx ships
+   `wespeaker_en_voxceleb_resnet34(_LM)`, the embedding pyannote 3.1 uses, and
+   English VoxCEleb CAMPPlus/ERes2Net) before freezing CAMPPlus `zh-cn`. Never
+   force a fixed `num_clusters`. Let the user merge, split or rename speakers;
+   the filtered count is the default the UI should show, with an override.
+7. **Acceptance test.** A release candidate passes when, on BUT's
+   `AMI-diarization-setup` **test** meetings (`ES2004*`, `IS1009*`, `TS3003*`,
+   `EN2002*`), scored against the `only_words` RTTMs with the same
+   `der_pyannote`, with settings frozen on dev:
    - DER (pyannote.metrics, collar 0, overlap scored, full-file UEM) is at or
-     below the pyannote 3.1 reference for AMI headset-mix (from memory about
-     18.8%; community-1 about 17% — both marked as remembered figures), plus
-     two points of slack;
-   - WER with Whisper's English normalizer is within a few points of Parakeet
-     TDT v3's published AMI number (from memory about 11% on the Open ASR
-     Leaderboard IHM short segments; not the same channel or segmentation);
+     below the measured baseline on the same meetings plus two points. The
+     remembered pyannote 3.1 figure of about 18.8% (community-1 about 17%) is
+     context, not a bar on these references.
+   - WER with Whisper's English normalizer is set against measured baselines:
+     an IHM-utterance sanity check near the remembered ~11%, and a mix
+     long-form bar of **no-overlap WER <= baseline + 2**. AMI's 18-22%
+     overlapped words make the ~11% leaderboard number unreachable on the mix
+     channel.
    - one hour of audio completes in <= 10 minutes on a dedicated 8-core CPU and
      peaks below 8 GB;
    - the filtered speaker count is reported, and the user can correct it.
+
+   `TS3007b` and `ES2003b` must not appear in the acceptance set: they are
+   training meetings for pyannote. The normalizer must map AMI's `X_Y_`
+   acronyms (done in `score.py`).
+
+## Follow-up
+
+This round corrects the document; it does not re-run anything. The two changes
+that the numbers point to are tracked outside this PR:
+
+- **Runewire task #18, diarization clustering and embedding model.** Implement
+  over-cluster + merge by centroid + reassign by embedding, and compare CAMPPlus
+  `zh-cn` with an English embedding model on the dev meetings. The oracle bounds
+  the gain at roughly 21-28% -> 14-17% DER.
+- **Runewire task #19, same-data baselines.** Run pyannote
+  `speaker-diarization-community-1` and the Parakeet IHM-utterance check on the
+  same meetings, so the acceptance bars in condition 7 are measured rather than
+  remembered. ES2004b and IS1009b first; skip TS3007b, which pyannote trained on.
 
 ## Reproduction
 
@@ -430,10 +583,15 @@ ALLOW_BUSY=1 scripts/fork/bench/run-benchmark.sh  # builds, runs, prints tables
 
 `run-benchmark.sh` refuses to time when the 1-minute load average is 2 or more.
 Set `ALLOW_BUSY=1` to record busy-host numbers anyway; every result JSON then
-contains the load at start and end. The script creates the 6 min slice, the clean
-samples, the VAD runs, the fixed-240 s ablation, the thread/spin ablation, the
-dev threshold sweep, the held-out test runs and the parallel pipeline, and ends
-with the markdown tables in `$ROOT/results/repro/summary.md`.
+contains the load at start and end. It defaults to **4 threads**, runs the spin
+ablation at 4 threads on both sides so the table is 4-vs-4, and gives the
+combined run the frozen 0.7 threshold. The published ASR rows used 8 threads on
+a 6-CPU quota; WER does not depend on the thread count, so a 4-thread rerun
+reproduces the quality but not the wall times. The script creates the 6 min
+slice, the clean samples, the VAD runs, the fixed-240 s ablation, the
+thread/spin ablation, the dev threshold sweep, the held-out test runs and the
+parallel pipeline, and ends with the markdown tables in
+`$ROOT/results/repro/summary.md`.
 
 One ASR run by hand:
 
@@ -461,7 +619,7 @@ scripts/fork/bench/target/release/tinta-bench diarize \
   --wav $ROOT/data/TS3007b.Mix-Headset.wav \
   --seg-model $ROOT/models/sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx \
   --embedding $ROOT/models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx \
-  --threads 4 --threshold 1.0 --window-shift 0.2 --spin 0 \
+  --threads 4 --threshold 0.7 --window-shift 0.2 --spin 0 \
   --output $ROOT/results/diar-TS3007b.json
 ```
 
@@ -488,12 +646,21 @@ never in the repo.
 - The timing host never went idle. The measured wall times include heavy
   contention and are not the ten-minute bar; the projection is explicitly
   labelled.
+- The cgroup fix in `main.rs` is this round's only harness-code change and is
+  syntax-checked only: the machine was reserved for another project, so the
+  binary was not rebuilt and no `usable_cpus` value has been observed from it.
+  The expected value on this host is 6, and the defaults it produces are the
+  3+3 already used by the combined run.
+- The harness still forces the VAD's 20 s flush. Design condition 1 says to
+  replace it with the quietest-point split or a larger join gap, but that is a
+  behavior change that needs a fresh run, so it was not made this round.
 - The small-cluster filter in the benchmark reassigns by temporal proximity
   because sherpa-onnx does not expose embeddings. The engine should use
   embeddings; the benchmark's DER after the filter is therefore an estimate of
   the engine's behavior, not an upper bound.
 - AMI reference segments are manual `transcriber_start`/`transcriber_end`
-  regions; DER numbers from word references differ. The same reference type is
-  used for every meeting and every threshold.
-- Published pyannote and Parakeet AMI figures quoted in this document are from
-  memory and are marked as such; they are not measured here.
+  regions; DER numbers from word references differ by 1-3 points. The same
+  reference type is used for every meeting and every threshold, and the
+  `only_words` figures are labelled where they appear.
+- Published pyannote, FluidAudio and Parakeet AMI figures quoted in this
+  document are from memory and are marked as such; they are not measured here.

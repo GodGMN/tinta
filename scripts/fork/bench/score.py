@@ -34,6 +34,21 @@ import xml.etree.ElementTree as ET
 FILLERS = {"uh", "um", "er", "ah", "eh", "mm", "hmm", "uh-huh", "mhm", "oh"}
 WHISPER_NORMALIZER = None
 LEGACY_NORMALIZER = None
+AMI_ACRONYM = None
+
+
+def ami_acronyms(text):
+    """Join AMI's spoken acronyms (`T_V_`) into one token (`TV`).
+
+    The manual annotation writes every letter of a spelled-out acronym as its
+    own `w` element with trailing underscores; Parakeet transcribes the same
+    speech as `TV`. Without this mapping each `T_V_` costs a substitution plus
+    two deletions, 24-54 times per meeting.
+    """
+    global AMI_ACRONYM
+    if AMI_ACRONYM is None:
+        AMI_ACRONYM = re.compile(r"\b(?:[A-Za-z]+_)+")
+    return AMI_ACRONYM.sub(lambda m: m.group(0).replace("_", ""), text)
 
 
 def legacy_tokens(words):
@@ -42,7 +57,7 @@ def legacy_tokens(words):
     if LEGACY_NORMALIZER is None:
         LEGACY_NORMALIZER = re.compile(r"[^a-z0-9'\- ]+")
     text = words if isinstance(words, str) else " ".join(words)
-    text = text.lower().replace("\u2019", "'")
+    text = ami_acronyms(text).lower().replace("\u2019", "'")
     text = LEGACY_NORMALIZER.sub(" ", text)
     return [p for p in text.split() if p]
 
@@ -55,7 +70,7 @@ def whisper_tokens(words):
 
         WHISPER_NORMALIZER = EnglishTextNormalizer()
     text = words if isinstance(words, str) else " ".join(words)
-    return WHISPER_NORMALIZER(text).split()
+    return WHISPER_NORMALIZER(ami_acronyms(text)).split()
 
 
 def build_ref(annotations, meeting, out_path):
@@ -196,11 +211,19 @@ def clean_sample(args):
         b = min(b, a + 20.0, a + (limit - used))
         if b - a < 1.0:
             continue
+        # Where this region starts in the concatenated output, before the
+        # silence that follows it. Word timings must be shifted by this much:
+        # the source regions are not contiguous, so carrying the ES2002a
+        # timestamps over would misplace almost every word.
+        offset = sum(len(piece) for piece in pieces) / 16000.0
         pieces.append(audio[int(a * 16000) : int(b * 16000)])
         used += b - a
         for w in ref["words"]:
             if w["start"] >= a and w["end"] <= b:
-                words.append(w)
+                item = dict(w)
+                item["start"] = round(offset + (w["start"] - a), 3)
+                item["end"] = round(offset + (w["end"] - a), 3)
+                words.append(item)
         # 0.2 s of silence between regions.
         pieces.append(np.zeros(int(0.2 * 16000), dtype=np.int16))
         used += 0.2
@@ -564,8 +587,12 @@ def tune(args):
     fractions = [float(x) for x in args.fractions.split(",")]
     by_key = {}
     for result in sorted(glob.glob(args.results_glob)):
-        meeting = os.path.basename(result).split("-")[1]
-        ref = json.load(open(os.path.join(args.ref_dir, meeting + ".ref.json")))
+        base = os.path.basename(result)
+        meeting = base.split("-")[1]
+        # 6 min samples have their own time-shifted reference; comparing them
+        # with the full-meeting reference would mix two timelines.
+        ref_name = meeting + (".sample6m.ref.json" if "-sample" in base else ".ref.json")
+        ref = json.load(open(os.path.join(args.ref_dir, ref_name)))
         hyp = json.load(open(result))
         diar = hyp.get("diarization")
         if not diar:

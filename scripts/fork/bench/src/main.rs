@@ -171,9 +171,38 @@ fn physical_cores(ids: &[usize]) -> usize {
     }
 }
 
-/// CPU quota from cgroup v2, in CPUs, if a quota is set.
+/// CPU quota for this process's own cgroup v2 scope, in CPUs, if one is set.
+///
+/// `/sys/fs/cgroup/cpu.max` is the root cgroup and normally does not exist or
+/// says `max`, which is why the first version of this check missed the 6-CPU
+/// limit on the bench host. Read the process's own path from
+/// `/proc/self/cgroup` (the v2 line is `0::/some/path`), then walk from that
+/// path up to the mount root and keep the smallest quota found on the way:
+/// a quota may be set on any ancestor slice.
 fn cgroup_cpus() -> Option<usize> {
-    let text = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = text.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let mut best: Option<usize> = None;
+    loop {
+        let dir = if parts.is_empty() {
+            "/sys/fs/cgroup".to_string()
+        } else {
+            format!("/sys/fs/cgroup/{}", parts.join("/"))
+        };
+        if let Some(cpus) = read_cpu_max(&format!("{dir}/cpu.max")) {
+            best = Some(best.map_or(cpus, |b| b.min(cpus)));
+        }
+        if parts.pop().is_none() {
+            break;
+        }
+    }
+    best
+}
+
+/// One `cpu.max` file: `<quota> <period>`, or `max <period>`.
+fn read_cpu_max(path: &str) -> Option<usize> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut it = text.split_whitespace();
     let quota = it.next()?;
     let period: u64 = it.next()?.parse().ok()?;
@@ -194,6 +223,14 @@ fn machine_info() -> Value {
         ids.len()
     };
     let physical = physical_cores(&ids).min(logical);
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let quota = cgroup_cpus();
+    // The CPUs the process can really use: the affinity mask, the cgroup quota
+    // of its own scope, and what the standard library reports, whichever is
+    // smallest.
+    let usable = logical.min(quota.unwrap_or(logical)).min(available).max(1);
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|s| {
@@ -206,9 +243,10 @@ fn machine_info() -> Value {
         "cpu": cpu,
         "logical_cpus": logical,
         "physical_cores": physical,
+        "usable_cpus": usable,
         "affinity_ids": ids,
-        "cgroup_cpus": cgroup_cpus(),
-        "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "cgroup_cpus": quota,
+        "available_parallelism": available,
     })
 }
 
@@ -809,11 +847,15 @@ fn main() {
     let machine = machine_info();
     let logical = machine["logical_cpus"].as_u64().unwrap_or(1) as i32;
     let physical = (machine["physical_cores"].as_u64().unwrap_or(logical as u64) as i32).min(logical);
+    let usable = (machine["usable_cpus"]
+        .as_u64()
+        .unwrap_or(physical as u64) as i32)
+        .clamp(1, physical);
 
     // Defaults scale with the CPUs the process actually gets: ASR gets half of
     // them, capped at 4; diarization gets 2-4.
-    let default_asr_threads = (physical / 2).clamp(1, 4);
-    let default_diar_threads = (physical / 2).clamp(2, 4);
+    let default_asr_threads = (usable / 2).clamp(1, 4);
+    let default_diar_threads = (usable / 2).clamp(2, 4);
     let asr_threads = args.i32_or("threads", default_asr_threads);
     let diar_threads = args.i32_or("diar-threads", default_diar_threads);
     let spin = args.i32_or("spin", -1);
@@ -861,6 +903,7 @@ fn main() {
             "diarization": default_diar_threads,
             "logical_cpus": logical,
             "physical_cores": physical,
+            "usable_cpus": usable,
         },
         "spin": if spin < 0 { "default".to_string() } else { spin.to_string() },
         "provider": provider,

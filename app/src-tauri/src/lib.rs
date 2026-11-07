@@ -972,17 +972,25 @@ pub fn start_engine(delay: Duration) {
         let state = state();
         // `ready` also carries the capabilities. A reply without them keeps what `ready` said, because
         // an engine may report the capabilities only there.
-        let capabilities = state
-            .engine
-            .call("ping", json!({}), Duration::from_secs(20))
-            .ok()
-            .filter(|result| Capabilities::reported(result))
-            .map(|result| Capabilities::from_json(&result));
-        if let Some(capabilities) = capabilities {
-            state.set_capabilities(capabilities);
-        }
+        let reply = state.engine.call("ping", json!({}), Duration::from_secs(20)).ok();
+        let Some(capabilities) = capabilities_after_ping(reply.as_ref(), state.capabilities()) else {
+            // The engine did not answer, so it is not running. The `engine_exit` of that process
+            // starts the next attempt with the backoff, and this chain ends here: starting the
+            // watchers now would send `calls`, which starts a second engine with no backoff and
+            // doubles the restart chains on every failure.
+            return;
+        };
+        state.set_capabilities(capabilities);
         state.start_watchers();
     });
+}
+
+/// The capabilities to use after a `ping` attempt. `None` means that the engine did not answer:
+/// the `engine_exit` of that process schedules the next attempt, so this one stops. `Some` keeps
+/// the current capabilities when the reply has no `capabilities` object.
+fn capabilities_after_ping(reply: Option<&Value>, current: Capabilities) -> Option<Capabilities> {
+    let reply = reply?;
+    Some(if Capabilities::reported(reply) { Capabilities::from_json(reply) } else { current })
 }
 
 /// Sends the call reading setting to the engine and reads the current calls.
@@ -1054,6 +1062,9 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
     });
     let _ = STATE.set(state.clone());
     start_engine(ENGINE_RESTART_MIN);
+    // Register the reminder click handler at launch, on the main thread: a reminder click can
+    // start Tinta, and macOS delivers it to the delegate that was set before launch finished.
+    calendar::init();
     // Test runs use their own data folder and must not change the Chrome configuration.
     if std::env::var_os("TINTA_DATA_DIR").is_none() {
         let _ = platform::install_native_host();
@@ -1135,4 +1146,31 @@ pub fn run() {
                 let _ = std::fs::remove_file(paths::socket_path());
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_ping_ends_the_restart_chain() {
+        let current = Capabilities::default();
+        // No reply: the process is gone and `engine_exit` owns the next attempt.
+        assert_eq!(capabilities_after_ping(None, current), None);
+    }
+
+    #[test]
+    fn a_ping_reply_without_capabilities_keeps_the_current_ones() {
+        let current = Capabilities::default();
+        let reply = json!({"pong": true});
+        assert_eq!(capabilities_after_ping(Some(&reply), current), Some(current));
+    }
+
+    #[test]
+    fn a_ping_reply_with_capabilities_replaces_them() {
+        let reply = json!({"pong": true, "capabilities": {"calendar": false}});
+        let capabilities = capabilities_after_ping(Some(&reply), Capabilities::default()).unwrap();
+        assert!(!capabilities.calendar);
+        assert!(capabilities.summaries);
+    }
 }

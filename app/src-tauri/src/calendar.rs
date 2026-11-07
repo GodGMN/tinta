@@ -217,15 +217,21 @@ impl AppState {
 /// True after the first call of `watch`. The calendar thread lives as long as the app.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Registers the reminders, and reads the calendars and checks for reminders on a new thread.
+/// Registers the reminder click handler. The app calls this in `init` at launch, on the main
+/// thread, so a click that launched Tinta (for example Join on a reminder) is delivered even
+/// when the engine cannot read calendars.
+pub fn init() {
+    notify::init(|event_id| {
+        std::thread::spawn(move || state().on_reminder_click(&event_id));
+    });
+}
+
+/// Reads the calendars and checks for reminders on a new thread.
 /// It runs only when the engine reports the calendar feature.
 pub fn watch() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    notify::init(|event_id| {
-        std::thread::spawn(move || state().on_reminder_click(&event_id));
-    });
     std::thread::spawn(|| {
         let state = state();
         if state.refresh_calendar().map(|s| s.access == "granted").unwrap_or(false) {

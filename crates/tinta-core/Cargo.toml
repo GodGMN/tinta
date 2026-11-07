@@ -20,5 +20,10 @@ dirs = "5"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 
+# The Linux peer check reads the user ID and the executable of the process at the other end of
+# the app socket.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

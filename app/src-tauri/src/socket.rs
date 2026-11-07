@@ -1,5 +1,8 @@
-//! The app socket. Only the signed helper binaries next to the app can connect:
+//! The app socket. Only the helper binaries next to the app can connect:
 //! `tinta-mcp` for MCP tools and `tinta-native-host` for Meet extension messages.
+//!
+//! macOS checks the code signature of the helper. Linux checks the user of the connection and
+//! the executable of the peer process; see `crates/tinta-core/src/peer.rs`.
 //!
 //! On Windows the app has no socket yet; the helper binaries connect over a Unix socket,
 //! which Windows support adds with the rest of the port.
@@ -34,6 +37,7 @@ const MAX_LINE_BYTES: u64 = 1 << 20;
 #[cfg(unix)]
 pub fn serve(state: Arc<AppState>) -> Result<()> {
     let path = paths::socket_path();
+    paths::prepare_socket_dir()?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;

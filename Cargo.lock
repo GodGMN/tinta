@@ -3679,6 +3679,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "tinta-core",
  "uuid",
 ]
@@ -3692,6 +3693,7 @@ dependencies = [
  "dirs 5.0.1",
  "hex",
  "hkdf",
+ "libc",
  "rand",
  "rusqlite",
  "security-framework",

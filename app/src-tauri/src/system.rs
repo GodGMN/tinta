@@ -1,5 +1,5 @@
-//! The Chrome extension folder. The macOS-only registration of the native host lives in
-//! `platform/macos.rs`; on the other platforms it does nothing for now.
+//! The Chrome extension folder. The registration of the native host lives in the platform
+//! files; on Linux it writes the manifest into each Chromium browser that the user runs.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

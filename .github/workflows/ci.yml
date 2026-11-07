@@ -76,20 +76,26 @@ jobs:
         run: |
           set -euo pipefail
           deb="$(ls target/release/bundle/deb/*.deb)"
-          dpkg-deb -c "$deb"
+          # Save the listing once: `dpkg-deb -c | grep -q` would stop tar with SIGPIPE.
+          contents="$(mktemp)"
+          dpkg-deb -c "$deb" > "$contents"
+          cat "$contents"
           dpkg-deb -I "$deb"
           for name in tinta tinta-engine tinta-mcp tinta-native-host; do
-            dpkg-deb -c "$deb" | grep -q "usr/bin/$name$" || { echo "missing usr/bin/$name"; exit 1; }
+            grep -q "usr/bin/$name$" "$contents" || { echo "missing usr/bin/$name"; exit 1; }
           done
           tmp="$(mktemp -d)"
           dpkg-deb -x "$deb" "$tmp"
+          cat "$tmp/usr/share/applications/Tinta.desktop"
           grep -qx 'Categories=Office;AudioVideo;' "$tmp/usr/share/applications/Tinta.desktop"
           appimage="$(ls target/release/bundle/appimage/*.AppImage)"
           work="$(mktemp -d)"
           cd "$work"
           "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
           ls -l squashfs-root/usr/bin
-          for name in tinta tinta-engine; do
+          cat squashfs-root/usr/share/applications/Tinta.desktop
+          for name in tinta tinta-engine tinta-mcp tinta-native-host; do
+            test -x "squashfs-root/usr/bin/$name" || { echo "missing $name in the AppImage"; exit 1; }
             if ldd "squashfs-root/usr/bin/$name" | grep 'not found'; then
               echo "unresolved libraries for $name"
               exit 1

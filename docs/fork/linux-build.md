@@ -62,9 +62,10 @@ On Linux the same two commands run in `core-linux` after the `tinta-core` steps.
 - The job runs on Ubuntu 22.04 for its glibc 2.35, so the bundles start on Debian 12
   (glibc 2.36) and Ubuntu 24.04 (glibc 2.39). `ubuntu-latest` is 24.04 and would tie the
   bundles to glibc 2.39.
-- The `.deb` depends on `libwebkit2gtk-4.1-0`, `libgtk-3-0`, `libpulse0`, `libssl3` and
-  `libstdc++6`. `libssl3` is there because the bundled SQLCipher links the system
-  `libcrypto`. The Secret Service client talks D-Bus directly with a vendored libdbus, so
+- Tauri adds `libwebkit2gtk-4.1-0` and `libgtk-3-0` to the `Depends` of every Linux
+  package. The config adds `libpulse0`, `libssl3` and `libstdc++6`: `libssl3` is there
+  because the bundled SQLCipher links the system `libcrypto`, and sherpa-onnx links
+  `libstdc++`. The Secret Service client talks D-Bus directly with a vendored libdbus, so
   the package needs no libsecret, and it recommends `gnome-keyring | kwalletmanager` for
   the service behind `org.freedesktop.secrets`.
 - `dpkg-deb -c` and `-I` print the contents and the dependencies, and

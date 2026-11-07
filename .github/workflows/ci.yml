@@ -25,6 +25,10 @@ jobs:
         run: cargo test --locked -p tinta-core
       - name: Clippy
         run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+      - name: Test engine
+        run: cargo test --locked -j2 -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -j2 -p tinta-engine-rs --all-targets -- -D warnings
 
   core-macos:
     # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15

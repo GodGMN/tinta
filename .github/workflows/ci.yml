@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but compiles against the system OpenSSL.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  core-macos:
+    # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15
+    # minutes and were cancelled twice on 2026-11-06), so this uses the Intel
+    # image. The core crate is architecture independent; move this back to
+    # macos-latest when the arm64 queue recovers.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+
+  tntc-swift-fixture:
+    # CryptoKit is macOS-only, so this job checks both directions: Swift-written
+    # chunks are decrypted by the Rust reader, and Rust-written chunks are
+    # decrypted by the engine's own Swift ChunkReader.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the Swift fixtures against ChunkStore.swift
+        run: |
+          swiftc -parse-as-library -O -o "$RUNNER_TEMP/make-tntc-fixture" \
+            engine/Sources/TintaEngine/Protocol.swift \
+            engine/Sources/TintaEngine/ChunkStore.swift \
+            engine/scripts/make-tntc-fixture.swift
+          swiftc -parse-as-library -O -o "$RUNNER_TEMP/read-tntc-fixture" \
+            engine/Sources/TintaEngine/Protocol.swift \
+            engine/Sources/TintaEngine/ChunkStore.swift \
+            engine/scripts/read-tntc-fixture.swift
+      - name: Write Swift TNTC fixture
+        run: '"$RUNNER_TEMP/make-tntc-fixture" "$RUNNER_TEMP/tntc-fixture"'
+      - name: Read the Swift fixture from Rust
+        env:
+          TINTA_TNTC_FIXTURE_DIR: ${{ runner.temp }}/tntc-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored reads_swift_cryptokit_chunks
+      - name: Write a Rust TNTC fixture
+        env:
+          TINTA_TNTC_WRITE_FIXTURE_DIR: ${{ runner.temp }}/tntc-rust-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored writes_rust_chunks
+      - name: Read the Rust fixture with Swift
+        run: '"$RUNNER_TEMP/read-tntc-fixture" "$RUNNER_TEMP/tntc-rust-fixture"'

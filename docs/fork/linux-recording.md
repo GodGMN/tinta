@@ -204,9 +204,9 @@ Every buffer is fixed or bounded by time, not by the length of the meeting:
 
 Measured over ten minutes with speech played in a loop into the default sink,
 so the live Parakeet was loaded and decoding
-(`scripts/fork/recording/rss_probe.py`): 32.6 MiB at start, 1012 MiB after the
-first live utterance, **peak 1042.7 MiB**, and 1022.8 MiB for the last seven
-minutes (tail spread 22.1 MiB over 650 `levels` ticks and 22 live drafts). The
+(`scripts/fork/recording/rss_probe.py`): 38.4 MiB at start, 1059 MiB after the
+first live utterance, **peak 1061.3 MiB**, and 1061.3 MiB for the last seven
+minutes (tail spread 2.3 MiB over 621 `levels` ticks and 33 live drafts). The
 recognizer dominates a debug build; a silent ten-minute recording stays at
 51 MiB. Memory tracks the models in use, not the length of the meeting.
 

@@ -4,10 +4,11 @@
 //! `install_models`, `import_audio` and `finalize`: those run on worker threads
 //! and reply when they finish, so `ping`, `models_status`, `calendar`, `sample`
 //! and the other quick commands keep answering during a 487 MB install or a long
-//! final pass. A second install is rejected while one is in flight. Commands
-//! whose features are not implemented yet fail with an `unsupported` error, and
-//! macOS-only commands return the degraded replies from `docs/engine-protocol.md`
-//! so the app does not show errors or retry loops.
+//! final pass. A second install is rejected while one is in flight. macOS-only
+//! commands return the degraded replies from `docs/engine-protocol.md` so the app
+//! does not show errors or retry loops.
+
+use crate::recording::{LiveConfig, RecordingSession, StartOptions};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -38,10 +39,8 @@ pub struct Capabilities {
     pub summaries: bool,
     pub echo_cancellation: bool,
     pub import_audio: bool,
+    pub live_transcription: bool,
 }
-
-/// Commands that belong to the protocol but whose feature is not built yet.
-const UNIMPLEMENTED: &[&str] = &["start", "pause", "resume", "mic_muted", "stop"];
 
 pub struct Engine {
     out: Output,
@@ -49,6 +48,7 @@ pub struct Engine {
     models_root: PathBuf,
     threads: Threads,
     installing: Arc<AtomicBool>,
+    session: Option<RecordingSession>,
 }
 
 impl Engine {
@@ -59,6 +59,7 @@ impl Engine {
             models_root,
             threads,
             installing: Arc::new(AtomicBool::new(false)),
+            session: None,
         }
     }
 
@@ -70,12 +71,21 @@ impl Engine {
             json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "capabilities": Capabilities {
+                    capture_system_audio: cfg!(target_os = "linux"),
                     import_audio: true,
+                    live_transcription: cfg!(target_os = "linux"),
                     ..Default::default()
                 },
             }),
         )?;
+        let result = self.read_commands(&mut input);
+        // Stdin EOF and I/O errors still flush the recording, like Swift's
+        // shutdown path.
+        self.stop_session();
+        result
+    }
 
+    fn read_commands<R: BufRead>(&mut self, input: &mut R) -> io::Result<()> {
         let mut line = String::new();
         loop {
             line.clear();
@@ -98,6 +108,7 @@ impl Engine {
         };
 
         if request.cmd == "shutdown" {
+            self.stop_session();
             self.out.reply(&request.id, json!({}))?;
             log("shutdown requested");
             return Ok(true);
@@ -164,6 +175,65 @@ impl Engine {
             })),
             "call_report" => bail!("Call reading is not available on this platform."),
             "summarize" => bail!("Summaries are not available on this platform."),
+            "start" => {
+                // Swift checks the active session before the parameters.
+                if self.session.is_some() {
+                    bail!("a recording is already active");
+                }
+                let directory = PathBuf::from(param_string(params, "dir")?);
+                let key = audio_key(params)?;
+                let source = params
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .filter(|source| !source.is_empty())
+                    .unwrap_or("all")
+                    .to_string();
+                let mic_muted = params
+                    .get("mic_muted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let live = self.live_config();
+                let session = RecordingSession::start(
+                    StartOptions {
+                        directory,
+                        key,
+                        source,
+                        mic_muted,
+                    },
+                    self.out.clone(),
+                    live,
+                )?;
+                let start_wall_ms = session.start_wall_ms();
+                self.session = Some(session);
+                Ok(json!({ "start_wall_ms": start_wall_ms }))
+            }
+            "pause" => {
+                if let Some(session) = &self.session {
+                    session.pause();
+                }
+                Ok(json!({}))
+            }
+            "resume" => {
+                if let Some(session) = &self.session {
+                    session.resume();
+                }
+                Ok(json!({}))
+            }
+            "mic_muted" => {
+                let muted = params
+                    .get("muted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let t = param_i64(params, "t").unwrap_or_else(crate::recording::now_wall_ms);
+                if let Some(session) = &self.session {
+                    session.set_mic_muted(muted, t);
+                }
+                Ok(json!({}))
+            }
+            "stop" => {
+                self.stop_session();
+                Ok(json!({}))
+            }
             "sample" => {
                 let dir = param_string(params, "dir")?;
                 let track = match param_string(params, "track")?.as_str() {
@@ -176,11 +246,31 @@ impl Engine {
                 let key = audio_key(params)?;
                 crate::sample::sample(Path::new(&dir), &key, track, start, end)
             }
-            other if UNIMPLEMENTED.contains(&other) => {
-                bail!("unsupported command: {other}")
-            }
             other => bail!("unknown command {other}"),
         }
+    }
+
+    /// Stops and drops the active recording, if any.
+    fn stop_session(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            session.stop();
+        }
+    }
+
+    /// Live drafts need the installed models. `TINTA_ENGINE_LIVE=0` turns them
+    /// off for a machine that should spend nothing on them.
+    fn live_config(&self) -> Option<LiveConfig> {
+        if std::env::var_os("TINTA_ENGINE_LIVE").is_some_and(|value| value == "0") {
+            return None;
+        }
+        if !self.manifest.all_files_exist(&self.models_root) {
+            return None;
+        }
+        Some(LiveConfig {
+            manifest: self.manifest.clone(),
+            models_root: self.models_root.clone(),
+            threads: self.threads,
+        })
     }
 
     /// Runs one final pass on a worker thread. Two passes may overlap; the speech
@@ -275,6 +365,15 @@ fn param_usize(params: &Map<String, Value>, key: &str) -> Option<usize> {
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .map(|value| value as usize)
+}
+
+/// An optional integer; Swift accepts both an integer and a float here.
+fn param_i64(params: &Map<String, Value>, key: &str) -> Option<i64> {
+    params.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|value| value as i64))
+    })
 }
 
 /// Decodes `audio_key`, a base64 string of exactly 32 bytes. Anything else is
@@ -392,12 +491,20 @@ mod tests {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["version"], env!("CARGO_PKG_VERSION"));
         let capabilities = ready["capabilities"].as_object().unwrap();
-        assert_eq!(capabilities.len(), 8);
+        assert_eq!(capabilities.len(), 9);
         assert_eq!(capabilities["import_audio"], true);
-        for (name, value) in capabilities {
-            if name != "import_audio" {
-                assert_eq!(value, &Value::Bool(false), "{name}");
-            }
+        assert_eq!(capabilities["capture_app_audio"], false);
+        assert_eq!(capabilities["echo_cancellation"], false);
+        assert_eq!(
+            capabilities["capture_system_audio"],
+            Value::Bool(cfg!(target_os = "linux"))
+        );
+        assert_eq!(
+            capabilities["live_transcription"],
+            Value::Bool(cfg!(target_os = "linux"))
+        );
+        for name in ["calls_detection", "call_reader", "calendar", "summaries"] {
+            assert_eq!(capabilities[name], false, "{name}");
         }
     }
 
@@ -471,13 +578,35 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_command_says_unsupported() {
+    fn start_checks_its_parameters_before_opening_a_stream() {
         let lines = run("{\"id\":4,\"cmd\":\"start\",\"params\":{}}");
         assert_eq!(lines[1]["ok"], false);
-        assert!(lines[1]["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported command: start"));
+        assert_eq!(lines[1]["error"], "missing parameter: dir");
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = line(
+            1,
+            "start",
+            json!({
+                "dir": dir.path().display().to_string(),
+                "audio_key": "AAAA",
+            }),
+        );
+        let lines = run(&input);
+        assert_eq!(lines[1]["ok"], false);
+        assert_eq!(lines[1]["error"], "invalid audio key");
+    }
+
+    #[test]
+    fn recording_commands_are_noops_without_a_session() {
+        let lines = run("{\"id\":1,\"cmd\":\"pause\"}\n\
+             {\"id\":2,\"cmd\":\"resume\"}\n\
+             {\"id\":3,\"cmd\":\"mic_muted\",\"params\":{\"muted\":true}}\n\
+             {\"id\":4,\"cmd\":\"stop\"}");
+        for line in &lines[1..] {
+            assert_eq!(line["ok"], true);
+            assert_eq!(line["result"], json!({}));
+        }
     }
 
     #[test]

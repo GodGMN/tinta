@@ -124,7 +124,7 @@ impl SpeechPass {
         Ok(self.recognizer.as_ref().expect("loaded above"))
     }
 
-    fn vad(&self) -> Result<VoiceActivityDetector> {
+    pub(crate) fn vad(&self) -> Result<VoiceActivityDetector> {
         self.check_installed()?;
         let group = self.group("vad")?;
         let model = self.path(group, "vad")?;
@@ -179,7 +179,13 @@ impl SpeechPass {
             .context("the diarization models did not load. Install the models again.")
     }
 
-    fn decode(&mut self, samples: &[f32], offset: f64) -> Result<Vec<Word>> {
+    /// A streaming VAD for live drafts, with the same settings as the final pass.
+    pub(crate) fn live_vad(&self) -> Result<VoiceActivityDetector> {
+        self.vad()
+    }
+
+    /// Decodes one finished speech segment at `offset` seconds.
+    pub(crate) fn decode(&mut self, samples: &[f32], offset: f64) -> Result<Vec<Word>> {
         ensure_recognizer_window(samples.len())?;
         let recognizer = self.recognizer()?;
         let stream = recognizer.create_stream();

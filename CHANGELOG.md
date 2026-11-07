@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Tinta records meetings on Linux. It records your microphone and the sound your computer plays, keeps both when you pause, and transcribes them when you stop. The microphone mute button, the live transcript, and the recording bubble work as on macOS.
+
 ## 0.9.3 (2026-10-21)
 
 ### Fixed

@@ -1,0 +1,352 @@
+//! End-to-end live recording over the engine protocol.
+//!
+//! Ignored by default. It needs a running PulseAudio or PipeWire pulse server and
+//! `pactl`, `paplay` on `PATH` (or in `TINTA_PACTL` / `TINTA_PAPLAY`). It creates
+//! two null sinks and a remapped microphone source, records ~28 s through the
+//! real engine, and unloads everything afterwards. Run it with:
+//!
+//! ```text
+//! cargo test --locked -p tinta-engine-rs --test recording_e2e -- --ignored --nocapture
+//! ```
+
+#![cfg(target_os = "linux")]
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Lines, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tinta_core::chunks::{read_track, Track};
+use tinta_engine_rs::audio::SAMPLE_RATE;
+
+const REMOTE_SINK: &str = "tinta_e2e_remote";
+const MIC_SINK: &str = "tinta_e2e_mic_sink";
+const MIC_SOURCE: &str = "tinta_e2e_mic";
+
+fn tool(name: &str) -> PathBuf {
+    std::env::var_os(format!("TINTA_{}", name.to_uppercase()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn run(program: &Path, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", program.display()));
+    assert!(
+        output.status.success(),
+        "{} {:?} failed: {}",
+        program.display(),
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The virtual devices and the server defaults, restored on drop.
+struct Fixture {
+    pactl: PathBuf,
+    modules: Vec<String>,
+    original_sink: String,
+    original_source: String,
+}
+
+impl Fixture {
+    fn setup() -> Self {
+        let pactl = tool("pactl");
+        let original_sink = run(&pactl, &["get-default-sink"]);
+        let original_source = run(&pactl, &["get-default-source"]);
+        let mut fixture = Self {
+            pactl,
+            modules: Vec::new(),
+            original_sink,
+            original_source,
+        };
+        fixture.load(&[
+            "module-null-sink",
+            &format!("sink_name={REMOTE_SINK}"),
+            "sink_properties=device.description=tinta_e2e_remote",
+        ]);
+        fixture.load(&[
+            "module-null-sink",
+            &format!("sink_name={MIC_SINK}"),
+            "sink_properties=device.description=tinta_e2e_mic_sink",
+        ]);
+        fixture.load(&[
+            "module-remap-source",
+            &format!("master={MIC_SINK}.monitor"),
+            &format!("source_name={MIC_SOURCE}"),
+        ]);
+        run(&fixture.pactl, &["set-default-sink", REMOTE_SINK]);
+        run(&fixture.pactl, &["set-default-source", MIC_SOURCE]);
+        // Let the server publish the new nodes before the engine opens them.
+        thread::sleep(Duration::from_millis(500));
+        fixture
+    }
+
+    fn load(&mut self, args: &[&str]) {
+        let mut all = vec!["load-module"];
+        all.extend_from_slice(args);
+        let id = run(&self.pactl, &all);
+        self.modules.push(id);
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for module in self.modules.drain(..).rev() {
+            let _ = Command::new(&self.pactl)
+                .args(["unload-module", &module])
+                .output();
+        }
+        if !self.original_sink.is_empty() {
+            let _ = Command::new(&self.pactl)
+                .args(["set-default-sink", &self.original_sink])
+                .output();
+        }
+        if !self.original_source.is_empty() {
+            let _ = Command::new(&self.pactl)
+                .args(["set-default-source", &self.original_source])
+                .output();
+        }
+    }
+}
+
+struct Engine {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Lines<BufReader<ChildStdout>>,
+    seen: Vec<Value>,
+}
+
+impl Engine {
+    fn spawn() -> Self {
+        let models = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tinta-engine"))
+            .env("TINTA_ENGINE_MODELS_DIR", models.path())
+            // Live drafts need models; this test only checks capture and chunks.
+            .env("TINTA_ENGINE_LIVE", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("the engine binary starts");
+        let stdin = child.stdin.take().unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut engine = Self {
+            child,
+            stdin,
+            lines,
+            seen: Vec::new(),
+        };
+        let ready = engine.next_value();
+        assert_eq!(ready["event"], "ready");
+        engine
+    }
+
+    fn next_value(&mut self) -> Value {
+        let line = self
+            .lines
+            .next()
+            .expect("the engine line")
+            .expect("a readable line");
+        serde_json::from_str(&line).expect("a JSON line")
+    }
+
+    fn send(&mut self, value: Value) {
+        writeln!(self.stdin, "{value}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// Reads until the reply with `id`, keeping the events it passes in `seen`.
+    fn reply(&mut self, id: u64) -> Value {
+        loop {
+            let value = self.next_value();
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                return value;
+            }
+            self.seen.push(value);
+        }
+    }
+
+    fn finish(&mut self) {
+        self.send(json!({ "id": 0, "cmd": "shutdown" }));
+        while let Some(Ok(line)) = self.lines.next() {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if value.get("id").is_none() {
+                    self.seen.push(value);
+                }
+            }
+        }
+        let status = self.child.wait().unwrap();
+        assert!(status.success(), "the engine exits with 0");
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn play(paplay: &Path, sink: &str, file: &Path) {
+    let status = Command::new(paplay)
+        .arg(format!("--device={sink}"))
+        .arg(file)
+        .status()
+        .expect("paplay starts");
+    assert!(status.success(), "paplay plays {sink}");
+}
+
+fn tone(seconds: f32, frequency: f32) -> Vec<f32> {
+    let count = (SAMPLE_RATE as f32 * seconds) as usize;
+    (0..count)
+        .map(|index| {
+            let fade =
+                ((index as f32 / 400.0).min(1.0)).min(((count - index) as f32 / 400.0).min(1.0));
+            (2.0 * std::f32::consts::PI * frequency * index as f32 / SAMPLE_RATE as f32).sin()
+                * 0.5
+                * fade
+        })
+        .collect()
+}
+
+fn rms(samples: &[f32], from: f32, to: f32) -> f32 {
+    let start = (from * SAMPLE_RATE as f32) as usize;
+    let end = ((to * SAMPLE_RATE as f32) as usize).min(samples.len());
+    if start >= end {
+        return 0.0;
+    }
+    let slice = &samples[start..end];
+    (slice.iter().map(|sample| sample * sample).sum::<f32>() / slice.len() as f32).sqrt()
+}
+
+fn sleep_until(start: Instant, seconds: f32) {
+    let target = start + Duration::from_secs_f32(seconds);
+    if let Some(left) = target.checked_duration_since(Instant::now()) {
+        thread::sleep(left);
+    }
+}
+
+#[test]
+#[ignore = "needs a PulseAudio/PipeWire server and pulseaudio-utils"]
+fn records_two_tracks_with_pause_and_levels() {
+    let fixture = Fixture::setup();
+    let paplay = tool("paplay");
+    let dir = tempfile::tempdir().unwrap();
+    let remote_tone = dir.path().join("remote.wav");
+    let mic_tone = dir.path().join("mic.wav");
+    let paused_tone = dir.path().join("paused.wav");
+    std::fs::write(&remote_tone, tinta_engine_rs::audio::wav(&tone(5.0, 440.0))).unwrap();
+    std::fs::write(&mic_tone, tinta_engine_rs::audio::wav(&tone(5.0, 880.0))).unwrap();
+    std::fs::write(&paused_tone, tinta_engine_rs::audio::wav(&tone(2.0, 550.0))).unwrap();
+
+    let mut engine = Engine::spawn();
+    engine.send(json!({
+        "id": 1,
+        "cmd": "start",
+        "params": {
+            "dir": dir.path().display().to_string(),
+            "audio_key": STANDARD.encode([7u8; 32]),
+            "source": "all",
+        },
+    }));
+    let start = engine.reply(1);
+    assert_eq!(start["ok"], true, "{start}");
+    assert!(start["result"]["start_wall_ms"].as_i64().unwrap() > 0);
+    let t0 = Instant::now();
+
+    // Remote speech in 0-5 s. The microphone must stay silent.
+    play(&paplay, REMOTE_SINK, &remote_tone);
+
+    // Microphone speech in 8-13 s. The remote track must stay silent.
+    sleep_until(t0, 8.0);
+    play(&paplay, MIC_SINK, &mic_tone);
+
+    // A remote tone while paused must not reach the chunks.
+    sleep_until(t0, 15.0);
+    engine.send(json!({ "id": 2, "cmd": "pause" }));
+    assert_eq!(engine.reply(2)["ok"], true);
+    play(&paplay, REMOTE_SINK, &paused_tone);
+
+    // Resume and speak into the microphone again in 20-25 s.
+    sleep_until(t0, 19.5);
+    engine.send(json!({ "id": 3, "cmd": "resume" }));
+    assert_eq!(engine.reply(3)["ok"], true);
+    sleep_until(t0, 20.0);
+    play(&paplay, MIC_SINK, &mic_tone);
+
+    sleep_until(t0, 28.0);
+    engine.send(json!({ "id": 4, "cmd": "stop" }));
+    assert_eq!(engine.reply(4)["ok"], true);
+    engine.finish();
+    let seen = std::mem::take(&mut engine.seen);
+
+    let key = [7u8; 32];
+    let remote = read_track(dir.path(), &key, Track::Remote).unwrap();
+    let mic = read_track(dir.path(), &key, Track::Mic).unwrap();
+    eprintln!("remote {} samples, mic {} samples", remote.len(), mic.len());
+    for (name, track) in [("remote", &remote), ("mic", &mic)] {
+        let windows: Vec<String> = (0..28)
+            .map(|second| {
+                format!(
+                    "{second}:{:.3}",
+                    rms(track, second as f32, second as f32 + 1.0)
+                )
+            })
+            .collect();
+        eprintln!("{name} rms by second: {}", windows.join(" "));
+    }
+    eprintln!(
+        "default sink {} / source {}",
+        run(&fixture.pactl, &["get-default-sink"]),
+        run(&fixture.pactl, &["get-default-source"])
+    );
+
+    // Both tracks open within a few hundred milliseconds of the start.
+    assert!(remote.len() > 20 * SAMPLE_RATE as usize, "remote length");
+    assert!(mic.len() > 20 * SAMPLE_RATE as usize, "mic length");
+
+    // Remote: audible 1-4 s, silent while only the microphone plays and while
+    // the recording is paused.
+    assert!(rms(&remote, 1.0, 4.0) > 0.1, "remote tone");
+    assert!(
+        rms(&remote, 9.0, 12.0) < 0.01,
+        "remote hears the microphone"
+    );
+    assert!(rms(&remote, 16.0, 18.0) < 0.01, "remote through the pause");
+
+    // Microphone: silent while only the remote plays, audible at 9-12 s and
+    // again after the resume.
+    assert!(rms(&mic, 1.0, 4.0) < 0.01, "microphone hears the remote");
+    assert!(rms(&mic, 9.0, 12.0) > 0.1, "microphone tone");
+    assert!(rms(&mic, 21.0, 24.0) > 0.1, "microphone after the resume");
+
+    // The levels events report both meters and the capture state.
+    let levels: Vec<&Value> = seen
+        .iter()
+        .filter(|value| value["event"] == "levels")
+        .collect();
+    assert!(!levels.is_empty(), "no levels events");
+    assert!(levels
+        .iter()
+        .any(|event| event["remote"].as_f64().unwrap_or(0.0) > 0.02));
+    assert!(levels
+        .iter()
+        .any(|event| event["mic"].as_f64().unwrap_or(0.0) > 0.02));
+    assert!(levels.iter().any(|event| event["remote_capturing"] == true));
+
+    let session = std::fs::read_dir(dir.path().join("audio"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("session-"))
+        .count();
+    assert_eq!(session, 1, "one session json");
+
+    drop(fixture);
+}

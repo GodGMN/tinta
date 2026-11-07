@@ -119,7 +119,33 @@ if [ ! -s data/librispeech_testclean_30.wav ]; then
     --out-ref data/librispeech_testclean_30.ref.json
 fi
 
-# 4. Checksums pinned at benchmark time (see docs/fork/benchmark.md).
+# 4. AMI IHM test split for the ASR baseline (docs/fork/asr-baseline.md, task 19).
+#    `edinburghcstr/ami`, config `ihm`, split `test`: the reference-segmented
+#    single-headset condition the Open ASR Leaderboard and the Parakeet v3 model
+#    card use (11.31% WER). Public, no token. The revision is pinned; the LFS oid
+#    of each parquet file is its SHA-256, checked here again.
+BASE19="${BASE19:-/home/sergio/code/evidence/tinta-fork/19}"
+AMI_REV="46f28f2503e2ec48f8867a84eef356c70476beab"
+IHM_BASE="https://huggingface.co/datasets/edinburghcstr/ami/resolve/$AMI_REV/ihm"
+mkdir -p "$BASE19/data/ihm-test"
+ihm_files="
+d95920dccc6924c15215239461bf5d1152fe07c9c61add073bd12da26dd602e0 test-00000-of-00004.parquet
+07a2b1c407cf36bc1e66c1362b0248ed32c897edc2a116549d1dc6b456dc2325 test-00001-of-00004.parquet
+83cde21e55fc884295585327b0ee334cba47ad53bdb787dd5f97437067aca5f8 test-00002-of-00004.parquet
+3312bb79400ddef62d5a0097e124dfabe86a693b4643e7fef7d72a62588280d7 test-00003-of-00004.parquet
+"
+printf '%s\n' "$ihm_files" | while read -r want f; do
+  [ -n "${want:-}" ] || continue
+  p="$BASE19/data/ihm-test/$f"
+  if [ -s "$p" ] && printf '%s  %s\n' "$want" "$p" | sha256sum -c --status; then
+    continue
+  fi
+  rm -f "$p"
+  curl -fL --retry 5 --retry-all-errors --retry-delay 3 -o "$p" "$IHM_BASE/$f"
+  printf '%s  %s\n' "$want" "$p" | sha256sum -c --status
+done
+
+# 5. Checksums pinned at benchmark time (see docs/fork/benchmark.md).
 sha256sum -c <<'EOF'
 9c76866990fcc8b84006dc32d273ad99df439090b748ebe72103bb78c3216ee7  data/ES2002a.Mix-Headset.wav
 25c9a48237c1f23bc419702f89234467a1b9efedbac16d9673f52d6a8c1c6a57  data/IS1000a.Mix-Headset.wav

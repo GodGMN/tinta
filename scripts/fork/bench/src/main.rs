@@ -10,8 +10,16 @@
 //! Every stage writes one JSON object. Timings are wall clock. Model load is
 //! measured twice: "cold" after evicting the model files from the page cache
 //! (posix_fadvise DONTNEED), "warm" by building a second instance right after.
+//!
+//! `batch` is for short reference-segmented utterances (the AMI IHM baseline in
+//! docs/fork/asr-baseline.md): it builds the recognizer once and decodes a TSV
+//! manifest of `id <TAB> wav <TAB> start <TAB> end` rows, so thousands of
+//! 1-20 s clips do not pay the model load each time. No VAD, no chunking: each
+//! row is decoded exactly as the dataset defines it, like the Open ASR
+//! Leaderboard condition.
 
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, BufWriter};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
     OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
@@ -708,6 +716,115 @@ fn run_asr_stage(cfg: &AsrStage) -> Value {
     })
 }
 
+/// Decode a TSV manifest of short reference-segmented utterances.
+///
+/// `batch` exists because the AMI IHM baseline decodes thousands of 1-20 s
+/// clips (docs/fork/asr-baseline.md). `asr` builds the recognizer three times
+/// per file and evicts the model from the page cache; that is meaningful for a
+/// long meeting, not for a 2 s utterance. Here the recognizer is built once,
+/// the last wav stays resident, and every row is decoded exactly as the dataset
+/// defines it: no VAD, no chunking, no padding.
+///
+/// Manifest line: `id <TAB> wav <TAB> start_s <TAB> end_s`; an empty start/end
+/// means the whole file. Output is JSONL, one object per row.
+fn run_batch(args: &Args) {
+    let manifest = args.req("manifest");
+    let out_path = args.req("output");
+    let models = AsrModels {
+        encoder: args.req("encoder"),
+        decoder: args.req("decoder"),
+        joiner: args.req("joiner"),
+        tokens: args.req("tokens"),
+    };
+    let threads = args.i32_or("threads", 2);
+    let spin = args.i32_or("spin", 0);
+    let (provider, provider_conf) = provider_string(spin);
+
+    let t = Instant::now();
+    let rec = build_recognizer(&models, threads, &provider).expect("create recognizer");
+    let load_ms = ms_since(t);
+    eprintln!("batch: recognizer loaded in {load_ms:.0} ms, threads {threads}");
+
+    let file = File::open(&manifest).expect("open manifest");
+    if let Some(dir) = Path::new(&out_path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut out = BufWriter::new(File::create(&out_path).expect("create output"));
+
+    let cpu_start = cpu_seconds();
+    let t_all = Instant::now();
+    let mut cached: Option<(String, Vec<f32>)> = None;
+    let mut rows = 0usize;
+    let mut audio_s = 0.0f64;
+    for line in BufReader::new(file).lines() {
+        let line = line.expect("read manifest line");
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert!(cols.len() >= 2, "bad manifest line: {line}");
+        let id = cols[0];
+        let wav_path = cols[1];
+        let (start_s, end_s) = if cols.len() >= 4 && !cols[2].is_empty() && !cols[3].is_empty() {
+            (
+                cols[2].parse::<f64>().expect("start"),
+                cols[3].parse::<f64>().expect("end"),
+            )
+        } else {
+            (0.0, f64::INFINITY)
+        };
+        if cached.as_ref().map(|(p, _)| p.as_str()) != Some(wav_path) {
+            let w = Wave::read(wav_path).unwrap_or_else(|| panic!("read wav {wav_path}"));
+            assert_eq!(w.sample_rate(), 16000, "expected 16 kHz: {wav_path}");
+            cached = Some((wav_path.to_string(), w.samples().to_vec()));
+        }
+        let samples = &cached.as_ref().expect("cached wav").1;
+        let a = ((start_s * SAMPLE_RATE as f64) as usize).min(samples.len());
+        let b = ((end_s * SAMPLE_RATE as f64) as usize).min(samples.len()).max(a);
+        assert!(b > a, "empty span for {id}");
+        let piece_s = (b - a) as f64 / SAMPLE_RATE as f64;
+        audio_s += piece_s;
+        let (_text, tk, tsv, dur) = run_asr_call(&rec, &samples[a..b], 0.0);
+        let words = tokens_to_words(&tk, &tsv, dur.as_deref());
+        let text = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let row = json!({
+            "id": id,
+            "text": text,
+            "audio_seconds": piece_s,
+            "words": words.iter().map(|w| json!({"start": w.start, "end": w.end, "text": w.text})).collect::<Vec<_>>(),
+        })
+        .to_string();
+        out.write_all(row.as_bytes()).expect("write row");
+        out.write_all(b"\n").expect("write newline");
+        rows += 1;
+        if rows.is_multiple_of(250) {
+            eprintln!(
+                "batch: {rows} rows, {:.1} min audio, {:.1} min wall",
+                audio_s / 60.0,
+                t_all.elapsed().as_secs_f64() / 60.0
+            );
+        }
+    }
+    out.flush().expect("flush output");
+    let wall = t_all.elapsed().as_secs_f64();
+    let cpu = cpu_seconds() - cpu_start;
+    eprintln!(
+        "batch: {rows} rows, {:.2} min audio, {:.1} min wall, {:.0} CPU-s, RTF {:.3}, peak RSS {:.0} MB -> {out_path}",
+        audio_s / 60.0,
+        wall / 60.0,
+        cpu,
+        wall / audio_s.max(1e-9),
+        peak_rss_mb()
+    );
+    if let Some(path) = provider_conf {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 struct DiarStage<'a> {
     samples: &'a [f32],
     audio_s: f64,
@@ -842,6 +959,10 @@ fn combine_turns(asr: &Value, diar_segments: &[(f32, f32, i32)]) -> Vec<Value> {
 
 fn main() {
     let args = Args::parse();
+    if args.cmd == "batch" {
+        run_batch(&args);
+        return;
+    }
     let wav_path = args.req("wav");
     let out_path = args.req("output");
     let machine = machine_info();

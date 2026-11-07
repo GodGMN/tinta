@@ -26,3 +26,20 @@ cargo clippy --locked -p tinta-core --all-targets -- -D warnings
 
 The `core-linux` job in `.github/workflows/ci.yml` runs the same commands on
 `ubuntu-latest`.
+
+## The engine crate on Linux, Windows and macOS
+
+`crates/tinta-engine-rs` does not depend on `tinta-core`, so the bundled
+SQLCipher build and the OpenSSL headers above do not apply to it. Its
+dependencies are pure Rust plus the prebuilt sherpa-onnx native libraries that
+`sherpa-onnx-sys` downloads in its build script. The `engine-windows`
+(`windows-latest`) and `engine-macos` (`macos-15-intel`) jobs in
+`.github/workflows/ci.yml` build and test only `-p tinta-engine-rs`, with no
+extra system packages:
+
+```sh
+cargo test --locked -p tinta-engine-rs
+cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+```
+
+On Linux the same two commands run in `core-linux` after the `tinta-core` steps.

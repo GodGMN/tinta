@@ -7,6 +7,7 @@ mod system;
 
 use anyhow::{bail, Result};
 use engine::Engine;
+use tinta_core::capabilities::Capabilities;
 use tinta_core::db::{Db, Participant};
 use tinta_core::keys::Keys;
 use tinta_core::naming;
@@ -130,6 +131,8 @@ pub struct AppState {
     pub calls: Mutex<Vec<AppCall>>,
     /// The events of the calendars on this Mac.
     pub calendar: Mutex<calendar::CalendarState>,
+    /// The features that the engine reported in `ready` or in the `ping` reply.
+    pub capabilities: Mutex<Capabilities>,
     pub finalizing: Mutex<HashSet<String>>,
     pub summarizing: Mutex<HashSet<String>>,
     /// A call that ended during a recording, and the time of the end message.
@@ -145,6 +148,18 @@ pub struct AppState {
 
 /// The processing error of a recording without speech. The window shows its own text for this error.
 pub const NO_SPEECH: &str = "Tinta heard no speech in this recording.";
+
+/// What the app says when the engine does not have the summaries feature.
+pub const SUMMARIES_UNAVAILABLE: &str = "Summaries are not available on this platform.";
+
+/// What the app says when the engine cannot read the window of a call app.
+pub const CALL_READER_UNAVAILABLE: &str = "Reading names from the call window is not available on this platform.";
+
+/// What the app says when the engine cannot import an audio file.
+pub const IMPORT_AUDIO_UNAVAILABLE: &str = "Importing audio files is not available on this platform.";
+
+/// What the app says when the engine cannot read the calendars.
+pub const CALENDAR_UNAVAILABLE: &str = "Calendars are not available on this platform.";
 
 /// The time between leaving a call and the automatic stop. A rejoin in this time cancels the stop.
 const CALL_END_GRACE_MS: i64 = 3000;
@@ -202,6 +217,36 @@ impl AppState {
 
     pub fn meeting_changed(&self, id: &str) {
         self.emit("meeting_changed", json!({"id": id}));
+    }
+
+    /// The features that the engine supports, as it last reported them.
+    pub fn capabilities(&self) -> Capabilities {
+        *self.capabilities.lock().unwrap()
+    }
+
+    /// Stores the capabilities of the engine and tells the window when they change.
+    fn set_capabilities(&self, capabilities: Capabilities) {
+        let changed = {
+            let mut current = self.capabilities.lock().unwrap();
+            let changed = *current != capabilities;
+            *current = capabilities;
+            changed
+        };
+        if changed {
+            self.emit("capabilities", json!(capabilities));
+        }
+    }
+
+    /// Starts the watchers of the features that the engine supports. The call watcher also reads the
+    /// calls in progress, which recovers them after an engine restart.
+    pub fn start_watchers(&self) {
+        let capabilities = self.capabilities();
+        if capabilities.calls_detection {
+            watch_calls(Duration::ZERO);
+        }
+        if capabilities.calendar {
+            calendar::watch();
+        }
     }
 
     /// Refuses a change to a meeting while it records or while the final pass runs.
@@ -394,10 +439,11 @@ impl AppState {
                 self.emit("calls", json!([]));
                 self.emit("engine", event);
                 self.on_recording_lost();
-                watch_calls(self.next_restart_delay());
+                start_engine(self.next_restart_delay());
             }
             "ready" => {
                 self.engine_restart.lock().unwrap().0 = Some(Instant::now());
+                self.set_capabilities(Capabilities::from_json(&event));
                 self.emit("engine", event);
             }
             kind @ ("finalize_progress" | "summary_progress") => {
@@ -594,6 +640,9 @@ impl AppState {
     // MARK: Summaries
 
     pub fn summaries_available(&self) -> bool {
+        if !self.capabilities().summaries {
+            return false;
+        }
         let status = self.engine.call("summary_status", json!({}), Duration::from_secs(10));
         status.map(|s| s["available"].as_bool().unwrap_or(false)).unwrap_or(false)
     }
@@ -608,6 +657,9 @@ impl AppState {
 
     /// Writes a summary from the notes and the transcript with the local model.
     pub fn summarize(self: &Arc<Self>, id: &str) -> Result<()> {
+        if !self.capabilities().summaries {
+            bail!(SUMMARIES_UNAVAILABLE);
+        }
         if !self.summarizing.lock().unwrap().insert(id.to_string()) {
             bail!("a summary for this meeting is already in progress");
         }
@@ -911,13 +963,39 @@ impl Drop for FinalizeGuard {
     }
 }
 
-/// Starts the engine after `delay`. The engine watches for desktop app calls. The app sends the reading setting and reads the current calls.
+/// Starts the engine if it is not running, then starts the watchers of the features that it supports.
+/// `ping` has no side effects and starts a stopped engine. The engine reader thread calls this after
+/// the engine stops, so the work runs on its own thread.
+pub fn start_engine(delay: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let state = state();
+        // `ready` also carries the capabilities. A reply without them keeps what `ready` said, because
+        // an engine may report the capabilities only there.
+        let capabilities = state
+            .engine
+            .call("ping", json!({}), Duration::from_secs(20))
+            .ok()
+            .filter(|result| Capabilities::reported(result))
+            .map(|result| Capabilities::from_json(&result));
+        if let Some(capabilities) = capabilities {
+            state.set_capabilities(capabilities);
+        }
+        state.start_watchers();
+    });
+}
+
+/// Sends the call reading setting to the engine and reads the current calls.
 /// The engine reader thread calls this after the engine stops, so the call runs on its own thread.
 pub fn watch_calls(delay: Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
         let state = state();
-        let read = state.setting("call_reading", "false") == "true";
+        if !state.capabilities().calls_detection {
+            return;
+        }
+        // Reading the call window is a second feature. Without it, the engine only watches the audio.
+        let read = state.capabilities().call_reader && state.setting("call_reading", "false") == "true";
         let Ok(result) = state.engine.call("calls", json!({"read": read}), Duration::from_secs(20)) else { return };
         let calls: Vec<AppCall> =
             result["calls"].as_array().map(|list| list.iter().filter_map(AppCall::parse).collect()).unwrap_or_default();
@@ -966,6 +1044,7 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
         extension: Mutex::new(ExtensionState::default()),
         calls: Mutex::new(Vec::new()),
         calendar: Mutex::new(calendar::CalendarState::default()),
+        capabilities: Mutex::new(Capabilities::default()),
         finalizing: Mutex::new(HashSet::new()),
         summarizing: Mutex::new(HashSet::new()),
         call_ended: Mutex::new(None),
@@ -974,8 +1053,7 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
         engine_restart: Mutex::new((None, ENGINE_RESTART_MIN)),
     });
     let _ = STATE.set(state.clone());
-    watch_calls(ENGINE_RESTART_MIN);
-    calendar::watch();
+    start_engine(ENGINE_RESTART_MIN);
     // Test runs use their own data folder and must not change the Chrome configuration.
     if std::env::var_os("TINTA_DATA_DIR").is_none() {
         let _ = platform::install_native_host();

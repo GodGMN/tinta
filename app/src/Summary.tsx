@@ -1,5 +1,5 @@
 import { Fragment, ReactNode, useEffect, useState } from "react";
-import { api, Bootstrap, dateTime, MeetingDetail, on } from "./api";
+import { api, Bootstrap, capabilitiesOf, dateTime, MeetingDetail, on } from "./api";
 import { Icon } from "./Brand";
 import { ConfirmButton } from "./Menu";
 
@@ -56,7 +56,8 @@ export function SummaryPanel({ detail, boot, onError, onMessage }: Props) {
   };
   const id = detail.meeting.id;
   const summary = detail.summary;
-  const available = boot?.summaries.available ?? false;
+  const caps = capabilitiesOf(boot);
+  const available = caps.summaries && (boot?.summaries.available ?? false);
 
   useEffect(() => {
     const subs = [
@@ -99,6 +100,8 @@ export function SummaryPanel({ detail, boot, onError, onMessage }: Props) {
   }
 
   if (!summary) {
+    // An engine without summaries has no control to offer. A meeting may still show a summary written elsewhere.
+    if (!caps.summaries) return null;
     return (
       <section className="panel summary-panel empty">
         <div>
@@ -128,9 +131,11 @@ export function SummaryPanel({ detail, boot, onError, onMessage }: Props) {
             <button className="quiet" onClick={copy}>
               Copy
             </button>
-            <button className="quiet" onClick={start} disabled={!available} title={available ? "" : boot?.summaries.reason}>
-              Write again
-            </button>
+            {caps.summaries && (
+              <button className="quiet" onClick={start} disabled={!available} title={available ? "" : boot?.summaries.reason}>
+                Write again
+              </button>
+            )}
             <ConfirmButton
               label="Delete"
               question="Delete this summary?"

@@ -1,6 +1,9 @@
 //! Commands for the app window.
 
-use crate::{platform, state, system, MCP_ENABLED_DEFAULT};
+use crate::{
+    platform, state, system, CALL_READER_UNAVAILABLE, IMPORT_AUDIO_UNAVAILABLE, MCP_ENABLED_DEFAULT,
+    SUMMARIES_UNAVAILABLE,
+};
 use tinta_core::db::Origin;
 use tinta_core::export::{self, Document};
 use tinta_core::paths;
@@ -24,8 +27,14 @@ async fn bootstrap() -> CommandResult<Value> {
         let s = state();
         let models = s.engine.call("models_status", json!({}), Duration::from_secs(20)).unwrap_or(json!({}));
         let permissions = s.engine.call("permissions", json!({}), Duration::from_secs(10)).unwrap_or(json!({}));
-        let summaries =
-            s.engine.call("summary_status", json!({}), Duration::from_secs(10)).unwrap_or(json!({"available": false}));
+        // The engine reported its capabilities in the `ready` event of the process that the calls above started.
+        let capabilities = s.capabilities();
+        // Real availability comes from `summary_status`, but only when the engine has the feature at all.
+        let summaries = if capabilities.summaries {
+            s.engine.call("summary_status", json!({}), Duration::from_secs(10)).unwrap_or(json!({"available": false}))
+        } else {
+            json!({"available": false, "reason": SUMMARIES_UNAVAILABLE})
+        };
         let mcp_path = platform::helper_path("tinta-mcp");
         let mut result = {
             let db = s.db.lock().unwrap();
@@ -52,6 +61,7 @@ async fn bootstrap() -> CommandResult<Value> {
         for (key, value) in [
             ("accessibility", json!(permissions["accessibility"].as_bool().unwrap_or(false))),
             ("summaries", summaries),
+            ("capabilities", json!(capabilities)),
             ("filevault", json!(platform::filevault_on())),
             ("models_installed", json!(models["installed"].as_bool().unwrap_or(false))),
             ("models_path", models["path"].clone()),
@@ -85,7 +95,19 @@ async fn set_setting(key: String, value: String) -> CommandResult<()> {
 
 #[tauri::command]
 async fn request_accessibility() -> CommandResult<Value> {
-    blocking(|| state().engine.call("request_accessibility", json!({}), Duration::from_secs(10)).map_err(err)).await
+    blocking(|| {
+        if !state().capabilities().call_reader {
+            return Err(CALL_READER_UNAVAILABLE.to_string());
+        }
+        state().engine.call("request_accessibility", json!({}), Duration::from_secs(10)).map_err(err)
+    })
+    .await
+}
+
+/// The features of the engine, for the window and for scripts.
+#[tauri::command]
+async fn capabilities() -> CommandResult<Value> {
+    Ok(json!(state().capabilities()))
 }
 
 /// Opens a pane of System Settings: "accessibility", "microphone", "calendars", or "internet_accounts".
@@ -127,6 +149,9 @@ async fn open_event(id: String, join: bool) -> CommandResult<String> {
 #[tauri::command]
 async fn save_call_report(app: String, path: String) -> CommandResult<()> {
     blocking(move || {
+        if !state().capabilities().call_reader {
+            return Err(CALL_READER_UNAVAILABLE.to_string());
+        }
         let result = state().engine.call("call_report", json!({"app": app}), Duration::from_secs(20)).map_err(err)?;
         let text = result["text"].as_str().unwrap_or_default();
         std::fs::write(&path, text).map_err(err)
@@ -315,6 +340,9 @@ async fn delete_summary(id: String) -> CommandResult<()> {
 async fn import_recording(path: String) -> CommandResult<Value> {
     blocking(move || {
         let s = state();
+        if !s.capabilities().import_audio {
+            return Err(IMPORT_AUDIO_UNAVAILABLE.to_string());
+        }
         let name = std::path::Path::new(&path)
             .file_stem()
             .map(|n| n.to_string_lossy().to_string())
@@ -614,6 +642,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         install_models,
         request_microphone,
         request_accessibility,
+        capabilities,
         open_privacy_settings,
         refresh_calendar,
         request_calendar,

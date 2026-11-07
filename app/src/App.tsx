@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Active, allowCalendar, allowMicrophone, api, AppCall, Bootstrap, CalendarState, ExtensionState, Meeting, on, Preview, SearchHit } from "./api";
+import { Active, allowCalendar, allowMicrophone, api, AppCall, Bootstrap, CalendarState, Capabilities, capabilitiesOf, ExtensionState, Meeting, on, Preview, SearchHit } from "./api";
 import { MeetingView } from "./MeetingView";
 import { MeetingList, Notice, pressable, tagList } from "./MeetingList";
 import { Mcp, Settings, Trash } from "./Settings";
@@ -46,6 +46,7 @@ export function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [granolaExport, setGranolaExport] = useState<string | null>(null);
   const [compact, setCompact] = useState(() => window.innerWidth < COMPACT_WIDTH);
+  const caps = capabilitiesOf(boot);
 
   useEffect(() => {
     const resize = () => setCompact(window.innerWidth < COMPACT_WIDTH);
@@ -113,11 +114,13 @@ export function App() {
   }, [!!boot, micAllowed, refreshBoot]);
 
   // The calendars change in other apps and in System Settings, so Tinta reads them again when the window gets the focus.
+  // Only when the engine supports calendars at all.
   useEffect(() => {
+    if (!boot?.capabilities.calendar) return;
     const focus = () => void api.refreshCalendar().then(setCalendar).catch(() => undefined);
     window.addEventListener("focus", focus);
     return () => window.removeEventListener("focus", focus);
-  }, []);
+  }, [boot?.capabilities.calendar]);
 
   useEffect(() => {
     void refreshList();
@@ -131,6 +134,12 @@ export function App() {
       on<ExtensionState>("extension", setExtension),
       on<AppCall[]>("calls", setCalls),
       on<Active | null>("recording", setActive),
+      // The capabilities change when the engine restarts with another build. The summary
+      // availability comes from an engine call, so read the bootstrap again.
+      on<Capabilities>("capabilities", (c) => {
+        setBoot((b) => (b ? { ...b, capabilities: c } : b));
+        void refreshBoot();
+      }),
       on<{ id: string; app: string }>("auto_stopped", (p) => {
         setNotice({ text: `The ${p.app} call ended, so Tinta stopped the recording.` });
         void refreshList();
@@ -144,7 +153,7 @@ export function App() {
       }),
     ];
     return () => subs.forEach((p) => p.then((u) => u()));
-  }, [refreshList, show]);
+  }, [refreshList, refreshBoot, show]);
 
   useEffect(() => {
     if (!query.trim()) {
@@ -232,7 +241,8 @@ export function App() {
     let id: string | null = null;
     try {
       id = eventId ? await api.openEvent(eventId, false) : (await api.createMeeting()).id;
-      setActive(await api.startRecording(id, source));
+      // Without per-app capture the engine records all system audio, and the call plays through it.
+      setActive(await api.startRecording(id, caps.capture_app_audio ? source : "all"));
       await refreshList();
       setView({ kind: "meeting", id });
     } catch (e) {
@@ -357,17 +367,21 @@ export function App() {
           </ul>
         ) : (
           <>
-            <CallNotice
-              calendar={calendar}
-              meetings={meetings}
-              active={active}
-              extension={extension}
-              ready={boot?.models_installed ?? false}
-              busy={creating}
-              onOpenEvent={openEvent}
-              onRecord={(eventId) => void recordCall("com.google.Chrome", eventId)}
-            />
-            <SidebarNext calendar={calendar} busy={creating} onOpen={(id) => void openEvent(id, false)} onConnect={connectCalendar} />
+            {caps.calendar && (
+              <>
+                <CallNotice
+                  calendar={calendar}
+                  meetings={meetings}
+                  active={active}
+                  extension={extension}
+                  ready={boot?.models_installed ?? false}
+                  busy={creating}
+                  onOpenEvent={openEvent}
+                  onRecord={(eventId) => void recordCall("com.google.Chrome", eventId)}
+                />
+                <SidebarNext calendar={calendar} busy={creating} onOpen={(id) => void openEvent(id, false)} onConnect={connectCalendar} />
+              </>
+            )}
             <MeetingList
               meetings={meetings}
               loaded={loaded}

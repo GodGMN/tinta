@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Access, McpTool, allowMicrophone, api, AppCall, Bootstrap, Browser, bytes, CalendarState, dateTime, Meeting, on, RETENTION_DAYS, Revision, StorageUsage } from "./api";
+import { Access, McpTool, allowMicrophone, api, AppCall, Bootstrap, Browser, bytes, CalendarState, capabilitiesOf, dateTime, Meeting, on, RETENTION_DAYS, Revision, StorageUsage } from "./api";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
 import { setTheme, ThemeChoice } from "./theme";
@@ -27,6 +27,9 @@ type Props = {
 export function Settings({ boot, calls, calendar, onConnectCalendar, onGranola, onChanged, onError }: Props) {
   const [name, setName] = useState(boot.self_name);
   const { progress, install } = useModelInstall(onChanged, onError);
+  const caps = capabilitiesOf(boot);
+  // The calendar group has no content when the engine cannot read calendars.
+  const groups = GROUPS.filter(([gid]) => gid !== "settings-calendar" || caps.calendar);
 
   const [moving, setMoving] = useState(false);
   const [usage, setUsage] = useState<StorageUsage | null>(null);
@@ -95,7 +98,7 @@ export function Settings({ boot, calls, calendar, onConnectCalendar, onGranola, 
         <button onClick={() => set("onboarded", "false")}>Run setup again</button>
       </div>
       <nav className="settings-nav" aria-label="Settings groups">
-        {GROUPS.map(([gid, label]) => (
+        {groups.map(([gid, label]) => (
           <button key={gid} className="quiet" onClick={() => document.getElementById(gid)?.scrollIntoView({ behavior: "smooth", block: "start" })}>
             {label}
           </button>
@@ -141,20 +144,26 @@ export function Settings({ boot, calls, calendar, onConnectCalendar, onGranola, 
 
       <section className="panel">
         <h3>Summaries</h3>
-        <label>
-          <input
-            type="checkbox"
-            checked={boot.auto_summary}
-            disabled={!boot.summaries.available}
-            onChange={(e) => set("auto_summary", String(e.target.checked))}
-          />{" "}
-          Write a summary after each call
-        </label>
-        <p className="small muted">
-          {boot.summaries.available
-            ? "The Apple on-device model writes the summary from your notes and the transcript. You can also write a summary from each meeting."
-            : boot.summaries.reason}
-        </p>
+        {caps.summaries ? (
+          <>
+            <label>
+              <input
+                type="checkbox"
+                checked={boot.auto_summary}
+                disabled={!boot.summaries.available}
+                onChange={(e) => set("auto_summary", String(e.target.checked))}
+              />{" "}
+              Write a summary after each call
+            </label>
+            <p className="small muted">
+              {boot.summaries.available
+                ? "The Apple on-device model writes the summary from your notes and the transcript. You can also write a summary from each meeting."
+                : boot.summaries.reason}
+            </p>
+          </>
+        ) : (
+          <p className="small muted">Summaries are not available on this platform.</p>
+        )}
       </section>
 
       <h2 className="group-title" id="settings-recording">Recording and calls</h2>
@@ -171,8 +180,9 @@ export function Settings({ boot, calls, calendar, onConnectCalendar, onGranola, 
           </div>
         )}
         <p className="small">
-          With speakers, Tinta removes the echo of the call from your microphone, and other audio plays a little quieter. With
-          headphones, it records your microphone directly. Headphones give the best transcript.
+          {caps.echo_cancellation
+            ? "With speakers, Tinta removes the echo of the call from your microphone, and other audio plays a little quieter. With headphones, it records your microphone directly. Headphones give the best transcript."
+            : "Tinta records your microphone and the meeting audio. Use headphones so that the meeting audio does not come back through your microphone."}
         </p>
         <p className="small muted">
           Tinta records the default input device. Change it in System Settings, Sound. macOS asks for access to the meeting audio
@@ -189,35 +199,44 @@ export function Settings({ boot, calls, calendar, onConnectCalendar, onGranola, 
         <p className="small muted">
           Tinta stops 3 seconds after you leave the call. If you join again in this time, the recording continues.
         </p>
-        <label>
-          <input type="checkbox" checked={boot.call_reading} onChange={(e) => setCallReading(e.target.checked)} /> Get speaker names
-          from Zoom and Microsoft Teams <span className="tag">Beta</span>
-        </label>
-        <p className="small muted">
-          Tinta reads the participant names, who speaks, and your mute state from the call window. It does not keep other text.
-          This needs Accessibility access.
-        </p>
-        {boot.call_reading && !boot.accessibility && (
-          <div className="row">
-            <span className="warn small">macOS does not allow Accessibility access for Tinta.</span>
-            <button onClick={() => api.openPrivacySettings("accessibility").catch((e) => onError(String(e)))}>Open Accessibility settings</button>
-            <button onClick={onChanged}>Check again</button>
-          </div>
-        )}
-        {boot.call_reading && calls.length > 0 && (
+        {caps.call_reader ? (
           <>
-            <div className="row">
-              {calls.map((c) => (
-                <button key={c.app} onClick={() => saveReport(c)}>
-                  Save a report of the {c.name} window
-                </button>
-              ))}
-            </div>
+            <label>
+              <input type="checkbox" checked={boot.call_reading} onChange={(e) => setCallReading(e.target.checked)} /> Get speaker
+              names from Zoom and Microsoft Teams <span className="tag">Beta</span>
+            </label>
             <p className="small muted">
-              If names are missing or wrong, save a report during the call and send it to the Tinta team. The report can contain
-              any text of the window, such as chat messages. Read it before you send it.
+              Tinta reads the participant names, who speaks, and your mute state from the call window. It does not keep other text.
+              This needs Accessibility access.
             </p>
+            {boot.call_reading && !boot.accessibility && (
+              <div className="row">
+                <span className="warn small">macOS does not allow Accessibility access for Tinta.</span>
+                <button onClick={() => api.openPrivacySettings("accessibility").catch((e) => onError(String(e)))}>Open Accessibility settings</button>
+                <button onClick={onChanged}>Check again</button>
+              </div>
+            )}
+            {boot.call_reading && calls.length > 0 && (
+              <>
+                <div className="row">
+                  {calls.map((c) => (
+                    <button key={c.app} onClick={() => saveReport(c)}>
+                      Save a report of the {c.name} window
+                    </button>
+                  ))}
+                </div>
+                <p className="small muted">
+                  If names are missing or wrong, save a report during the call and send it to the Tinta team. The report can contain
+                  any text of the window, such as chat messages. Read it before you send it.
+                </p>
+              </>
+            )}
           </>
+        ) : (
+          <p className="small muted">
+            Reading the names, who speaks, and your mute state from a Zoom or Microsoft Teams window is not available on this
+            platform.
+          </p>
         )}
       </section>
 
@@ -237,84 +256,88 @@ export function Settings({ boot, calls, calendar, onConnectCalendar, onGranola, 
         </p>
       </section>
 
-      <h2 className="group-title" id="settings-calendar">Calendar</h2>
-      <section className="panel">
-        <h3>Next meetings</h3>
-        <p className="small muted">
-          Tinta reads the calendars on this Mac and shows your meetings of the next 7 days on Home. It needs no sign-in. To add a
-          Google calendar, add your Google account in System Settings, Internet Accounts, and turn on Calendars.
-        </p>
-        {calendar.access === "granted" ? (
-          <p>Tinta can read your calendars.</p>
-        ) : (
-          <div className="row">
-            <span>{calendar.access === "denied" ? "macOS does not allow calendar access for Tinta." : "Tinta does not have calendar access yet."}</span>
-            <button onClick={onConnectCalendar}>{calendar.access === "denied" ? "Open Calendar settings" : "Connect calendar"}</button>
-          </div>
-        )}
-        <div className="row">
-          <button onClick={() => api.openPrivacySettings("internet_accounts").catch((e) => onError(String(e)))}>Open Internet Accounts</button>
-        </div>
-      </section>
+      {caps.calendar && (
+        <>
+          <h2 className="group-title" id="settings-calendar">Calendar</h2>
+          <section className="panel">
+            <h3>Next meetings</h3>
+            <p className="small muted">
+              Tinta reads the calendars on this Mac and shows your meetings of the next 7 days on Home. It needs no sign-in. To add a
+              Google calendar, add your Google account in System Settings, Internet Accounts, and turn on Calendars.
+            </p>
+            {calendar.access === "granted" ? (
+              <p>Tinta can read your calendars.</p>
+            ) : (
+              <div className="row">
+                <span>{calendar.access === "denied" ? "macOS does not allow calendar access for Tinta." : "Tinta does not have calendar access yet."}</span>
+                <button onClick={onConnectCalendar}>{calendar.access === "denied" ? "Open Calendar settings" : "Connect calendar"}</button>
+              </div>
+            )}
+            <div className="row">
+              <button onClick={() => api.openPrivacySettings("internet_accounts").catch((e) => onError(String(e)))}>Open Internet Accounts</button>
+            </div>
+          </section>
 
-      {calendar.access === "granted" && (
-        <section className="panel">
-          <h3>Reminders</h3>
-          <label>
-            <input type="checkbox" checked={boot.meeting_reminders} onChange={(e) => set("meeting_reminders", String(e.target.checked))} />{" "}
-            Remind me 1 minute before a meeting with a call link starts
-          </label>
-          <p className="small muted">
-            Click the reminder to join the call. Tinta opens Zoom and Microsoft Teams in their apps, and other calls in the browser
-            below. It starts the recording and opens your notes. Tinta must be open to show reminders.
-          </p>
-        </section>
-      )}
+          {calendar.access === "granted" && (
+            <section className="panel">
+              <h3>Reminders</h3>
+              <label>
+                <input type="checkbox" checked={boot.meeting_reminders} onChange={(e) => set("meeting_reminders", String(e.target.checked))} />{" "}
+                Remind me 1 minute before a meeting with a call link starts
+              </label>
+              <p className="small muted">
+                Click the reminder to join the call. Tinta opens Zoom and Microsoft Teams in their apps, and other calls in the browser
+                below. It starts the recording and opens your notes. Tinta must be open to show reminders.
+              </p>
+            </section>
+          )}
 
-      {calendar.access === "granted" && (
-        <section className="panel">
-          <h3>Browser for calls</h3>
-          <label>
-            Open Google Meet and Webex calls in{" "}
-            <select value={boot.call_browser} onChange={(e) => set("call_browser", e.target.value)} aria-label="Browser for calls">
-              <option value="default">{browsers?.default ? `The default browser (${browsers.default.name})` : "The default browser"}</option>
-              {browsers?.browsers.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.name}
-                </option>
-              ))}
-              {browsers && boot.call_browser !== "default" && !browsers.browsers.some((b) => b.id === boot.call_browser) && (
-                <option value={boot.call_browser}>{boot.call_browser} (not installed)</option>
-              )}
-            </select>
-          </label>
-          <p className="small muted">
-            Tinta uses this browser when you join from a reminder or from the list of meetings. Speaker names from Google Meet
-            need the Meet extension, which works in Google Chrome.
-          </p>
-        </section>
-      )}
+          {calendar.access === "granted" && (
+            <section className="panel">
+              <h3>Browser for calls</h3>
+              <label>
+                Open Google Meet and Webex calls in{" "}
+                <select value={boot.call_browser} onChange={(e) => set("call_browser", e.target.value)} aria-label="Browser for calls">
+                  <option value="default">{browsers?.default ? `The default browser (${browsers.default.name})` : "The default browser"}</option>
+                  {browsers?.browsers.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name}
+                    </option>
+                  ))}
+                  {browsers && boot.call_browser !== "default" && !browsers.browsers.some((b) => b.id === boot.call_browser) && (
+                    <option value={boot.call_browser}>{boot.call_browser} (not installed)</option>
+                  )}
+                </select>
+              </label>
+              <p className="small muted">
+                Tinta uses this browser when you join from a reminder or from the list of meetings. Speaker names from Google Meet
+                need the Meet extension, which works in Google Chrome.
+              </p>
+            </section>
+          )}
 
-      {calendar.access === "granted" && calendar.calendars.length > 0 && (
-        <section className="panel">
-          <h3>Calendars</h3>
-          <p className="small muted">Tinta shows the meetings of the selected calendars.</p>
-          <ul className="calendar-list">
-            {calendar.calendars.map((c) => (
-              <li key={c.id}>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={!c.hidden}
-                    onChange={(e) => api.setCalendarHidden(c.id, !e.target.checked).catch((err) => onError(String(err)))}
-                  />{" "}
-                  <span className="event-color" style={{ background: c.color || "var(--accent)" }} /> {c.title}
-                  {c.account && <span className="small muted"> · {c.account}</span>}
-                </label>
-              </li>
-            ))}
-          </ul>
-        </section>
+          {calendar.access === "granted" && calendar.calendars.length > 0 && (
+            <section className="panel">
+              <h3>Calendars</h3>
+              <p className="small muted">Tinta shows the meetings of the selected calendars.</p>
+              <ul className="calendar-list">
+                {calendar.calendars.map((c) => (
+                  <li key={c.id}>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={!c.hidden}
+                        onChange={(e) => api.setCalendarHidden(c.id, !e.target.checked).catch((err) => onError(String(err)))}
+                      />{" "}
+                      <span className="event-color" style={{ background: c.color || "var(--accent)" }} /> {c.title}
+                      {c.account && <span className="small muted"> · {c.account}</span>}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </>
       )}
 
       <h2 className="group-title" id="settings-storage">Storage</h2>

@@ -1,5 +1,6 @@
 // Sample data for `pnpm preview:mock`, a design preview outside the Tauri window.
 // Only the "mock" Vite mode imports this file.
+import { ALL_CAPABILITIES } from "./api";
 import type { Bootstrap, Meeting, MeetingDetail, Turn } from "./api";
 
 const now = Date.now();
@@ -93,6 +94,7 @@ const calendar: Bootstrap["calendar"] = {
 
 const boot: Bootstrap = {
   self_name: "Sam Rivera", onboarded: !hash().startsWith("onboarding"), auto_stop: true, auto_summary: true, audio_retention_days: 7, summaries: { available: true }, mcp_enabled: true, theme: (localStorage.getItem("tinta-theme") as Bootstrap["theme"]) || "system", last_source: "com.google.Chrome", filevault: true,
+  capabilities: ALL_CAPABILITIES,
   models_path: "~/Library/Application Support/FluidAudio/Models", microphone: "granted",
   mcp_path: "/Applications/Tinta.app/Contents/MacOS/tinta-mcp",
   mcp_config: { mcpServers: { tinta: { command: "/Applications/Tinta.app/Contents/MacOS/tinta-mcp" } } },

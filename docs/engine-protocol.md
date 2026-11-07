@@ -78,10 +78,11 @@ to arrive after it.
    see [§9](#9-model-install-and-verification)).
 4. Create the `Controller` actor (`Engine.swift:17`).
 5. Emit the **`ready`** event as the first line:
-   `{"event":"ready","version":"0.9.3"}` (`Engine.swift:18`).
-   The version must equal the app version (`AGENTS.md:15`). The app only forwards it, it
-   does not parse it (`app/src-tauri/src/lib.rs:402-405`; no frontend consumer was found
-   for the `ready` event).
+   `{"event":"ready","version":"0.9.3","capabilities":{…}}` (`Engine.swift:18`).
+   The version must equal the app version (`AGENTS.md:15`). The app reads the
+   `capabilities` object (`crates/tinta-core/src/capabilities.rs`) and forwards the whole
+   event to the window (`app/src-tauri/src/lib.rs`, `on_engine_event`). See
+   [§10.1](#101-capabilities).
 6. Start the desktop-call watcher and the calendar observer (`Engine.swift:19-20`).
    Both are Mac-only. Then start model prewarming in a detached task
    (`Engine.swift:21`, `146-150`).
@@ -89,10 +90,12 @@ to arrive after it.
    parsed and dispatched in a detached task (`Engine.swift:38-61`).
 8. On stdin EOF, call `Controller.shutdown()` and `exit(0)` (`Engine.swift:27-30`).
 
-There is no handshake and no capability negotiation. A second engine that needs to
-announce capabilities must do it with extra fields in `ready` (the app ignores unknown
-fields; it forwards the whole event at `lib.rs:404`) or with a new event; neither is
-consumed by current app code.
+There is no handshake: the app may write commands before the child has read any. The
+capabilities are data, reported in `ready` and in the `ping` reply, not a negotiation. The
+app sends `ping` on its start and after every engine exit, and starts the watchers of the
+optional features only after that reply, and only for what the engine reports as
+supported ([§10.1](#101-capabilities)). An engine that reports no capabilities is the Mac
+engine from before the field, and the app treats every feature as supported.
 
 ### 1.4 Reply/event dispatch on the app side
 
@@ -132,13 +135,13 @@ dropped.
 
 | Command | Timeout | App call site |
 |---|---|---|
-| `ping` | — | no caller in the app |
+| `ping` | 20 s | `lib.rs start_engine` (every engine start) |
 | `models_status` | 20 s | `commands.rs:25`, `commands.rs:563` |
 | `install_models` | 3600 s (1 h) | `commands.rs:147` |
 | `permissions` | 10 s | `commands.rs:26` |
 | `request_microphone` | 120 s | `commands.rs:152` |
 | `list_sources` | 10 s | `commands.rs:157` |
-| `calls` | 20 s | `lib.rs:924` |
+| `calls` | 20 s | `lib.rs watch_calls` (only with `calls_detection`) |
 | `request_accessibility` | 10 s | `commands.rs:88` |
 | `call_report` | 20 s | `commands.rs:138` |
 | `calendar` | 30 s | `calendar.rs:66` |
@@ -170,11 +173,11 @@ made resumable from the files on disk rather than retried blindly.
 - The app supervises the engine **only reactively**. On `engine_exit` it clears the known
   calls (emits `calls: []`), forwards the event, and — if a recording was active — takes
   the meeting away from the recording and starts the final pass on the audio that was
-  already written (`lib.rs:395-401`, `420-427`).
-- Then it schedules one `calls` command after a delay (`lib.rs:400`, `917-932`). That
-  command spawns a fresh process if none is running (`engine.rs:56-66`). Any other command
-  (bootstrap, `start`, calendar refresh, ...) also respawns immediately; the backoff
-  delays only the call-watcher's `calls`.
+  already written (`lib.rs`, `on_recording_lost`).
+- Then it schedules one `ping` command after a delay (`lib.rs start_engine`). That
+  command spawns a fresh process if none is running (`engine.rs:56-66`), and the app
+  starts the supported watchers again after its reply. Any other command (bootstrap,
+  `start`, ...) also respawns immediately; the backoff delays only the `ping`.
 - Backoff: first wait 1 s, doubled after each run that lasted less than 60 s, capped at
   60 s; a run of at least 60 s resets the next wait to 1 s
   (`lib.rs:165-169`, `429-436`). A `ready` event records the start of the current run
@@ -320,7 +323,7 @@ float are interchangeable where a number is expected. Extra parameters are ignor
 `<` is engine stdout, `>` is app stdin:
 
 ```
-< {"event":"ready","version":"0.9.3"}
+< {"event":"ready","version":"0.9.3","capabilities":{…}}
 > {"id":1,"cmd":"models_status","params":{}}
 < {"id":1,"ok":true,"result":{"installed":true,"path":"/Users/sam/Library/Application Support/FluidAudio/Models"}}
 > {"id":2,"cmd":"start","params":{"dir":"/Users/sam/Library/Application Support/Tinta/meetings/m1","audio_key":"…","source":"com.google.Chrome","mic_muted":false}}
@@ -349,21 +352,19 @@ before it (`Engine.swift:49-53`). Unknown commands throw `unknown command <name>
 (`Engine.swift:135-136`).
 
 Concurrency rules in [§5](#5-concurrency) apply to every command. "Mac-only" marks
-commands whose implementation in the Swift engine uses macOS APIs; the app calls them
-regardless of platform, so a second engine must still answer them (see
-[§10.1](#101-the-app-has-no-capability-negotiation)).
+commands whose implementation in the Swift engine uses macOS APIs. A new engine turns them
+off with a capability, which the app honors; an old app calls them regardless, so a second
+engine must still answer them (see [§10.1](#101-capabilities)).
 
 ### 3.1 `ping`
-
-No caller in the app (verified by searching `engine.call(` in `app/src-tauri/src/`).
 
 | | |
 |---|---|
 | params | none |
-| result | `{"pong": true}` (`Engine.swift:76-77`) |
+| result | `{"pong": true, "capabilities": {…}}` (`Engine.swift:76-77`; see [§10.1](#101-capabilities)) |
 | errors | none |
 | events | none |
-| notes | A second engine should keep it; it is the only command with no side effects and no timeout in the app. |
+| notes | The app calls it on every engine start, including the restart after an exit: `ping` starts the process without side effects and carries the capabilities, and the app then starts the watchers that the engine supports (`lib.rs start_engine`). A second engine should keep it free of side effects and fast. |
 
 ### 3.2 `models_status`
 
@@ -423,7 +424,7 @@ No caller in the app (verified by searching `engine.call(` in `app/src-tauri/src
 | result | `{"calls": [{"app": string, "name": string, "since": int64 ms}], "accessibility": bool}` (`Engine.swift:93-95`, `CallWatcher.swift:64-70`) |
 | errors | none |
 | events | the call watcher emits `call_started`, `call_ended`, `call_state` on its own schedule |
-| notes | `read` is a side-effect switch for Accessibility reading (`Engine.swift:94` → `CallWatcher.swift:59-61`); it is sent on every app start and whenever the setting changes (`lib.rs:919-931`, `commands.rs:80-82`). `calls` is the app's **only** recovery path after an engine restart: it replays the calls that are already in progress (`lib.rs:917-932`). `since` is wall-clock ms. Mac-only (Core Audio process list). |
+| notes | `read` is a side-effect switch for Accessibility reading (`Engine.swift:94` → `CallWatcher.swift:59-61`); the app sends it on every engine start and whenever the setting changes, but only when the engine reports `calls_detection`, and it is true only when the engine also reports `call_reader` (`lib.rs watch_calls`). `calls` is the app's **only** recovery path for calls after an engine restart: it replays the calls that are already in progress (`lib.rs watch_calls`). `since` is wall-clock ms. Mac-only (Core Audio process list). |
 
 ### 3.8 `request_accessibility`
 
@@ -659,7 +660,7 @@ Behavioral details:
 
 | Event | Fields | Emitted at | App handling |
 |---|---|---|---|
-| `ready` | `version: string` | `Engine.swift:18` | Records the run start, forwards to the frontend (`lib.rs:402-405`). First line of a run. |
+| `ready` | `version: string`, `capabilities: object` | `Engine.swift:18` | Stores the capabilities, records the run start, forwards to the frontend (`lib.rs`, `on_engine_event`). First line of a run. |
 | `error` | `message: string` | Invalid request `Engine.swift:43`; live transcription/VAD failure `Session.swift:64`, `91`; chunk write failure `ChunkStore.swift:90` | Forwarded (`lib.rs:416`); UI shows it as a notice (`app/src/App.tsx:142-144`). |
 | `warning` | `message: string` | Echo removal unavailable `Capture.swift:434-437`; tap helper exited `TapHelper.swift:90-91` | Forwarded; UI notice (`App.tsx:142-144`). |
 | `install_progress` | `component: "transcription" \| "vad" \| "diarization" \| "all"`, `state: "downloading" \| "done"` | `Speech.swift:95`, `97`, `99`, `108` | Forwarded; onboarding shows step labels (`app/src/Onboarding.tsx:8-12`, `17-21`). |
@@ -1027,26 +1028,62 @@ Any error aborts the command and is returned as the reply's `error`; the app sho
 
 ## 10. Porting notes
 
-### 10.1 The app has no capability negotiation
+### 10.1 Capabilities
 
-The fork plan wants unsupported features disabled "through engine capabilities"
-(`docs/fork/WORKFLOW.md:15`), but no such field or command exists in the code yet. The app
-calls Mac-only commands unconditionally:
+Every engine reports what it can do in a `capabilities` object, in the `ready` event and in
+the `ping` reply:
 
-- `permissions`, `models_status`, `summary_status` on every bootstrap
-  (`commands.rs:25-28`);
-- `calls` on every start and every engine restart (`lib.rs:917-932`, `964`);
-- `calendar` at startup and every 5 minutes after a successful read; after a **failed** read
-  `read_at` is not updated (`calendar.rs:72`), so the app retries on every 15 s tick
-  (`calendar.rs:20`, `216-222`), and each retry respawns a dead engine with no backoff; and
-  `request_calendar` when the user asks;
-- `summary_status` before an automatic summary and `summarize` when the user asks
-  (`lib.rs:589-593`, `605-645`);
-- `request_accessibility`, `call_report`, accessibility reading when the user turns on
-  call reading (`commands.rs:86-89`, `136-143`; `lib.rs:919-931`).
+```json
+{"event":"ready","version":"0.9.3","capabilities":{"capture_system_audio":true,"capture_app_audio":true,"calls_detection":true,"call_reader":true,"calendar":true,"summaries":true,"echo_cancellation":true,"import_audio":true}}
+```
 
-Therefore a Windows/Linux engine must **answer these with valid, degraded results**, not
-errors, or the app will surface errors and retry loops:
+```json
+> {"id":1,"cmd":"ping","params":{}}
+< {"id":1,"ok":true,"result":{"pong":true,"capabilities":{…}}}
+```
+
+| field | `true` means |
+|---|---|
+| `capture_system_audio` | The engine records the audio of the whole system. The app does not read this field yet. |
+| `capture_app_audio` | The engine records the audio of one app, and `list_sources` names the apps. |
+| `calls_detection` | The engine detects calls in desktop apps and emits `call_started`, `call_ended`, and `call_state`. |
+| `call_reader` | The engine reads names, the active speaker, and the mute state from a call window (`read` in `calls`, `request_accessibility`, `call_report`). |
+| `calendar` | The engine reads the calendars (`calendar`, `request_calendar`, `calendar_changed`). |
+| `summaries` | The engine writes summaries (`summarize`). |
+| `echo_cancellation` | The engine removes the meeting audio from the microphone. |
+| `import_audio` | The engine imports an audio file (`import_audio`). |
+
+Semantics:
+
+- **A missing object means all `true`.** That is the Mac engine from before the field
+  existed, so an engine that never sends it keeps working. The Swift engine now sends the
+  object with every field `true`.
+- A **missing field** inside the object, or a value that is not a boolean, is `true` too.
+- The object describes the binary, not the current permission state: `calendar: true`
+  still means that `calendar.access` can be `denied`, and `summaries: true` still means
+  that `summary_status` can report `available: false`. The app keeps asking those; the
+  features that the capability turns off are not asked at all.
+- `ready` and `ping` must send the same values. The app reads `ready` on every process
+  start and `ping` on every start and restart. A `ping` reply without the object keeps what
+  `ready` said.
+
+The app turns a feature off like this (`crates/tinta-core/src/capabilities.rs`,
+`app/src-tauri/src/`):
+
+| capability `false` | app behavior |
+|---|---|
+| `capture_app_audio` | The meeting source is always `all`, and the window shows a fixed "System audio" instead of the per-app picker. |
+| `calls_detection` | No `calls` polling and no call watcher after a restart (the restart uses `ping`), and no call banners or "call detected" hero. |
+| `call_reader` | `calls` is sent with `read: false`; `request_accessibility` and `call_report` are not sent; the Zoom and Microsoft Teams names setting is hidden. |
+| `calendar` | The calendar thread is not started; `calendar` and `request_calendar` are not sent; the calendar section, the Home cards, and the reminders are hidden. |
+| `summaries` | `summary_status` and `summarize` are not sent, no automatic summary runs, and the summary controls are hidden. An existing summary is still shown. |
+| `echo_cancellation` | The window does not claim that Tinta removes the echo, and suggests headphones. |
+| `import_audio` | The import command and button are disabled. |
+| `capture_system_audio` | Not read by the app yet. |
+
+An old app does not know the object and calls the Mac-only commands anyway. A second engine
+must therefore still **answer these with valid, degraded results**, not errors, or the old
+app will surface errors and retry loops:
 
 | Command | Recommended degraded reply |
 |---|---|
@@ -1061,10 +1098,11 @@ errors, or the app will surface errors and retry loops:
 | `summarize` | a clear error sentence |
 | `list_sources` | the platform's recording targets; `route` may always be `"speakers"` |
 
-`calendar.access = "denied"` also keeps reminders inert, because the app only asks for
-notification permission when the read reports `granted` (`calendar.rs:211-215`). Returning
-`available:false` from `summary_status` prevents automatic summaries without any app
-change (`lib.rs:589`).
+`calendar.access = "denied"` also keeps reminders inert for an old app, because it only
+asks for notification permission when the read reports `granted` (`calendar.rs`, `watch`).
+`available:false` from `summary_status` prevents automatic summaries there too
+(`lib.rs`, `summaries_available`). A new app never gets this far with a capability of
+`false`.
 
 ### 10.2 Recording sources and permissions
 
@@ -1100,7 +1138,7 @@ Do not merge the two, and do not reuse `Request`/`Response` for the engine.
 ### 10.4 Checklist for a second engine
 
 1. Spawn as `tinta-engine`, speak JSON lines on stdin/stdout, logs on stderr, emit
-   `ready` first.
+   `ready` first, with the `capabilities` object ([§10.1](#101-capabilities)).
 2. Echo numeric ids, reply `{id, ok:true, result}` / `{id, ok:false, error}`.
 3. Implement all commands in [§3](#3-commands); at minimum the recording, audio and model
    commands plus the degraded replies above for platform-specific ones.
@@ -1119,13 +1157,14 @@ Do not merge the two, and do not reuse `Request`/`Response` for the engine.
 These are real gaps; a second engine should pick a reasonable behavior and document it,
 and the app may need a change later.
 
-1. **No capability negotiation.** `docs/fork/WORKFLOW.md:15` describes it, the code has
-   none; see [§10.1](#101-the-app-has-no-capability-negotiation).
+1. **Capabilities are trusted, not checked.** The app believes the object; an engine that
+   reports a feature it does not implement makes the app call that command anyway. See
+   [§10.1](#101-capabilities).
 2. **No engine binary override.** The path is fixed to the sidecar/development location
    (`engine.rs:33-38`). The port needs either a rename/install step or an app change.
-3. **`ping` is unused.** No app caller; its reply shape (`{"pong": true}`) is therefore
-   fixed only by the engine, not by a consumer. It is the obvious place to add a future
-   health check.
+3. **`ping` is not a heartbeat.** The app sends it on every start and restart, but not
+   while the engine runs, so a process that hangs without closing stdout is not detected.
+   It is still the obvious place to add a future health check.
 4. **Strings vs numbers for `id`.** The protocol echoes whatever `id` arrives, but the app
    only accepts `u64` (`engine.rs:76`). A second engine interoperates only with numeric
    ids, even though nothing rejects string ids on the wire.
@@ -1176,6 +1215,7 @@ and the app may need a change later.
 | Topic | Location |
 |---|---|
 | App-side transport | `app/src-tauri/src/engine.rs:1-152` |
+| Capabilities | `crates/tinta-core/src/capabilities.rs`; `app/src-tauri/src/lib.rs` (`start_engine`, `watch_calls`) |
 | Engine-side transport | `engine/Sources/TintaEngine/Protocol.swift:1-67` |
 | Command switch | `engine/Sources/TintaEngine/Engine.swift:74-138` |
 | Command dispatch/main loop | `engine/Sources/TintaEngine/Engine.swift:10-61` |

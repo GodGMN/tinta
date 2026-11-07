@@ -9,6 +9,11 @@
 #   scripts/fork/build-integration.sh --no-push     # merge only
 #   scripts/fork/build-integration.sh --resume      # continue after a manual conflict fix
 #
+# The branch also carries a few integration-only commits (the stable AppImage
+# helper paths, the smoke test). They are marked with an
+# `Integration-only: true` trailer and cherry-picked back after the merges, so
+# a rebuild does not lose them.
+#
 # Conflict handling:
 #   - CHANGELOG.md `## Unreleased` is merged as the union of the entries.
 #   - Cargo.lock is regenerated from the merged manifests with `cargo metadata`
@@ -23,6 +28,15 @@
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+
+# Resetting the branch removes this file from the tree. Run from a copy so bash
+# can keep reading the script after that.
+if [[ "${TINTA_INTEGRATION_COPY:-}" != "1" ]]; then
+  copy="$(mktemp "${TMPDIR:-/tmp}/tinta-build-integration.XXXXXX.sh")"
+  cp "$0" "$copy"
+  TINTA_INTEGRATION_COPY=1 exec bash "$copy" "$@"
+fi
+trap 'rm -f "$0"' EXIT
 
 REMOTE="${REMOTE:-origin}"
 TARGET="${TARGET:-integration/linux}"
@@ -151,12 +165,36 @@ PY
   fi
 }
 
+# Commits that belong to integration/linux only are marked with an
+# `Integration-only: true` trailer. They are cherry-picked back after every
+# rebuild, because no port branch contains them.
+collect_integration_only() {
+  git log --reverse --format='%H%x09%(trailers:key=Integration-only,valueonly)' "$1" |
+    while IFS=$'\t' read -r sha value; do
+      if [[ "$value" == "true" ]]; then
+        echo "$sha"
+      fi
+    done
+}
+
 git config rerere.enabled true
 git config rerere.autoupdate true
+state="$(git rev-parse --path-format=absolute --git-path tinta-integration-commits)"
 
 if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
   if [[ "$RESUME" -eq 0 ]]; then
     echo "a merge is in progress; finish it and rerun with --resume" >&2
+    exit 1
+  fi
+  if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+    resolved_conflicts || exit 1
+  fi
+  git commit --no-edit
+fi
+
+if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
+  if [[ "$RESUME" -eq 0 ]]; then
+    echo "a cherry-pick is in progress; finish it and rerun with --resume" >&2
     exit 1
   fi
   if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
@@ -171,6 +209,25 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 git fetch "$REMOTE" --prune
+
+# Read the integration-only commits from the state file (a resumed run) or from
+# the last published result. A first run on a new clone has none yet.
+INTEGRATION_COMMITS=()
+if [[ -f "$state" ]]; then
+  mapfile -t INTEGRATION_COMMITS <"$state"
+fi
+if ((${#INTEGRATION_COMMITS[@]} == 0)); then
+  source=""
+  if git rev-parse --verify --quiet "$REMOTE/$TARGET" >/dev/null; then
+    source="$REMOTE/$TARGET"
+  elif git rev-parse --verify --quiet "$TARGET" >/dev/null; then
+    source="$TARGET"
+  fi
+  if [[ -n "$source" ]]; then
+    mapfile -t INTEGRATION_COMMITS < <(collect_integration_only "$source")
+  fi
+  printf '%s\n' "${INTEGRATION_COMMITS[@]}" >"$state"
+fi
 
 if [[ "$RESUME" -eq 0 ]]; then
   git checkout -B "$TARGET" "$REMOTE/main"
@@ -196,6 +253,34 @@ for branch in "${BRANCHES[@]}"; do
   fi
   git commit --no-edit
 done
+
+for sha in "${INTEGRATION_COMMITS[@]}"; do
+  [[ -n "$sha" ]] || continue
+  if git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+    echo "== integration-only $(git log -1 --format='%h %s' "$sha"): already in the result"
+    continue
+  fi
+  echo "== integration-only $(git log -1 --format='%h %s' "$sha")"
+  if ! git cherry-pick --no-edit "$sha"; then
+    echo "" >&2
+    echo "stopped while applying the integration-only commit $sha" >&2
+    echo "Resolve the conflict, git add the files, git commit --no-edit," >&2
+    echo "then run this script again with --resume." >&2
+    exit 1
+  fi
+done
+
+# A rerere replay can leave an older Cargo.lock behind. Resolve the lock one
+# last time from the merged manifests and commit it if it changed.
+if ! cargo metadata --format-version 1 >/dev/null; then
+  echo "cargo metadata failed; Cargo.lock needs a manual fix" >&2
+  exit 1
+fi
+if ! git diff --quiet -- Cargo.lock; then
+  echo "== regenerating Cargo.lock from the merged manifests"
+  git add Cargo.lock
+  git commit -m "Cargo.lock: regenerate from the merged manifests"
+fi
 
 if git grep -n -e '^<<<<<<< ' -e '^>>>>>>> ' -- . ':!scripts/fork/*' >/tmp/tinta-conflict-markers 2>/dev/null; then
   echo "conflict markers remain:" >&2

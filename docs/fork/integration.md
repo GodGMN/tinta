@@ -48,6 +48,14 @@ It prints the head of every merged branch and refuses to finish unless each one
 is an ancestor of the result. The only ref it pushes is `integration/linux`, and
 only with `--force-with-lease`.
 
+The branch also has integration-only commits (the AppImage helper fix, the
+smoke test, the keyring test). They carry an `Integration-only: true` trailer.
+Before resetting, the script records them in `.git/tinta-integration-commits`
+and reads the last published `integration/linux` for the list; after the merges
+it cherry-picks them back. On a brand-new clone that is the published branch.
+If a cherry-pick conflicts, resolve it, `git commit --no-edit`, and rerun with
+`--resume`.
+
 `git rerere` is enabled by the script. A manual resolution is remembered in the
 local rerere cache, so the same conflict resolves itself the next time. The
 cache is local (`.git/rr-cache`) and is not committed: the branch revisions may

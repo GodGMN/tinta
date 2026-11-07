@@ -25,7 +25,7 @@ fn main() {
         threads,
     );
     if let Err(error) = engine.run(std::io::stdin().lock()) {
-        log(&format!("cannot read stdin: {error}"));
+        log(&format!("engine I/O error: {error}"));
         let _ = std::io::stderr().flush();
         std::process::exit(1);
     }

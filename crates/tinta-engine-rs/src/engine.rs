@@ -1,17 +1,21 @@
 //! The engine command loop.
 //!
-//! Commands are handled one at a time on the stdin reader thread. The app never
-//! requires two replies at once for these commands and serial handling keeps the
-//! model state simple; slow work (only `install_models` today) therefore delays
-//! the next line. Commands whose features are not implemented yet fail with an
-//! `unsupported` error, and macOS-only commands return the degraded replies from
-//! `docs/engine-protocol.md` so the app does not show errors or retry loops.
+//! Commands are handled one at a time on the stdin reader thread, except
+//! `install_models`: it runs on its own worker thread and replies when it
+//! finishes, so `ping`, `models_status`, `calendar` and the other quick commands
+//! keep answering while a 487 MB install runs. A second install is rejected
+//! while one is in flight. Commands whose features are not implemented yet fail
+//! with an `unsupported` error, and macOS-only commands return the degraded
+//! replies from `docs/engine-protocol.md` so the app does not show errors or
+//! retry loops.
 
 use anyhow::{bail, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::install;
 use crate::manifest::Manifest;
@@ -49,6 +53,7 @@ pub struct Engine {
     manifest: Manifest,
     models_root: PathBuf,
     threads: Threads,
+    installing: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -58,6 +63,7 @@ impl Engine {
             manifest,
             models_root,
             threads,
+            installing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -99,6 +105,11 @@ impl Engine {
             return Ok(true);
         }
 
+        if request.cmd == "install_models" {
+            self.start_install(&request.id)?;
+            return Ok(false);
+        }
+
         match self.handle_command(&request.cmd, &request.params) {
             Ok(result) => self.out.reply(&request.id, result)?,
             Err(error) => self.out.fail(&request.id, &error.to_string())?,
@@ -117,17 +128,19 @@ impl Engine {
                 "installed": self.manifest.all_files_exist(&self.models_root),
                 "path": self.models_root.display().to_string(),
             })),
-            "install_models" => {
-                install::install(&self.manifest, &self.models_root, &self.out, &self.threads)?;
-                Ok(json!({ "installed": true }))
-            }
+            // A real microphone check needs a capture dependency (cpal, and ALSA
+            // headers on Linux), which arrives with the capture task. Until then
+            // report `granted` so onboarding is not blocked; the Windows privacy
+            // switch is tracked there as well.
             "permissions" => Ok(json!({
                 "microphone": "granted",
                 "accessibility": false,
             })),
             "request_microphone" => Ok(json!({ "granted": true })),
+            // The Swift engine always lists `all`; one entry keeps the record
+            // panel's source select populated until system capture exists.
             "list_sources" => Ok(json!({
-                "sources": [],
+                "sources": [{ "id": "all", "name": "All system audio", "playing": false }],
                 "default_input": "",
                 "route": "speakers",
             })),
@@ -153,6 +166,30 @@ impl Engine {
             other => bail!("unknown command {other}"),
         }
     }
+
+    /// Starts one install on a worker thread. The reply is written when the
+    /// install finishes; a second request while one is running is rejected so
+    /// two installs cannot race over the same files.
+    fn start_install(&mut self, id: &Value) -> io::Result<()> {
+        if self.installing.swap(true, Ordering::SeqCst) {
+            return self.out.fail(id, "the models are already being installed");
+        }
+        let out = self.out.clone();
+        let manifest = self.manifest.clone();
+        let root = self.models_root.clone();
+        let threads = self.threads;
+        let installing = self.installing.clone();
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let result = install::install(&manifest, &root, &out, &threads);
+            let _ = match result {
+                Ok(()) => out.reply(&id, json!({ "installed": true })),
+                Err(error) => out.fail(&id, &error.to_string()),
+            };
+            installing.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +197,7 @@ mod tests {
     use super::*;
     use crate::threads::Threads;
     use std::io::{Cursor, Write};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -284,6 +322,34 @@ mod tests {
             .unwrap()
             .ends_with("models"));
         assert!(!harness.sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_second_install_is_rejected() {
+        let mut harness = harness();
+        harness.engine.installing.store(true, Ordering::SeqCst);
+        harness
+            .engine
+            .handle_line("{\"id\":9,\"cmd\":\"install_models\"}")
+            .unwrap();
+        let lines = harness.sink.lines();
+        assert_eq!(lines[0]["id"], 9);
+        assert_eq!(lines[0]["ok"], false);
+        assert!(lines[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("already being installed"));
+    }
+
+    #[test]
+    fn list_sources_offers_the_default_output() {
+        let lines = run("{\"id\":1,\"cmd\":\"list_sources\"}");
+        let sources = lines[1]["result"]["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["id"], "all");
+        assert_eq!(sources[0]["name"], "All system audio");
+        assert_eq!(sources[0]["playing"], false);
+        assert_eq!(lines[1]["result"]["route"], "speakers");
     }
 
     #[test]

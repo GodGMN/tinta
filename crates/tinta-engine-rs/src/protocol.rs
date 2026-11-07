@@ -8,7 +8,7 @@
 
 use serde_json::{Map, Value};
 use std::io::{self, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A parsed request line.
 #[derive(Debug, Clone)]
@@ -37,15 +37,17 @@ impl Request {
 }
 
 /// Thread-safe stdout writer. Each object is serialized into one buffer and
-/// written together, then flushed.
+/// written together, then flushed. Cloning shares the same writer, so the
+/// install worker and the command loop cannot interleave bytes.
+#[derive(Clone)]
 pub struct Output {
-    inner: Mutex<Box<dyn Write + Send>>,
+    inner: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
 impl Output {
     pub fn new<W: Write + Send + 'static>(writer: W) -> Self {
         Self {
-            inner: Mutex::new(Box::new(writer)),
+            inner: Arc::new(Mutex::new(Box::new(writer))),
         }
     }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const EMBEDDED: &str = include_str!("../assets/models.json");
 const MANIFEST_VERSION: u32 = 1;
@@ -87,14 +87,6 @@ impl Manifest {
             .find(|group| group.component == component)
             .with_context(|| format!("the model manifest has no {component} group"))
     }
-
-    pub fn total_size(&self) -> u64 {
-        self.groups
-            .iter()
-            .flat_map(|group| &group.files)
-            .map(|file| file.size)
-            .sum()
-    }
 }
 
 impl ModelGroup {
@@ -141,11 +133,6 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// A copy of the effective model path, for the reply and for sherpa-onnx.
-pub fn installed_path(root: &Path, file: &ModelFile) -> PathBuf {
-    root.join(&file.path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,7 +168,13 @@ mod tests {
     fn embedded_manifest_is_valid_and_pinned() {
         let manifest = Manifest::embedded();
         assert_eq!(manifest.groups.len(), 3);
-        assert!(manifest.total_size() > 690_000_000);
+        let total: u64 = manifest
+            .groups
+            .iter()
+            .flat_map(|group| &group.files)
+            .map(|file| file.size)
+            .sum();
+        assert!(total > 690_000_000);
         for group in &manifest.groups {
             for file in &group.files {
                 assert_eq!(file.sha256.len(), 64);

@@ -26,9 +26,29 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
       - name: Test engine
-        run: cargo test --locked -j2 -p tinta-engine-rs
+        run: cargo test --locked -p tinta-engine-rs
       - name: Clippy engine
-        run: cargo clippy --locked -j2 -p tinta-engine-rs --all-targets -- -D warnings
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
 
   core-macos:
     # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15

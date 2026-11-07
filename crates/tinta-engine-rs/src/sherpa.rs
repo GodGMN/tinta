@@ -19,7 +19,7 @@ use sherpa_onnx::{
 };
 use std::path::Path;
 
-use crate::manifest::{installed_path, ModelFile, ModelGroup};
+use crate::manifest::{ModelFile, ModelGroup};
 use crate::threads::Threads;
 
 const SAMPLE_RATE: i32 = 16_000;
@@ -37,6 +37,9 @@ pub fn provider(root: &Path) -> Result<String> {
     let path = root.join("provider.conf");
     std::fs::write(&path, "SessionConfig.session.intra_op.allow_spinning=0\n")
         .with_context(|| format!("cannot write {}", path.display()))?;
+    // sherpa-onnx splits `provider[:config_path]` at the first ':' only
+    // (`SplitProviderAndConfig` in session.cc), so `cpu:C:\Users\...` on
+    // Windows keeps the drive letter as part of the config path.
     Ok(format!("cpu:{}", path.display()))
 }
 
@@ -57,7 +60,7 @@ pub fn load_group(
 }
 
 fn path_of(root: &Path, file: &ModelFile) -> String {
-    installed_path(root, file).to_string_lossy().into_owned()
+    root.join(&file.path).to_string_lossy().into_owned()
 }
 
 fn load_transcription(

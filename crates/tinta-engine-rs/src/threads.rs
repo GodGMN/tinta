@@ -1,16 +1,17 @@
 //! Thread budgets for the ONNX sessions.
 //!
 //! The benchmark showed that a hard-coded thread count oversubscribes the CPUs a
-//! process actually has. Use the affinity mask, count distinct physical cores and
-//! honour a cgroup CPU quota where one exists. The benchmark's defaults are kept:
-//! ASR `min(4, max(1, physical_cores / 2))`, diarization
-//! `clamp(physical_cores / 2, 2, 4)`.
+//! process actually has. `available_parallelism` already applies the affinity
+//! mask and the process's own cgroup CPU quota, so count distinct physical cores
+//! behind the allowed CPUs and cap that by `available_parallelism`. The
+//! benchmark's defaults are kept: ASR `min(4, max(1, physical_cores / 2))`,
+//! diarization `clamp(physical_cores / 2, 2, 4)`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Threads {
     /// Logical CPUs this process may run on.
     pub available: usize,
-    /// Distinct physical cores behind those CPUs, capped by the cgroup quota.
+    /// Distinct physical cores behind those CPUs, capped by the CPU budget.
     pub physical: usize,
     /// Threads for the transcription sessions.
     pub asr: usize,
@@ -19,20 +20,15 @@ pub struct Threads {
 }
 
 impl Threads {
-    pub fn new(physical: usize) -> Self {
-        let physical = physical.max(1);
-        Self {
-            available: physical,
-            physical,
-            asr: asr_threads(physical),
-            diarization: diarization_threads(physical),
-        }
-    }
-
     /// A small fixed budget for tests that never load a model.
     #[cfg(test)]
     pub fn for_tests() -> Self {
-        Self::new(2)
+        Self {
+            available: 2,
+            physical: 2,
+            asr: 1,
+            diarization: 2,
+        }
     }
 }
 
@@ -47,18 +43,16 @@ pub fn diarization_threads(physical_cores: usize) -> usize {
 }
 
 pub fn detect() -> Threads {
-    let available = allowed_cpu_ids()
-        .filter(|ids| !ids.is_empty())
-        .map(|ids| ids.len())
-        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+    // On Linux this is min(affinity, the process's own cgroup quota), v1 or v2.
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
         .unwrap_or(1);
-    let mut physical = physical_cores(available).unwrap_or(available);
-    if let Some(quota) = cgroup_cpu_quota() {
-        physical = physical.min(quota);
-    }
+    let physical = physical_cores(available)
+        .unwrap_or(available)
+        .clamp(1, available);
     Threads {
         available,
-        physical: physical.max(1),
+        physical,
         asr: asr_threads(physical),
         diarization: diarization_threads(physical),
     }
@@ -84,11 +78,6 @@ fn allowed_cpu_ids() -> Option<Vec<usize>> {
     Some(ids)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn allowed_cpu_ids() -> Option<Vec<usize>> {
-    None
-}
-
 #[cfg(target_os = "linux")]
 fn physical_cores(available: usize) -> Option<usize> {
     let ids = allowed_cpu_ids()?;
@@ -108,45 +97,7 @@ fn physical_cores(available: usize) -> Option<usize> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn physical_cores(_available: &usize) -> Option<usize> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn cgroup_cpu_quota() -> Option<usize> {
-    // cgroup v2: "max 100000" or "200000 100000".
-    if let Ok(text) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
-        let mut parts = text.split_whitespace();
-        let quota = parts.next()?;
-        let period = parts.next()?;
-        if quota != "max" {
-            let quota: u64 = quota.parse().ok()?;
-            let period: u64 = period.parse().ok()?;
-            if quota > 0 && period > 0 {
-                return Some(quota.div_ceil(period) as usize);
-            }
-        }
-        return None;
-    }
-    // cgroup v1.
-    let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-        .ok()?
-        .trim()
-        .parse::<i64>()
-        .ok()?;
-    let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-        .ok()?
-        .trim()
-        .parse::<i64>()
-        .ok()?;
-    if quota <= 0 || period <= 0 {
-        return None;
-    }
-    Some((quota as u64).div_ceil(period as u64) as usize)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cgroup_cpu_quota() -> Option<usize> {
+fn physical_cores(_available: usize) -> Option<usize> {
     None
 }
 
@@ -176,6 +127,7 @@ mod tests {
         let threads = detect();
         assert!(threads.available >= 1);
         assert!(threads.physical >= 1);
+        assert!(threads.physical <= threads.available);
         assert!((1..=4).contains(&threads.asr));
         assert!((2..=4).contains(&threads.diarization));
     }

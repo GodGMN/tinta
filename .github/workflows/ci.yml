@@ -87,7 +87,7 @@ jobs:
           tmp="$(mktemp -d)"
           dpkg-deb -x "$deb" "$tmp"
           cat "$tmp/usr/share/applications/Tinta.desktop"
-          grep -qx 'Categories=Office;AudioVideo;' "$tmp/usr/share/applications/Tinta.desktop"
+          grep -qx 'Categories=AudioVideo;Audio;Recorder;' "$tmp/usr/share/applications/Tinta.desktop"
           appimage="$(ls target/release/bundle/appimage/*.AppImage)"
           work="$(mktemp -d)"
           cd "$work"
@@ -96,14 +96,36 @@ jobs:
           cat squashfs-root/usr/share/applications/Tinta.desktop
           for name in tinta tinta-engine tinta-mcp tinta-native-host; do
             test -x "squashfs-root/usr/bin/$name" || { echo "missing $name in the AppImage"; exit 1; }
-            if ldd "squashfs-root/usr/bin/$name" | grep 'not found'; then
-              echo "unresolved libraries for $name"
-              exit 1
-            fi
+          done
+      # An ldd run on this machine proves nothing: the build image has every -dev package
+      # installed. Install the real .deb in a clean supported release instead, so apt has
+      # to resolve the whole Depends list, and check the installed binaries there.
+      - name: Install the deb in clean Debian 12 and Ubuntu 24.04
+        run: |
+          set -euo pipefail
+          deb="$(ls target/release/bundle/deb/*.deb)"
+          for image in debian:12 ubuntu:24.04; do
+            echo "== $image =="
+            docker run --rm \
+              -v "$PWD/$deb:/tmp/tinta.deb:ro" \
+              "$image" bash -euc '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends /tmp/tinta.deb
+                for binary in /usr/bin/tinta /usr/bin/tinta-engine \
+                  /usr/bin/tinta-mcp /usr/bin/tinta-native-host; do
+                  test -x "$binary"
+                  if ldd "$binary" | grep "not found"; then
+                    echo "unresolved libraries for $binary"
+                    exit 1
+                  fi
+                done
+              '
           done
       - uses: actions/upload-artifact@v4
         with:
           name: tinta-linux-x86_64
+          retention-days: 30
           path: |
             target/release/bundle/deb/*.deb
             target/release/bundle/appimage/*.AppImage

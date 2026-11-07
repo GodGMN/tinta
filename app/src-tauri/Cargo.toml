@@ -9,7 +9,8 @@ name = "tinta_app"
 crate-type = ["rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# `config-json5` lets `tauri.linux.conf.json` carry comments next to the deb dependencies.
+tauri-build = { version = "2", features = ["config-json5"] }
 
 [dependencies]
 anyhow.workspace = true

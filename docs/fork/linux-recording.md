@@ -40,8 +40,8 @@ is rejected while the first is opening.
 ## No physical microphone
 
 A machine without an input device makes the **monitor of its speakers** the
-default source: a VM, a headless box, and this host (`auto_null.monitor`) all do
-it. Recording that as the microphone duplicates every remote utterance as the
+default source: a VM, a headless box, and a machine whose only sink is a null
+or dummy sink all do it (`auto_null.monitor` is the usual name). Recording that as the microphone duplicates every remote utterance as the
 user, and the echo filter cannot catch it because the two levels are equal.
 
 The engine therefore looks at the default source before opening it:

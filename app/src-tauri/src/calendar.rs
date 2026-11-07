@@ -3,7 +3,8 @@
 //! The engine reads the calendars with EventKit. The app reads them again when the engine reports a change,
 //! when the window gets the focus, and every few minutes.
 
-use crate::{notify, state, system, AppState};
+use crate::platform::{self, notify};
+use crate::{state, AppState};
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -106,7 +107,7 @@ impl AppState {
             self.withdraw_reminder(&event.id);
         }
         if let Some(link) = event.link.as_ref().filter(|_| join) {
-            let source = system::open_call(link, &self.setting("call_browser", system::DEFAULT_BROWSER));
+            let source = platform::open_call(link, &self.setting("call_browser", platform::DEFAULT_BROWSER));
             let idle = self.active.lock().unwrap().is_none();
             if meeting.started_at.is_none() && idle {
                 match self.start_recording(&meeting.id, &source) {
@@ -130,7 +131,7 @@ impl AppState {
             Err(error) => self.emit("engine", json!({"event": "warning", "message": error.to_string()})),
         }
         if let Some(app) = &self.app {
-            crate::bubble::show_main(app);
+            platform::bubble::show_main(app);
         }
     }
 

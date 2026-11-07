@@ -75,10 +75,17 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
   const [notes, setNotes] = useState(() => cache.get(id)?.notes ?? "");
   const [sources, setSources] = useState<Source[]>([]);
   const [route, setRoute] = useState<"speakers" | "headphones" | null>(null);
-  const [source, setSource] = useState(() =>
-    boot?.capabilities.capture_app_audio === false ? "all" : (boot?.last_source ?? "com.google.Chrome"),
-  );
+  const [source, setSource] = useState(() => {
+    const caps = capabilitiesOf(boot);
+    if (!caps.capture_app_audio) return caps.capture_system_audio ? "all" : "";
+    const last = boot?.last_source ?? "com.google.Chrome";
+    return last === "all" && !caps.capture_system_audio ? "" : last;
+  });
   const caps = capabilitiesOf(boot);
+  /** A recording needs one of the two meeting-audio sources. An engine may report neither. */
+  const canRecordAudio = caps.capture_app_audio || caps.capture_system_audio;
+  /** The sources that the engine can capture: an app needs `capture_app_audio`, `all` needs `capture_system_audio`. */
+  const sourceOptions = caps.capture_app_audio ? sources.filter((s) => s.id !== "all" || caps.capture_system_audio) : [];
   const [progress, setProgress] = useState<{ stage: string; fraction: number } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   /** The path of the last export, for the notice with the copy buttons. */
@@ -187,6 +194,22 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
     if (detectedApp && caps.capture_app_audio) setSource(detectedApp);
   }, [detectedApp, caps.capture_app_audio]);
 
+  // Keep the source one that the engine can capture. `all` needs `capture_system_audio`, and an
+  // app needs `capture_app_audio`; with neither, there is no source and the recording cannot start.
+  useEffect(() => {
+    if (source === "all") {
+      if (!caps.capture_system_audio) setSource(caps.capture_app_audio ? (sources[0]?.id ?? "") : "");
+      return;
+    }
+    if (caps.capture_app_audio) {
+      if (sources.length > 0 && !sources.some((s) => s.id === source)) {
+        setSource(sources.find((s) => s.id !== "all")?.id ?? sources[0].id);
+      }
+      return;
+    }
+    setSource(caps.capture_system_audio ? "all" : "");
+  }, [source, sources, caps.capture_app_audio, caps.capture_system_audio]);
+
   function changeNotes(value: string) {
     setNotes(value);
     latestNotes.current = value;
@@ -215,11 +238,13 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
   }
 
   async function start() {
+    // The engine can record neither one app nor the whole system, or the sources have not loaded yet.
+    if (!canRecordAudio || !source) return;
     setBusy("starting");
     startRequested.current = true;
     try {
       // Only a system-wide capture exists when the engine cannot record one app.
-      onActive(await api.startRecording(id, caps.capture_app_audio ? source : "all"));
+      onActive(await api.startRecording(id, source));
       await load();
     } catch (e) {
       onError(String(e));
@@ -334,7 +359,7 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
               Meeting audio
               {caps.capture_app_audio ? (
                 <select value={source} onChange={(e) => setSource(e.target.value)} disabled={!!busy}>
-                  {sources.map((s) => (
+                  {sourceOptions.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
                       {s.playing ? " (playing)" : ""}
@@ -342,10 +367,14 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
                   ))}
                 </select>
               ) : (
-                <span className="small muted">System audio</span>
+                <span className="small muted">{caps.capture_system_audio ? "System audio" : "No meeting audio"}</span>
               )}
             </label>
-            <button className="primary big" disabled={!boot?.models_installed || !!active || !!busy} onClick={start}>
+            <button
+              className="primary big"
+              disabled={!boot?.models_installed || !!active || !!busy || !canRecordAudio || !source}
+              onClick={start}
+            >
               {busy === "starting" ? "Starting…" : "Start recording"}
             </button>
             <button
@@ -357,6 +386,9 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
               Or import an audio file
             </button>
           </div>
+          {!canRecordAudio && (
+            <div className="warn small">This engine cannot record the meeting audio.</div>
+          )}
           {!boot?.models_installed && <div className="warn small">Install the speech models in Settings first.</div>}
           {!!active && <div className="warn small">Another meeting is recording. Stop it first.</div>}
           {source === "all" && caps.capture_app_audio && (

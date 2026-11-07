@@ -237,6 +237,11 @@ export function App() {
   /** Records a detected call. A call of a calendar event records into the meeting of the event. */
   async function recordCall(source: string, eventId?: string) {
     if (creating) return;
+    // The engine can record neither one app nor the whole system.
+    if (!caps.capture_app_audio && !caps.capture_system_audio) {
+      setError("This engine cannot record the meeting audio.");
+      return;
+    }
     setCreating(true);
     let id: string | null = null;
     try {

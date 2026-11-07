@@ -1,10 +1,22 @@
 // Sample data for `pnpm preview:mock`, a design preview outside the Tauri window.
 // Only the "mock" Vite mode imports this file.
 import { ALL_CAPABILITIES } from "./api";
-import type { Bootstrap, Meeting, MeetingDetail, Turn } from "./api";
+import type { Bootstrap, Capabilities, Meeting, MeetingDetail, Turn } from "./api";
 
 const now = Date.now();
 const hash = () => window.location.hash.replace("#", "");
+
+/** A second engine without the optional features, for `pnpm preview:mock#caps-none`. */
+const REDUCED_CAPABILITIES: Capabilities = {
+  capture_system_audio: false,
+  capture_app_audio: false,
+  calls_detection: false,
+  call_reader: false,
+  calendar: false,
+  summaries: false,
+  echo_cancellation: false,
+  import_audio: false,
+};
 
 function meeting(id: string, title: string, minutesAgo: number, state: Meeting["state"]): Meeting {
   return {
@@ -94,7 +106,7 @@ const calendar: Bootstrap["calendar"] = {
 
 const boot: Bootstrap = {
   self_name: "Sam Rivera", onboarded: !hash().startsWith("onboarding"), auto_stop: true, auto_summary: true, audio_retention_days: 7, summaries: { available: true }, mcp_enabled: true, theme: (localStorage.getItem("tinta-theme") as Bootstrap["theme"]) || "system", last_source: "com.google.Chrome", filevault: true,
-  capabilities: ALL_CAPABILITIES,
+  capabilities: hash() === "caps-none" ? REDUCED_CAPABILITIES : ALL_CAPABILITIES,
   models_path: "~/Library/Application Support/FluidAudio/Models", microphone: "granted",
   mcp_path: "/Applications/Tinta.app/Contents/MacOS/tinta-mcp",
   mcp_config: { mcpServers: { tinta: { command: "/Applications/Tinta.app/Contents/MacOS/tinta-mcp" } } },

@@ -169,15 +169,6 @@ pub fn remove_old_native_host() {
     }
 }
 
-/// Opens a folder or a file with its default handler.
-pub fn open_path(path: &Path) -> Result<()> {
-    let status = Command::new("xdg-open").arg(path).status()?;
-    if !status.success() {
-        bail!("cannot open {}", path.display());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

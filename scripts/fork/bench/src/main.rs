@@ -11,12 +11,16 @@
 //! measured twice: "cold" after evicting the model files from the page cache
 //! (posix_fadvise DONTNEED), "warm" by building a second instance right after.
 
+mod clustering;
+
+use clustering::{recluster, speech_shares, Options as ClusterOptions, Unit};
 use serde_json::{json, Value};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
     OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
     OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
-    SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector, Wave,
+    SileroVadModelConfig, SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig,
+    VadModelConfig, VoiceActivityDetector, Wave,
 };
 use std::collections::HashSet;
 use std::fs::File;
@@ -784,6 +788,234 @@ fn run_diar_stage(cfg: &DiarStage) -> Value {
     })
 }
 
+/// Join the front end's segments into embedding units: consecutive segments of
+/// the same cluster no further apart than `gap` seconds and no longer than
+/// `max_len` together. A whole unit is the smallest thing the post-clustering
+/// relabels, so very short fragments never get an embedding of their own.
+fn build_units(segments: &[(f32, f32, i32)], gap: f32, max_len: f32) -> Vec<(f32, f32, usize)> {
+    let mut out: Vec<(f32, f32, usize)> = Vec::new();
+    for &(start, end, speaker) in segments {
+        let cluster = speaker.max(0) as usize;
+        if end <= start {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if last.2 == cluster
+                && start - last.1 <= gap
+                && end.max(last.1) - last.0 <= max_len
+            {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        out.push((start, end, cluster));
+    }
+    out
+}
+
+/// Embeddings for every unit, cached on disk so a threshold sweep does not pay
+/// for the embedding model twice. Returns (embeddings, seconds spent, reused).
+fn unit_embeddings(
+    samples: &[f32],
+    units: &[(f32, f32, usize)],
+    model: &str,
+    threads: i32,
+    provider: &str,
+    min_unit: f32,
+    cache: Option<&str>,
+) -> (Vec<Vec<f32>>, f64, bool) {
+    if let Some(path) = cache {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                let same_model = v["model"].as_str() == Some(model);
+                let cached: Vec<(f32, f32, usize)> = v["units"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|u| {
+                                (
+                                    u["start"].as_f64().unwrap_or(-1.0) as f32,
+                                    u["end"].as_f64().unwrap_or(-1.0) as f32,
+                                    u["cluster"].as_u64().unwrap_or(0) as usize,
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if same_model && cached == units {
+                    let emb: Vec<Vec<f32>> = v["embeddings"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|e| {
+                                    e.as_array()
+                                        .map(|x| {
+                                            x.iter()
+                                                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if emb.len() == units.len() && !emb.is_empty() {
+                        return (emb, 0.0, true);
+                    }
+                }
+            }
+        }
+    }
+
+    let config = SpeakerEmbeddingExtractorConfig {
+        model: Some(model.to_string()),
+        num_threads: threads,
+        provider: Some(provider.to_string()),
+        ..Default::default()
+    };
+    let extractor = SpeakerEmbeddingExtractor::create(&config).expect("create embedding extractor");
+
+    let t = Instant::now();
+    let min_n = (min_unit * SAMPLE_RATE as f32) as usize;
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(units.len());
+    for &(start, end, _) in units {
+        let mut a = (start.max(0.0) * SAMPLE_RATE as f32) as usize;
+        let mut b = (end.max(0.0) * SAMPLE_RATE as f32) as usize;
+        if b > samples.len() {
+            b = samples.len();
+        }
+        // Very short units are padded symmetrically around the segment. An
+        // embedding needs a few hundred ms of audio to carry any voice at all.
+        if b > a && b - a < min_n {
+            let need = min_n - (b - a);
+            a = a.saturating_sub(need / 2);
+            b = (b + (need - need / 2)).min(samples.len());
+        }
+        if b <= a {
+            out.push(vec![0.0; extractor.dim() as usize]);
+            continue;
+        }
+        let stream = extractor.create_stream().expect("embedding stream");
+        stream.accept_waveform(SAMPLE_RATE as i32, &samples[a..b]);
+        let emb = if extractor.is_ready(&stream) {
+            extractor.compute(&stream).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if emb.is_empty() {
+            out.push(vec![0.0; extractor.dim() as usize]);
+        } else {
+            out.push(emb);
+        }
+    }
+    let seconds = t.elapsed().as_secs_f64();
+
+    if let Some(path) = cache {
+        let cache_json = json!({
+            "model": model,
+            "dim": extractor.dim(),
+            "units": units.iter().map(|(s, e, c)| json!({"start": s, "end": e, "cluster": c})).collect::<Vec<_>>(),
+            "embeddings": out,
+        });
+        if let Some(dir) = Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = File::create(path) {
+            let _ = f.write_all(serde_json::to_string(&cache_json).unwrap().as_bytes());
+        }
+    }
+    (out, seconds, false)
+}
+
+/// Post-cluster an already over-clustered diarization result.
+#[allow(clippy::too_many_arguments)]
+fn run_postcluster(
+    diar_path: &str,
+    embedding: &str,
+    samples: &[f32],
+    audio_s: f64,
+    threads: i32,
+    provider: &str,
+    opts: &ClusterOptions,
+    unit_gap: f32,
+    unit_max: f32,
+    min_unit: f32,
+    cache: Option<&str>,
+) -> Value {
+    let stage_t = Instant::now();
+    let raw: Value =
+        serde_json::from_str(&std::fs::read_to_string(diar_path).expect("read diarization json"))
+            .expect("parse diarization json");
+    let diar = if raw.get("diarization").is_some() {
+        &raw["diarization"]
+    } else {
+        &raw
+    };
+    let mut segments: Vec<(f32, f32, i32)> = diar["segments"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|s| {
+                    (
+                        s["start"].as_f64().unwrap_or(0.0) as f32,
+                        s["end"].as_f64().unwrap_or(0.0) as f32,
+                        s["speaker"].as_i64().unwrap_or(0) as i32,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    segments.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let units = build_units(&segments, unit_gap, unit_max);
+    let (embeddings, embedding_seconds, reused) =
+        unit_embeddings(samples, &units, embedding, threads, provider, min_unit, cache);
+    let clustered: Vec<Unit> = units
+        .iter()
+        .zip(embeddings)
+        .map(|(&(start, end, cluster), embedding)| Unit {
+            start,
+            end,
+            cluster,
+            embedding,
+        })
+        .collect();
+
+    let outcome = recluster(&clustered, opts);
+    let shares = speech_shares(&clustered, &outcome.labels);
+    let total: f32 = shares.iter().map(|(_, s)| *s).sum();
+    let out_segments: Vec<Value> = clustered
+        .iter()
+        .zip(&outcome.labels)
+        .map(|(u, &label)| json!({"start": u.start, "end": u.end, "speaker": label}))
+        .collect();
+
+    json!({
+        "diar_source": diar_path,
+        "embedding_model": embedding,
+        "merge_distance": opts.merge_distance,
+        "min_share": opts.min_share,
+        "min_loyalty": opts.min_loyalty,
+        "protect_share": opts.protect_share,
+        "unit_gap": unit_gap,
+        "unit_max": unit_max,
+        "min_unit": min_unit,
+        "units": units.len(),
+        "clusters_before": outcome.clusters_before,
+        "num_speakers": outcome.clusters_after,
+        "merges": outcome.merges,
+        "dissolved": outcome.dissolved,
+        "reassigned": outcome.reassigned,
+        "shares": shares.iter().map(|(l, s)| json!({"speaker": l, "seconds": s, "share": if total > 0.0 { s / total } else { 0.0 }})).collect::<Vec<_>>(),
+        "embedding_seconds": embedding_seconds,
+        "embeddings_reused": reused,
+        "stage_seconds": stage_t.elapsed().as_secs_f64(),
+        "audio_seconds": audio_s,
+        "num_segments": out_segments.len(),
+        "segments": out_segments,
+    })
+}
+
 fn combine_turns(asr: &Value, diar_segments: &[(f32, f32, i32)]) -> Vec<Value> {
     let words: Vec<Value> = asr["words"].as_array().cloned().unwrap_or_default();
     let mut turns: Vec<Value> = Vec::new();
@@ -891,6 +1123,79 @@ fn main() {
         return;
     }
     let cpu_start = cpu_seconds();
+
+    if args.cmd == "postcluster" {
+        let opts = ClusterOptions {
+            merge_distance: args.f32_or("merge-threshold", 0.25),
+            min_share: args.f32_or("min-share", 0.02),
+            min_loyalty: args.f32_or("min-loyalty", 0.5),
+            protect_share: args.f32_or("protect-share", 0.0),
+        };
+        let block = run_postcluster(
+            &args.req("diar"),
+            &args.req("embedding"),
+            samples,
+            audio_s,
+            asr_threads,
+            &provider,
+            &opts,
+            args.f32_or("unit-gap", 0.5),
+            args.f32_or("unit-max", 15.0),
+            args.f32_or("min-unit", 0.8),
+            args.get("embeddings"),
+        );
+        let out = json!({
+            "command": "postcluster",
+            "wav": wav_path,
+            "audio_seconds": audio_s,
+            "threads": asr_threads,
+            "spin": if spin < 0 { "default".to_string() } else { spin.to_string() },
+            "loadavg_start": loadavg(),
+            "machine": machine,
+            "postcluster": {
+                "clusters_before": block["clusters_before"],
+                "num_speakers": block["num_speakers"],
+                "merges": block["merges"],
+                "dissolved": block["dissolved"],
+                "reassigned": block["reassigned"],
+                "units": block["units"],
+                "shares": block["shares"],
+                "merge_distance": block["merge_distance"],
+                "min_share": block["min_share"],
+                "min_loyalty": block["min_loyalty"],
+                "protect_share": block["protect_share"],
+                "embedding_seconds": block["embedding_seconds"],
+                "embeddings_reused": block["embeddings_reused"],
+                "stage_seconds": block["stage_seconds"],
+            },
+            "diarization": {
+                "segments": block["segments"],
+                "num_speakers": block["num_speakers"],
+                "num_segments": block["num_segments"],
+                "threshold": serde_json::Value::Null,
+                "merge_distance": block["merge_distance"],
+                "min_share": block["min_share"],
+                "min_loyalty": block["min_loyalty"],
+                "protect_share": block["protect_share"],
+                "clusters_before": block["clusters_before"],
+                "process_seconds": block["stage_seconds"],
+                "rtf": block["stage_seconds"].as_f64().unwrap_or(0.0) / audio_s,
+                "cpu_seconds": cpu_seconds() - cpu_start,
+            },
+            "peak_rss_mb": peak_rss_mb(),
+            "loadavg_end": loadavg(),
+        });
+        if let Some(dir) = Path::new(&out_path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut f = File::create(&out_path).expect("create output");
+        f.write_all(serde_json::to_string_pretty(&out).unwrap().as_bytes())
+            .expect("write output");
+        if let Some(path) = provider_conf {
+            let _ = std::fs::remove_file(path);
+        }
+        return;
+    }
 
     let mut out = json!({
         "command": args.cmd,

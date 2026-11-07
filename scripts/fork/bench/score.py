@@ -125,6 +125,49 @@ def build_ref(annotations, meeting, out_path):
     )
 
 
+def build_ref_rttm(rttm_path, meeting, out_path, uem_path=None):
+    """Build a ref JSON from a BUT/pyannote AMI-diarization-setup RTTM.
+
+    The RTTM is word-level (`only_words`): every word is a speech region, and
+    adjacent words of one speaker are merged. That is the reference pyannote and
+    FluidAudio publish their AMI DER against.
+    """
+    segments = []
+    with open(rttm_path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 8 or parts[0] != "SPEAKER":
+                continue
+            start = float(parts[3])
+            duration = float(parts[4])
+            label = parts[7]
+            if duration <= 0:
+                continue
+            segments.append({"start": start, "end": start + duration, "speaker": label})
+    segments.sort(key=lambda s: (s["start"], s["speaker"]))
+    uem_end = None
+    if uem_path:
+        with open(uem_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] != "SPEAKER":
+                    uem_end = float(parts[3])
+    ref = {
+        "meeting": meeting,
+        "words": [],
+        "segments": segments,
+        "duration": uem_end or max((s["end"] for s in segments), default=0.0),
+        "speakers": sorted({s["speaker"] for s in segments}),
+        "source": rttm_path,
+    }
+    with open(out_path, "w") as f:
+        json.dump(ref, f, indent=1)
+    print(
+        f"ref-rttm {meeting}: {len(segments)} segments, "
+        f"{len(ref['speakers'])} speakers, {ref['duration'] / 60:.1f} min -> {out_path}"
+    )
+
+
 def cut_slice(args):
     """Cut [start, start+duration) from a wav into a new 16 kHz mono wav."""
     import wave
@@ -476,6 +519,89 @@ def speaker_totals(segments):
     return {str(k): round(v, 3) for k, v in sorted(totals.items(), key=lambda kv: -kv[1])}
 
 
+def overlap_seconds(a_start, a_end, b_start, b_end):
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def oracle_map(ref_segments, hyp_segments):
+    """Many-to-one oracle: each hypothesis cluster -> the ref speaker it overlaps most.
+
+    This is the bound on what any relabelling of the existing clusters can
+    achieve. It is not a speaker-count oracle: several clusters may map to one
+    speaker, and a speaker may be missing, exactly like the real system.
+    """
+    labels = sorted({s["speaker"] for s in hyp_segments}, key=str)
+    ref_speakers = sorted({s["speaker"] for s in ref_segments}, key=str)
+    mass = {label: {r: 0.0 for r in ref_speakers} for label in labels}
+    for h in hyp_segments:
+        for r in ref_segments:
+            if r["end"] <= h["start"]:
+                continue
+            if r["start"] >= h["end"]:
+                break
+            ov = overlap_seconds(h["start"], h["end"], r["start"], r["end"])
+            if ov > 0:
+                mass[h["speaker"]][r["speaker"]] += ov
+    mapping = {}
+    purity = {}
+    speech = {}
+    for label in labels:
+        total = sum(mass[label].values())
+        best = max(mass[label].items(), key=lambda kv: (kv[1], kv[0]))
+        mapping[label] = best[0] if total > 0 else label
+        purity[str(label)] = best[1] / total if total > 0 else 0.0
+        speech[str(label)] = total
+    mapped = [
+        {"start": s["start"], "end": s["end"], "speaker": mapping[s["speaker"]]}
+        for s in hyp_segments
+    ]
+    return mapped, mapping, purity, speech
+
+
+def load_result_segments(path):
+    hyp = json.load(open(path))
+    diar = hyp.get("diarization") or hyp
+    return [
+        {"start": s["start"], "end": s["end"], "speaker": s["speaker"]}
+        for s in diar["segments"]
+    ]
+
+
+def score_oracle(args):
+    ref = json.load(open(args.ref))
+    refsegs = [
+        {"start": s["start"], "end": s["end"], "speaker": s["speaker"]}
+        for s in ref["segments"]
+    ]
+    hyp = load_result_segments(args.result)
+    uem_end = args.uem_end or ref["duration"]
+    if args.uem:
+        for line in open(args.uem):
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] != "SPEAKER":
+                uem_end = float(parts[3])
+    mapped, mapping, purity, speech = oracle_map(refsegs, hyp)
+    detail = der_pyannote(refsegs, mapped, uem_end, collar=0.0, skip_overlap=False)
+    out = {
+        "meeting": ref["meeting"],
+        "result": os.path.basename(args.result),
+        "clusters": len({s["speaker"] for s in hyp}),
+        "ref_speakers": len(ref["speakers"]),
+        "oracle_der": detail["der"],
+        "oracle_detail": detail,
+        "mapping": {str(k): str(v) for k, v in mapping.items()},
+        "purity": purity,
+        "cluster_speech": speech,
+        "uem_end": uem_end,
+    }
+    total = sum(speech.values()) or 1.0
+    top = sorted(speech.items(), key=lambda kv: -kv[1])[:6]
+    out["top_cluster_shares"] = {k: round(v / total, 4) for k, v in top}
+    with open(args.out, "w") as f:
+        json.dump(out, f, indent=1)
+    print(json.dumps({k: out[k] for k in ("meeting", "oracle_der", "clusters", "ref_speakers")}, indent=1))
+
+
 def score_one(args):
     ref = json.load(open(args.ref))
     hyp = json.load(open(args.result))
@@ -521,6 +647,11 @@ def score_one(args):
             for s in ref["segments"]
         ]
         uem_end = float(hyp.get("audio_seconds") or ref.get("duration") or 0.0)
+        if getattr(args, "uem", None):
+            for line in open(args.uem):
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] != "SPEAKER":
+                    uem_end = float(parts[3])
         filtered, dropped = filter_small_clusters(segs, args.small_cluster_fraction)
 
         def der_block(hyp_segs):
@@ -722,6 +853,15 @@ def main():
     p.add_argument("--out", required=True)
     p.set_defaults(func=lambda a: build_ref(a.annotations, a.meeting, a.out))
 
+    p = sub.add_parser("ref-rttm")
+    p.add_argument("--rttm", required=True)
+    p.add_argument("--meeting", required=True)
+    p.add_argument("--uem", default=None)
+    p.add_argument("--out", required=True)
+    p.set_defaults(
+        func=lambda a: build_ref_rttm(a.rttm, a.meeting, a.out, a.uem)
+    )
+
     p = sub.add_parser("slice")
     p.add_argument("--wav", required=True)
     p.add_argument("--start", type=float, default=0.0)
@@ -754,8 +894,17 @@ def main():
     p.add_argument("--ref", required=True)
     p.add_argument("--result", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--uem", default=None)
     p.add_argument("--small-cluster-fraction", type=float, default=0.02)
     p.set_defaults(func=score_one)
+
+    p = sub.add_parser("oracle")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--result", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--uem", default=None)
+    p.add_argument("--uem-end", type=float, default=0.0)
+    p.set_defaults(func=score_oracle)
 
     p = sub.add_parser("tune")
     p.add_argument("--ref-dir", required=True)

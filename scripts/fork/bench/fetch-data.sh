@@ -75,6 +75,21 @@ fi
 [ -s models/silero_vad.onnx ] || curl -fL --retry 5 --retry-all-errors -o models/silero_vad.onnx \
   "$MODELS/asr-models/silero_vad.onnx"
 
+# Task 18: English speaker-embedding model, the one pyannote 3.1 uses.
+WESPEAKER="wespeaker_en_voxceleb_resnet34.onnx"
+[ -s "models/$WESPEAKER" ] || curl -fL --retry 5 --retry-all-errors -o "models/$WESPEAKER" \
+  "$MODELS/speaker-recongition-models/$WESPEAKER"
+
+# Task 18: BUTSpeechFIT AMI diarization references (word-level, pyannote setup).
+# Pinned to the last commit (2023-10-17); the repo has not moved since.
+AMI_DIAR_ZIP="AMI-diarization-setup-2509d8933721023fab4def2618aabd5c28eb82e9.zip"
+[ -s "data/$AMI_DIAR_ZIP" ] || curl -fL --retry 5 --retry-all-errors -o "data/$AMI_DIAR_ZIP" \
+  "https://github.com/BUTSpeechFIT/AMI-diarization-setup/archive/2509d8933721023fab4def2618aabd5c28eb82e9.zip"
+if [ ! -d data/ami-diarization-setup ]; then
+  unzip -q "data/$AMI_DIAR_ZIP" -d data/
+  mv "data/AMI-diarization-setup-2509d8933721023fab4def2618aabd5c28eb82e9" data/ami-diarization-setup
+fi
+
 [ -d models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8 ] || \
   tar xjf "models/$ASR_TAR" -C models
 [ -d models/sherpa-onnx-pyannote-segmentation-3-0 ] || \
@@ -148,4 +163,6 @@ acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247  models/sherpa-
 3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3  models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/joiner.int8.onnx
 d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d  models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tokens.txt
 d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d  models/sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx
+5ef208a9da1453335308a6b6f4e6dfbd7e183a38b604de0a57664f45d257fe94  models/wespeaker_en_voxceleb_resnet34.onnx
+c8e96b5e3d907a173d82582ef6855865936623a57d1b9cc5d91b7fd4c590cf39  data/AMI-diarization-setup-2509d8933721023fab4def2618aabd5c28eb82e9.zip
 EOF

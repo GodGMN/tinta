@@ -1142,6 +1142,29 @@ mod tests {
         })
     }
 
+    /// A virtual capture clock, so read timing does not depend on the load of
+    /// the test machine. Each read advances it by its fragment.
+    struct Timeline {
+        start: Instant,
+        micros: std::sync::atomic::AtomicU64,
+    }
+
+    impl Timeline {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                start: Instant::now(),
+                micros: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        /// Advances the clock and returns the capture time of the last sample.
+        fn advance(&self, duration: Duration) -> Instant {
+            let micros = duration.as_micros() as u64;
+            let end = self.micros.fetch_add(micros, Ordering::SeqCst) + micros;
+            self.start + Duration::from_micros(end)
+        }
+    }
+
     /// A capture source driven by the test: one read every 100 ms, an error after
     /// `fail_after` good reads, and a stop after `limit` calls in total.
     struct FakeSource {
@@ -1150,6 +1173,7 @@ mod tests {
         total: Arc<std::sync::atomic::AtomicUsize>,
         limit: usize,
         shared: Arc<Shared>,
+        timeline: Arc<Timeline>,
     }
 
     impl CaptureSource for FakeSource {
@@ -1173,9 +1197,8 @@ mod tests {
             out.fill(0.5);
             Ok(CaptureRead {
                 count: out.len(),
-                // A real stream reports when the last sample was captured; the
-                // fake uses the read completion, so a reopen leaves a gap.
-                captured: Some(Instant::now()),
+                // A real stream reports when the last sample was captured.
+                captured: Some(self.timeline.advance(Duration::from_millis(100))),
             })
         }
     }
@@ -1185,16 +1208,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shared = shared_for_capture(dir.path());
         let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let timeline = Timeline::new();
         let opener = {
             let shared = shared.clone();
             let total = total.clone();
+            let timeline = timeline.clone();
             move |_track: Track| -> Result<Box<dyn CaptureSource>> {
+                // The reopen loop waits 300 ms before it opens; the virtual
+                // clock advances by the same amount so the gap is exact.
+                timeline.advance(Duration::from_millis(300));
                 Ok(Box::new(FakeSource {
                     fail_after: None,
                     reads: 0,
                     total: total.clone(),
                     limit: 7,
                     shared: shared.clone(),
+                    timeline: timeline.clone(),
                 }))
             }
         };
@@ -1204,6 +1233,7 @@ mod tests {
             total: total.clone(),
             limit: 7,
             shared: shared.clone(),
+            timeline: timeline.clone(),
         });
         run_capture_with(shared.clone(), Track::Remote, first, opener);
 

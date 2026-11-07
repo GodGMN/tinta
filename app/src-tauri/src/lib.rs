@@ -7,6 +7,7 @@ mod system;
 
 use anyhow::{bail, Result};
 use engine::Engine;
+use tinta_core::capabilities::Capabilities;
 use tinta_core::db::{Db, Participant};
 use tinta_core::keys::Keys;
 use tinta_core::naming;
@@ -130,6 +131,8 @@ pub struct AppState {
     pub calls: Mutex<Vec<AppCall>>,
     /// The events of the calendars on this Mac.
     pub calendar: Mutex<calendar::CalendarState>,
+    /// The features that the engine reported in `ready` or in the `ping` reply.
+    pub capabilities: Mutex<Capabilities>,
     pub finalizing: Mutex<HashSet<String>>,
     pub summarizing: Mutex<HashSet<String>>,
     /// A call that ended during a recording, and the time of the end message.
@@ -145,6 +148,18 @@ pub struct AppState {
 
 /// The processing error of a recording without speech. The window shows its own text for this error.
 pub const NO_SPEECH: &str = "Tinta heard no speech in this recording.";
+
+/// What the app says when the engine does not have the summaries feature.
+pub const SUMMARIES_UNAVAILABLE: &str = "Summaries are not available on this platform.";
+
+/// What the app says when the engine cannot read the window of a call app.
+pub const CALL_READER_UNAVAILABLE: &str = "Reading names from the call window is not available on this platform.";
+
+/// What the app says when the engine cannot import an audio file.
+pub const IMPORT_AUDIO_UNAVAILABLE: &str = "Importing audio files is not available on this platform.";
+
+/// What the app says when the engine cannot read the calendars.
+pub const CALENDAR_UNAVAILABLE: &str = "Calendars are not available on this platform.";
 
 /// The time between leaving a call and the automatic stop. A rejoin in this time cancels the stop.
 const CALL_END_GRACE_MS: i64 = 3000;
@@ -202,6 +217,36 @@ impl AppState {
 
     pub fn meeting_changed(&self, id: &str) {
         self.emit("meeting_changed", json!({"id": id}));
+    }
+
+    /// The features that the engine supports, as it last reported them.
+    pub fn capabilities(&self) -> Capabilities {
+        *self.capabilities.lock().unwrap()
+    }
+
+    /// Stores the capabilities of the engine and tells the window when they change.
+    fn set_capabilities(&self, capabilities: Capabilities) {
+        let changed = {
+            let mut current = self.capabilities.lock().unwrap();
+            let changed = *current != capabilities;
+            *current = capabilities;
+            changed
+        };
+        if changed {
+            self.emit("capabilities", json!(capabilities));
+        }
+    }
+
+    /// Starts the watchers of the features that the engine supports. The call watcher also reads the
+    /// calls in progress, which recovers them after an engine restart.
+    pub fn start_watchers(&self) {
+        let capabilities = self.capabilities();
+        if capabilities.calls_detection {
+            watch_calls(Duration::ZERO);
+        }
+        if capabilities.calendar {
+            calendar::watch();
+        }
     }
 
     /// Refuses a change to a meeting while it records or while the final pass runs.
@@ -394,10 +439,11 @@ impl AppState {
                 self.emit("calls", json!([]));
                 self.emit("engine", event);
                 self.on_recording_lost();
-                watch_calls(self.next_restart_delay());
+                start_engine(self.next_restart_delay());
             }
             "ready" => {
                 self.engine_restart.lock().unwrap().0 = Some(Instant::now());
+                self.set_capabilities(Capabilities::from_json(&event));
                 self.emit("engine", event);
             }
             kind @ ("finalize_progress" | "summary_progress") => {
@@ -594,6 +640,9 @@ impl AppState {
     // MARK: Summaries
 
     pub fn summaries_available(&self) -> bool {
+        if !self.capabilities().summaries {
+            return false;
+        }
         let status = self.engine.call("summary_status", json!({}), Duration::from_secs(10));
         status.map(|s| s["available"].as_bool().unwrap_or(false)).unwrap_or(false)
     }
@@ -608,6 +657,9 @@ impl AppState {
 
     /// Writes a summary from the notes and the transcript with the local model.
     pub fn summarize(self: &Arc<Self>, id: &str) -> Result<()> {
+        if !self.capabilities().summaries {
+            bail!(SUMMARIES_UNAVAILABLE);
+        }
         if !self.summarizing.lock().unwrap().insert(id.to_string()) {
             bail!("a summary for this meeting is already in progress");
         }
@@ -911,13 +963,75 @@ impl Drop for FinalizeGuard {
     }
 }
 
-/// Starts the engine after `delay`. The engine watches for desktop app calls. The app sends the reading setting and reads the current calls.
+/// Starts the engine if it is not running, then starts the watchers of the features that it supports.
+/// `ping` has no side effects and starts a stopped engine. The engine reader thread calls this after
+/// the engine stops, so the work runs on its own thread.
+pub fn start_engine(delay: Duration) {
+    std::thread::spawn(move || {
+        let mut delay = delay;
+        loop {
+            std::thread::sleep(delay);
+            let state = state();
+            // `ready` also carries the capabilities. A reply without them keeps what `ready` said, because
+            // an engine may report the capabilities only there.
+            let reply = state.engine.call("ping", json!({}), Duration::from_secs(20)).ok();
+            match ping_outcome(reply.as_ref(), state.engine.is_running(), state.capabilities()) {
+                PingOutcome::Ready(capabilities) => {
+                    state.set_capabilities(capabilities);
+                    state.start_watchers();
+                    return;
+                }
+                // The process runs but did not answer: a slow start, or an engine that does not know
+                // `ping`. Retry in this thread with the restart backoff instead of losing the
+                // watchers until the next exit.
+                PingOutcome::Retry => delay = state.next_restart_delay(),
+                // The process is gone. Its `engine_exit` starts the next attempt with the backoff,
+                // and this chain ends here: starting the watchers now would send `calls`, which
+                // starts a second engine with no backoff and doubles the restart chains.
+                PingOutcome::Stop => return,
+            }
+        }
+    });
+}
+
+/// What to do after one `ping` attempt.
+#[derive(Debug, PartialEq)]
+enum PingOutcome {
+    /// The engine answered: use these capabilities and start the watchers.
+    Ready(Capabilities),
+    /// The process is still running but did not answer; retry after the restart backoff.
+    Retry,
+    /// The process is gone; its `engine_exit` schedules the next attempt.
+    Stop,
+}
+
+/// The outcome of a `ping` attempt. `reply` is `None` when the call failed, which includes an error
+/// reply and a timeout, so the process state decides: a running process gets another ping, a gone
+/// one leaves the next attempt to `engine_exit`. A reply without a `capabilities` object keeps the
+/// current capabilities, because an engine may report them only in `ready`.
+fn ping_outcome(reply: Option<&Value>, running: bool, current: Capabilities) -> PingOutcome {
+    match reply {
+        Some(reply) => PingOutcome::Ready(if Capabilities::reported(reply) {
+            Capabilities::from_json(reply)
+        } else {
+            current
+        }),
+        None if running => PingOutcome::Retry,
+        None => PingOutcome::Stop,
+    }
+}
+
+/// Sends the call reading setting to the engine and reads the current calls.
 /// The engine reader thread calls this after the engine stops, so the call runs on its own thread.
 pub fn watch_calls(delay: Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
         let state = state();
-        let read = state.setting("call_reading", "false") == "true";
+        if !state.capabilities().calls_detection {
+            return;
+        }
+        // Reading the call window is a second feature. Without it, the engine only watches the audio.
+        let read = state.capabilities().call_reader && state.setting("call_reading", "false") == "true";
         let Ok(result) = state.engine.call("calls", json!({"read": read}), Duration::from_secs(20)) else { return };
         let calls: Vec<AppCall> =
             result["calls"].as_array().map(|list| list.iter().filter_map(AppCall::parse).collect()).unwrap_or_default();
@@ -966,6 +1080,7 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
         extension: Mutex::new(ExtensionState::default()),
         calls: Mutex::new(Vec::new()),
         calendar: Mutex::new(calendar::CalendarState::default()),
+        capabilities: Mutex::new(Capabilities::default()),
         finalizing: Mutex::new(HashSet::new()),
         summarizing: Mutex::new(HashSet::new()),
         call_ended: Mutex::new(None),
@@ -974,8 +1089,10 @@ pub fn init(app: Option<AppHandle>) -> Result<Arc<AppState>> {
         engine_restart: Mutex::new((None, ENGINE_RESTART_MIN)),
     });
     let _ = STATE.set(state.clone());
-    watch_calls(ENGINE_RESTART_MIN);
-    calendar::watch();
+    start_engine(ENGINE_RESTART_MIN);
+    // Register the reminder click handler at launch, on the main thread: a reminder click can
+    // start Tinta, and macOS delivers it to the delegate that was set before launch finished.
+    calendar::init();
     // Test runs use their own data folder and must not change the Chrome configuration.
     if std::env::var_os("TINTA_DATA_DIR").is_none() {
         let _ = platform::install_native_host();
@@ -1057,4 +1174,41 @@ pub fn run() {
                 let _ = std::fs::remove_file(paths::socket_path());
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_ping_without_a_process_ends_the_restart_chain() {
+        let current = Capabilities::default();
+        // No reply and no process: `engine_exit` owns the next attempt.
+        assert_eq!(ping_outcome(None, false, current), PingOutcome::Stop);
+    }
+
+    #[test]
+    fn a_failed_ping_with_a_running_process_retries() {
+        let current = Capabilities::default();
+        // An error reply or a timeout leaves the process running. The watchers wait for a reply,
+        // and the chain retries instead of ending until the next exit.
+        assert_eq!(ping_outcome(None, true, current), PingOutcome::Retry);
+    }
+
+    #[test]
+    fn a_ping_reply_without_capabilities_keeps_the_current_ones() {
+        let current = Capabilities::default();
+        let reply = json!({"pong": true});
+        assert_eq!(ping_outcome(Some(&reply), true, current), PingOutcome::Ready(current));
+    }
+
+    #[test]
+    fn a_ping_reply_with_capabilities_replaces_them() {
+        let reply = json!({"pong": true, "capabilities": {"calendar": false}});
+        let PingOutcome::Ready(capabilities) = ping_outcome(Some(&reply), true, Capabilities::default()) else {
+            panic!("a reply is ready");
+        };
+        assert!(!capabilities.calendar);
+        assert!(capabilities.summaries);
+    }
 }

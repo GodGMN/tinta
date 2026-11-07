@@ -5,6 +5,8 @@ import {
   AppCall,
   Bootstrap,
   bytes,
+  Capabilities,
+  capabilitiesOf,
   clock,
   dateTime,
   EngineEvent,
@@ -61,8 +63,9 @@ export function prefetchMeeting(id: string) {
 }
 
 /** One line about the detected call and where the speaker names come from. */
-function callStatus(call: AppCall, boot: Bootstrap | null): string {
+function callStatus(call: AppCall, boot: Bootstrap | null, caps: Capabilities): string {
   if (call.participants.length > 0) return `${call.name} call, ${call.participants.length} people. Names come from ${call.name} (beta).`;
+  if (!caps.call_reader) return `${call.name} call. You name the speakers after the call.`;
   if (boot?.call_reading) return `${call.name} call. Tinta reads the names when it has Accessibility access and the call window is open.`;
   return `${call.name} call. You name the speakers after the call, or turn on names from ${call.name} in Settings.`;
 }
@@ -72,7 +75,17 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
   const [notes, setNotes] = useState(() => cache.get(id)?.notes ?? "");
   const [sources, setSources] = useState<Source[]>([]);
   const [route, setRoute] = useState<"speakers" | "headphones" | null>(null);
-  const [source, setSource] = useState(boot?.last_source ?? "com.google.Chrome");
+  const [source, setSource] = useState(() => {
+    const caps = capabilitiesOf(boot);
+    if (!caps.capture_app_audio) return caps.capture_system_audio ? "all" : "";
+    const last = boot?.last_source ?? "com.google.Chrome";
+    return last === "all" && !caps.capture_system_audio ? "" : last;
+  });
+  const caps = capabilitiesOf(boot);
+  /** A recording needs one of the two meeting-audio sources. An engine may report neither. */
+  const canRecordAudio = caps.capture_app_audio || caps.capture_system_audio;
+  /** The sources that the engine can capture: an app needs `capture_app_audio`, `all` needs `capture_system_audio`. */
+  const sourceOptions = caps.capture_app_audio ? sources.filter((s) => s.id !== "all" || caps.capture_system_audio) : [];
   const [progress, setProgress] = useState<{ stage: string; fraction: number } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   /** The path of the last export, for the notice with the copy buttons. */
@@ -174,11 +187,28 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
     return meetingTones([...listed, ...detail.turns.map((t) => speakerName(detail.names, t))]);
   }, [detail?.speakers, detail?.names, detail?.participants, detail?.turns]);
 
-  // A detected desktop app call selects its app as the meeting audio.
+  // A detected desktop app call selects its app as the meeting audio. Without per-app capture,
+  // the recording uses all system audio and the list of apps has no meaning.
   const detectedApp = calls[0]?.app;
   useEffect(() => {
-    if (detectedApp) setSource(detectedApp);
-  }, [detectedApp]);
+    if (detectedApp && caps.capture_app_audio) setSource(detectedApp);
+  }, [detectedApp, caps.capture_app_audio]);
+
+  // Keep the source one that the engine can capture. `all` needs `capture_system_audio`, and an
+  // app needs `capture_app_audio`; with neither, there is no source and the recording cannot start.
+  useEffect(() => {
+    if (source === "all") {
+      if (!caps.capture_system_audio) setSource(caps.capture_app_audio ? (sources[0]?.id ?? "") : "");
+      return;
+    }
+    if (caps.capture_app_audio) {
+      if (sources.length > 0 && !sources.some((s) => s.id === source)) {
+        setSource(sources.find((s) => s.id !== "all")?.id ?? sources[0].id);
+      }
+      return;
+    }
+    setSource(caps.capture_system_audio ? "all" : "");
+  }, [source, sources, caps.capture_app_audio, caps.capture_system_audio]);
 
   function changeNotes(value: string) {
     setNotes(value);
@@ -208,9 +238,12 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
   }
 
   async function start() {
+    // The engine can record neither one app nor the whole system, or the sources have not loaded yet.
+    if (!canRecordAudio || !source) return;
     setBusy("starting");
     startRequested.current = true;
     try {
+      // Only a system-wide capture exists when the engine cannot record one app.
       onActive(await api.startRecording(id, source));
       await load();
     } catch (e) {
@@ -324,32 +357,57 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
           <div className="row">
             <label>
               Meeting audio
-              <select value={source} onChange={(e) => setSource(e.target.value)} disabled={!!busy}>
-                {sources.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                    {s.playing ? " (playing)" : ""}
-                  </option>
-                ))}
-              </select>
+              {caps.capture_app_audio ? (
+                <select value={source} onChange={(e) => setSource(e.target.value)} disabled={!!busy}>
+                  {sourceOptions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                      {s.playing ? " (playing)" : ""}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="small muted">{caps.capture_system_audio ? "System audio" : "No meeting audio"}</span>
+              )}
             </label>
-            <button className="primary big" disabled={!boot?.models_installed || !!active || !!busy} onClick={start}>
+            <button
+              className="primary big"
+              disabled={!boot?.models_installed || !!active || !!busy || !canRecordAudio || !source}
+              onClick={start}
+            >
               {busy === "starting" ? "Starting…" : "Start recording"}
             </button>
-            <button className="quiet" onClick={onImport} disabled={!!busy}>
+            <button
+              className="quiet"
+              onClick={onImport}
+              disabled={!!busy || !caps.import_audio}
+              title={caps.import_audio ? undefined : "Importing an audio file is not available on this platform."}
+            >
               Or import an audio file
             </button>
           </div>
+          {!canRecordAudio && (
+            <div className="warn small">This engine cannot record the meeting audio.</div>
+          )}
           {!boot?.models_installed && <div className="warn small">Install the speech models in Settings first.</div>}
           {!!active && <div className="warn small">Another meeting is recording. Stop it first.</div>}
-          {source === "all" && <div className="warn small">All system audio includes every app and browser tab on this Mac.</div>}
+          {source === "all" && caps.capture_app_audio && (
+            <div className="warn small">All system audio includes every app and browser tab on this Mac.</div>
+          )}
           {route === "speakers" && (
-            <div className="small warn">Sound plays through speakers. Tinta removes the echo, but headphones give a better transcript.</div>
+            <div className="small warn">
+              {caps.echo_cancellation
+                ? "Sound plays through speakers. Tinta removes the echo, but headphones give a better transcript."
+                : "Sound plays through speakers. Use headphones so that the meeting audio does not come back through your microphone."}
+            </div>
+          )}
+          {!caps.import_audio && (
+            <div className="small muted">Importing an audio file is not available on this platform.</div>
           )}
           {boot?.microphone !== "granted" && <div className="small muted">macOS asks for microphone access when the recording starts.</div>}
           <div className="small muted">
             {calls.length > 0
-              ? calls.map((c) => callStatus(c, boot)).join(" ")
+              ? calls.map((c) => callStatus(c, boot, caps)).join(" ")
               : extensionInCall
                 ? `Meet call, ${extension?.participants.length} people. Names come from Meet.`
                 : "No call detected. You name the speakers after the call."}
@@ -400,7 +458,9 @@ export function MeetingView({ id, boot, active, extension, calls, folders, tags,
         </section>
       )}
 
-      {ready && <SummaryPanel detail={detail} boot={boot} onError={onError} onMessage={setMessage} />}
+      {ready && (caps.summaries || detail.summary) && (
+        <SummaryPanel detail={detail} boot={boot} onError={onError} onMessage={setMessage} />
+      )}
 
       <Workspace details={ready}>
         <section className="column notes-column">

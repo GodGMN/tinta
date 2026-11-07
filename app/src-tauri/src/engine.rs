@@ -164,6 +164,17 @@ impl Engine {
         self.stopped.load(Ordering::SeqCst)
     }
 
+    /// True while the current engine process runs. A call that failed because the process is gone
+    /// looks like one that failed while it still runs, so the restart chain asks this to tell them
+    /// apart.
+    pub fn is_running(&self) -> bool {
+        if self.stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut slot = self.process.lock().unwrap();
+        slot.as_mut().is_some_and(|process| matches!(process.child.try_wait(), Ok(None)))
+    }
+
     /// Stops the engine. Later calls fail and do not start it again.
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);

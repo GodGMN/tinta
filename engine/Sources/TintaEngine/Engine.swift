@@ -15,7 +15,7 @@ struct Engine {
         setvbuf(stdout, nil, _IOLBF, 0)
         ModelPins.setOnline(false)
         let controller = Controller()
-        Output.shared.event("ready", ["version": "0.9.3"])
+        Output.shared.event("ready", ["version": "0.9.3", "capabilities": Controller.capabilities])
         Controller.calls.start()
         Controller.calendar.start()
         Task.detached { await controller.prewarm() }
@@ -64,6 +64,15 @@ struct Engine {
 actor Controller {
     static let calls = CallWatcher()
     static let calendar = CalendarReader()
+    /// The features of this engine, reported in `ready` and in `ping`. The Mac engine has all of them.
+    /// Summaries still report their real availability in `summary_status`.
+    static var capabilities: [String: Any] {
+        [
+            "capture_system_audio": true, "capture_app_audio": true, "calls_detection": true,
+            "call_reader": true, "calendar": true, "summaries": true, "echo_cancellation": true,
+            "import_audio": true,
+        ]
+    }
     private let speech = Speech()
     private var session: RecordingSession?
     /// True while `start` waits for permissions and models.
@@ -74,7 +83,7 @@ actor Controller {
     func handle(_ command: String, _ params: [String: Any]) async throws -> [String: Any] {
         switch command {
         case "ping":
-            return ["pong": true]
+            return ["pong": true, "capabilities": Self.capabilities]
         case "models_status":
             return ["installed": await speech.modelsInstalled(), "path": ModelPins.modelsRoot.path]
         case "install_models":

@@ -4,10 +4,11 @@
 //! when the window gets the focus, and every few minutes.
 
 use crate::platform::{self, notify};
-use crate::{state, AppState};
-use anyhow::{anyhow, Result};
+use crate::{state, AppState, CALENDAR_UNAVAILABLE};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tinta_core::calendar::{Event, Snapshot};
@@ -64,6 +65,9 @@ impl AppState {
 
     /// Reads the calendars from the engine and sends them to the window.
     pub fn refresh_calendar(&self) -> Result<Snapshot> {
+        if !self.capabilities().calendar {
+            bail!(CALENDAR_UNAVAILABLE);
+        }
         let value = self.engine.call("calendar", json!({"days": DAYS}), Duration::from_secs(30))?;
         let snapshot = Snapshot::parse(value)?;
         {
@@ -79,6 +83,9 @@ impl AppState {
 
     /// Asks macOS for calendar access, and then for permission to show reminders.
     pub fn request_calendar(&self) -> Result<Snapshot> {
+        if !self.capabilities().calendar {
+            bail!(CALENDAR_UNAVAILABLE);
+        }
         let result = self.engine.call("request_calendar", json!({}), Duration::from_secs(300))?;
         if result["granted"].as_bool() == Some(true) {
             notify::request_permission();
@@ -197,6 +204,9 @@ impl AppState {
 
     /// Handles a calendar event from the engine. The engine reader thread calls this, so the work runs on its own thread.
     pub fn on_calendar_changed(self: &Arc<Self>) {
+        if !self.capabilities().calendar {
+            return;
+        }
         let state = self.clone();
         std::thread::spawn(move || {
             let _ = state.refresh_calendar();
@@ -204,11 +214,24 @@ impl AppState {
     }
 }
 
-/// Registers the reminders, and reads the calendars and checks for reminders on a new thread.
-pub fn watch() {
+/// True after the first call of `watch`. The calendar thread lives as long as the app.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Registers the reminder click handler. The app calls this in `init` at launch, on the main
+/// thread, so a click that launched Tinta (for example Join on a reminder) is delivered even
+/// when the engine cannot read calendars.
+pub fn init() {
     notify::init(|event_id| {
         std::thread::spawn(move || state().on_reminder_click(&event_id));
     });
+}
+
+/// Reads the calendars and checks for reminders on a new thread.
+/// It runs only when the engine reports the calendar feature.
+pub fn watch() {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     std::thread::spawn(|| {
         let state = state();
         if state.refresh_calendar().map(|s| s.access == "granted").unwrap_or(false) {
@@ -216,6 +239,10 @@ pub fn watch() {
         }
         loop {
             std::thread::sleep(TICK);
+            // A restarted engine may report that it cannot read calendars, for example a Rust engine.
+            if !state.capabilities().calendar {
+                continue;
+            }
             // The wall clock also counts the time while the Mac sleeps.
             let read_at = state.calendar.lock().unwrap().read_at;
             if read_at.map(|t| now_ms() - t >= REFRESH_MS).unwrap_or(true) {

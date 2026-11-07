@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Active, AppCall, Bootstrap, CalendarState, clock, dateTime, ExtensionState, Meeting, NO_SPEECH_ERROR, PLATFORM_NAMES, Preview, relativeDate } from "./api";
+import { Active, AppCall, Bootstrap, CalendarState, capabilitiesOf, clock, dateTime, ExtensionState, Meeting, NO_SPEECH_ERROR, PLATFORM_NAMES, Preview, relativeDate } from "./api";
 import { Icon, InkMark, Name } from "./Brand";
 import { pressable } from "./MeetingList";
 import { JOIN_BEFORE_MS, NextMeetings, recorded, startsIn, timeRange } from "./NextMeetings";
@@ -49,15 +49,20 @@ export function Home({
   }, []);
 
   const inCall = !!(extension?.meeting_code && extension.last_seen && now - extension.last_seen < 30_000);
-  const appCall = calls[0];
+  const caps = capabilitiesOf(boot);
+  // The engine can capture a meeting only when it captures an app or the whole system.
+  const canRecordMeetingAudio = caps.capture_app_audio || caps.capture_system_audio;
+  const appCall = caps.calls_detection ? calls[0] : undefined;
   const everConnected = !!extension?.connected_at;
   const recording = active ? meetings.find((m) => m.id === active.meeting_id) : undefined;
   const ready = boot?.models_installed ?? false;
   const [calendarDismissed, setCalendarDismissed] = useState(() => localStorage.getItem(CALENDAR_DISMISSED) === "true");
-  const showCalendar = calendar.access === "granted" || (calendar.access !== "" && !calendarDismissed);
+  const showCalendar = caps.calendar && (calendar.access === "granted" || (calendar.access !== "" && !calendarDismissed));
   // The calendar event of the Meet call, and the next meeting with a call link that starts soon.
   const callEvent = inCall ? calendar.events.find((e) => e.link?.code && e.link.code === extension?.meeting_code) : undefined;
-  const soon = calendar.events.find((e) => e.link && e.start - now <= JOIN_BEFORE_MS && e.end > now && !recorded(e, meetings));
+  const soon = caps.calendar
+    ? calendar.events.find((e) => e.link && e.start - now <= JOIN_BEFORE_MS && e.end > now && !recorded(e, meetings))
+    : undefined;
 
   const setup = boot
     ? [
@@ -117,7 +122,12 @@ export function Home({
               {people(extension?.participants.length ?? 0)} Tell everyone that you record the call.
             </p>
           </div>
-          <RecordButton ready={ready} busy={busy} onClick={() => onRecordCall("com.google.Chrome", callEvent?.id)} />
+          <RecordButton
+            ready={ready}
+            busy={busy}
+            canRecord={canRecordMeetingAudio}
+            onClick={() => onRecordCall("com.google.Chrome", callEvent?.id)}
+          />
         </section>
       ) : appCall ? (
         <section className="hero hero-call">
@@ -132,7 +142,12 @@ export function Home({
               Tell everyone that you record the call.
             </p>
           </div>
-          <RecordButton ready={ready} busy={busy} onClick={() => onRecordCall(appCall.app)} />
+          <RecordButton
+            ready={ready}
+            busy={busy}
+            canRecord={canRecordMeetingAudio}
+            onClick={() => onRecordCall(appCall.app)}
+          />
         </section>
       ) : soon?.link ? (
         <section className="hero hero-call">
@@ -165,7 +180,11 @@ export function Home({
             <h2>
               Stay in the <em>conversation.</em>
             </h2>
-            <p>Join a call in Google Meet, Zoom, or Microsoft Teams, and Tinta offers to record it. For other apps, create a new meeting.</p>
+            <p>
+              {caps.calls_detection || caps.calendar
+                ? "Join a call in Google Meet, Zoom, or Microsoft Teams, and Tinta offers to record it. For other apps, create a new meeting."
+                : "Create a new meeting to record your microphone and the meeting audio."}
+            </p>
           </div>
         </section>
       )}
@@ -300,9 +319,14 @@ function people(count: number): string {
   return count === 1 ? "1 person in the call." : `${count} people in the call.`;
 }
 
-function RecordButton({ ready, busy, onClick }: { ready: boolean; busy: boolean; onClick: () => void }) {
+function RecordButton({ ready, busy, canRecord, onClick }: { ready: boolean; busy: boolean; canRecord: boolean; onClick: () => void }) {
+  const title = !ready
+    ? "Install the speech models first"
+    : !canRecord
+      ? "This engine cannot capture meeting audio."
+      : "";
   return (
-    <button className="primary big" disabled={!ready || busy} onClick={onClick} title={ready ? "" : "Install the speech models first"}>
+    <button className="primary big" disabled={!ready || busy || !canRecord} onClick={onClick} title={title}>
       {busy ? "Starting…" : "Record this call"}
     </button>
   );

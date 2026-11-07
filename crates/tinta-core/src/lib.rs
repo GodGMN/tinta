@@ -2,6 +2,7 @@
 
 pub mod calendar;
 pub mod chunks;
+pub mod capabilities;
 pub mod db;
 pub mod export;
 pub mod granola;

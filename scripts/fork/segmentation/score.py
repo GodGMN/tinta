@@ -8,6 +8,13 @@ engine's full-meeting decode from `tinta-segmentation`, with each word assigned
 to exactly one segment window by midpoint (the shortest window containing the
 midpoint), as in `ihm-baseline.py ablate-score` on the task #19 branch.
 
+Two oracle numbers are reported. The **per-turn oracle** decodes each reference
+turn on its own, so it transcribes both sides of an overlap. The **single-stream
+oracle** merges those words into one absolute-time stream and, in every overlap,
+keeps only the side with more words in the shared interval: it asks what the
+same scorer would give a perfect single-channel recognizer, which is the fair
+bound for this pipeline. Score deltas against both.
+
 WER is the leaderboard estimator: summed per-utterance edit distances over the
 summed reference words, with Whisper's EnglishTextNormalizer on both sides.
 An empty normalized reference keeps its hypothesis tokens as insertions.
@@ -18,6 +25,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import os
 import sys
@@ -127,6 +135,68 @@ def sum_counts(items):
     return total
 
 
+def oracle_words(rows, oracle):
+    """The oracle hypotheses as one absolute-time word stream."""
+    words = []
+    for row in rows:
+        hypothesis = oracle.get(row["id"], {})
+        for word in hypothesis.get("words", []):
+            words.append(
+                {
+                    "text": word["text"],
+                    "start": row["begin"] + word["start"],
+                    "end": row["begin"] + word["end"],
+                    "row": row["id"],
+                }
+            )
+    return words
+
+
+def single_stream_words(rows, oracle, overlap_seconds=0.2):
+    """The fair oracle bound: the per-turn oracle merged into one stream.
+
+    The per-turn oracle decodes each reference turn on its own, so in an overlap
+    it transcribes both speakers. A single-channel pipeline hears the mix once.
+    Merging the oracle words and, in each overlap, keeping only the side with
+    more words in the shared interval (as in the task #21 review) removes that
+    advantage. The removed words count is returned for the report.
+    """
+    words = oracle_words(rows, oracle)
+    by_row = {}
+    for index, word in enumerate(words):
+        by_row.setdefault(word["row"], []).append(index)
+    dropped = set()
+    for first, second in itertools.combinations(rows, 2):
+        shared_start = max(first["begin"], second["begin"])
+        shared_end = min(first["end"], second["end"])
+        if shared_end - shared_start <= overlap_seconds:
+            continue
+
+        def in_shared(row_id):
+            return [
+                index
+                for index in by_row.get(row_id, [])
+                if shared_start
+                <= (words[index]["start"] + words[index]["end"]) / 2
+                < shared_end
+            ]
+
+        first_inside = in_shared(first["id"])
+        second_inside = in_shared(second["id"])
+        if len(first_inside) == len(second_inside):
+            loser = by_row.get(second["id"], [])
+        elif len(first_inside) > len(second_inside):
+            loser = by_row.get(second["id"], [])
+        else:
+            loser = by_row.get(first["id"], [])
+        for index in loser:
+            middle = (words[index]["start"] + words[index]["end"]) / 2
+            if shared_start <= middle < shared_end:
+                dropped.add(index)
+    kept = [word for index, word in enumerate(words) if index not in dropped]
+    return kept, len(dropped)
+
+
 def pairs(spec):
     return dict(item.split("=", 1) for item in spec.split(",") if item)
 
@@ -154,51 +224,71 @@ def main():
 
     result = {"label": args.label, "per_meeting": {}}
     all_oracle = []
+    all_single = []
     all_pipeline = []
     print(f"\n### {args.label}\n")
-    print("| Meeting | Segments | Oracle WER | Pipeline WER | Delta | del / ins / sub (pipeline) | Words outside windows |")
-    print("|---|---|---|---|---|---|---|")
+    print(
+        "| Meeting | Segments | Oracle per-turn | Oracle single stream | Pipeline | "
+        "Delta vs per-turn | Delta vs single stream | del / ins / sub (pipeline) | Words outside windows |"
+    )
+    print("|---|---|---|---|---|---|---|---|---|")
     for meeting in meetings:
         meeting_rows = [row for row in rows if row["meeting"] == meeting]
         oracle = read_jsonl(oracle_paths[meeting])
         hypothesis, outside = assign_rows(
             meeting_rows, load_pipeline(pipeline_paths[meeting], args.field)
         )
+        single_words, dropped = single_stream_words(meeting_rows, oracle)
+        single_hypothesis, _ = assign_rows(meeting_rows, single_words)
         oracle_counts = [counts(row["text"], oracle.get(row["id"], {}).get("text", "")) for row in meeting_rows]
+        single_counts = [counts(row["text"], single_hypothesis.get(row["id"], "")) for row in meeting_rows]
         pipeline_counts = [counts(row["text"], hypothesis.get(row["id"], "")) for row in meeting_rows]
         o = sum_counts(oracle_counts)
+        s = sum_counts(single_counts)
         p = sum_counts(pipeline_counts)
         all_oracle.extend(oracle_counts)
+        all_single.extend(single_counts)
         all_pipeline.extend(pipeline_counts)
         result["per_meeting"][meeting] = {
             "segments": len(meeting_rows),
             "oracle": o,
+            "oracle_single_stream": s,
+            "oracle_single_stream_words_dropped": dropped,
             "pipeline": p,
             "delta": p["wer"] - o["wer"],
+            "delta_single_stream": p["wer"] - s["wer"],
             "words_outside_windows": outside,
         }
         print(
             f"| {meeting} | {len(meeting_rows)} | {100 * o['wer']:.1f}% | "
-            f"{100 * p['wer']:.1f}% | {100 * (p['wer'] - o['wer']):+.1f} | "
+            f"{100 * s['wer']:.1f}% | {100 * p['wer']:.1f}% | "
+            f"{100 * (p['wer'] - o['wer']):+.1f} | "
+            f"{100 * (p['wer'] - s['wer']):+.1f} | "
             f"{p['del']} / {p['ins']} / {p['sub']} | {outside} |"
         )
     o = sum_counts(all_oracle)
+    s = sum_counts(all_single)
     p = sum_counts(all_pipeline)
     result["overall"] = {
         "oracle": o,
+        "oracle_single_stream": s,
         "pipeline": p,
         "delta": p["wer"] - o["wer"],
+        "delta_single_stream": p["wer"] - s["wer"],
     }
     print(
         f"| **All** | {len(all_pipeline)} | **{100 * o['wer']:.1f}%** | "
-        f"**{100 * p['wer']:.1f}%** | **{100 * (p['wer'] - o['wer']):+.1f}** | "
+        f"**{100 * s['wer']:.1f}%** | **{100 * p['wer']:.1f}%** | "
+        f"**{100 * (p['wer'] - o['wer']):+.1f}** | "
+        f"**{100 * (p['wer'] - s['wer']):+.1f}** | "
         f"{p['del']} / {p['ins']} / {p['sub']} | |"
     )
     print(
         f"\n{args.label}: oracle {100 * o['wer']:.1f}% ({o['del']} del / {o['ins']} ins / "
-        f"{o['sub']} sub, {o['ref_words']} ref words), pipeline {100 * p['wer']:.1f}% "
+        f"{o['sub']} sub, {o['ref_words']} ref words), single-stream oracle "
+        f"{100 * s['wer']:.1f}%, pipeline {100 * p['wer']:.1f}% "
         f"({p['del']} del / {p['ins']} ins / {p['sub']} sub), delta "
-        f"{100 * (p['wer'] - o['wer']):+.1f} points."
+        f"{100 * (p['wer'] - o['wer']):+.1f} / {100 * (p['wer'] - s['wer']):+.1f} points."
     )
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

@@ -93,6 +93,7 @@ fn variant_settings(name: &str) -> Result<Settings> {
         "before" => Settings {
             max_piece_seconds: 30.0,
             pre_roll_seconds: 2.0,
+            min_pre_roll_seconds: 0.0,
             post_roll_seconds: 1.0,
             min_piece_seconds: 10.0,
             join_gap_seconds: 0.5,
@@ -166,6 +167,21 @@ fn variant_settings(name: &str) -> Result<Settings> {
             vad_max_speech_seconds: 60.0,
             ..base
         },
+        // The quiet-point pre-roll floored at 0.5 s and 1.0 s: the ablation for
+        // the "speech starts within 0.5 s of the piece start" finding. The 0 row
+        // is the previous quietest-only behaviour, for attribution.
+        "pre-roll-floor0" => Settings {
+            min_pre_roll_seconds: 0.0,
+            ..base
+        },
+        "pre-roll-floor05" => Settings {
+            min_pre_roll_seconds: 0.5,
+            ..base
+        },
+        "pre-roll-floor10" => Settings {
+            min_pre_roll_seconds: 1.0,
+            ..base
+        },
         // A shorter piece for tuning.
         "short-10" => Settings {
             max_piece_seconds: 10.0,
@@ -186,6 +202,7 @@ fn settings_json(settings: &Settings) -> serde_json::Value {
     json!({
         "max_piece_seconds": settings.max_piece_seconds,
         "pre_roll_seconds": settings.pre_roll_seconds,
+        "min_pre_roll_seconds": settings.min_pre_roll_seconds,
         "post_roll_seconds": settings.post_roll_seconds,
         "min_piece_seconds": settings.min_piece_seconds,
         "join_gap_seconds": settings.join_gap_seconds,

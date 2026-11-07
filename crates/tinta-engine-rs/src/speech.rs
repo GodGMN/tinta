@@ -34,7 +34,8 @@ use crate::audio::SAMPLE_RATE;
 use crate::clustering::{recluster, Options as ClusterOptions, Unit};
 use crate::manifest::{Manifest, ModelGroup};
 use crate::segment::{
-    ensure_recognizer_window, group_pieces_with, speech_gaps, trim_overlaps, vad_segments, Settings,
+    ensure_recognizer_window, group_pieces_with, merge_hole_words, speech_gaps, trim_overlaps,
+    vad_segments, Settings,
 };
 use crate::threads::Threads;
 use crate::types::{SpeakerSegment, Word};
@@ -65,6 +66,19 @@ const RETRY_HOLE_SECONDS: f32 = 2.5;
 const RETRY_OFFSETS_SECONDS: [f32; 4] = [0.4, -0.4, 0.9, -0.9];
 /// At most this many passes of hole detection and re-decode.
 const GAP_REDECODE_ROUNDS: usize = 2;
+/// The hole re-decode may hand the recognizer at most this many times the first
+/// pass's audio, retries included, largest holes first. Without it a VAD false
+/// positive over music or typing pays the primary decode plus four retries
+/// inside round 1. A stricter 25 % of the track was measured to skip 40 % of the
+/// planned holes on EN2002a and cost 1.8 WER points on ES2004b and 3.5 on
+/// EN2002a, so the cap sits at twice the first pass: the measured meetings spend
+/// 61 % (ES2004b) and 148 % (EN2002a) of the first pass's audio, and a
+/// pathological track still stops at 3x the first pass's compute.
+const REDECODE_BUDGET_SHARE: f64 = 2.0;
+/// The first pass fills this share of the transcription progress; the rest is
+/// the hole re-decode, so the bar keeps moving instead of sitting at 100 %
+/// while the extra pass runs (measured at +31 % to +137 % of the first pass).
+const FIRST_PASS_PROGRESS_SHARE: f64 = 0.8;
 /// `Speech.diarize` skips the diarizer below this much audio.
 const MIN_DIARIZATION_SECONDS: usize = 2 * SAMPLE_RATE as usize;
 
@@ -314,16 +328,21 @@ impl SpeechPass {
     /// retry can never make the transcript worse.
     ///
     /// `speech` is the VAD speech inside the window, so silence in the pre- and
-    /// post-roll is never mistaken for a dropped stretch.
+    /// post-roll is never mistaken for a dropped stretch. `max_retries` caps the
+    /// extra decodes so the re-decode budget holds, and `spent` receives the
+    /// samples handed to the recognizer, retries included.
     fn decode_with_retry(
         &mut self,
         samples: &[f32],
         start: usize,
         end: usize,
         speech: &[(usize, usize)],
+        max_retries: usize,
+        spent: &mut usize,
     ) -> Result<Vec<Word>> {
         let mut best = self.decode(&samples[start..end], start as f64 / SAMPLE_RATE as f64)?;
-        for offset in RETRY_OFFSETS_SECONDS {
+        *spent += end - start;
+        for offset in RETRY_OFFSETS_SECONDS.into_iter().take(max_retries) {
             if speech_gaps(speech, &best, RETRY_HOLE_SECONDS).is_empty() {
                 break;
             }
@@ -337,6 +356,7 @@ impl SpeechPass {
                 continue;
             }
             let candidate = self.decode(&samples[from..end], from as f64 / SAMPLE_RATE as f64)?;
+            *spent += end - from;
             if missing_seconds(speech, &candidate) < missing_seconds(speech, &best) {
                 best = candidate;
             }
@@ -348,15 +368,29 @@ impl SpeechPass {
     /// `gap_redecode_seconds` long inside a VAD speech region with no word from
     /// the previous pass. A hole is planned like any other speech span, so it
     /// starts at a quiet point and is split at the piece length if it is long.
-    /// Only words whose midpoint falls inside the hole are kept, so the words at
-    /// its edges stay single. Up to [`GAP_REDECODE_ROUNDS`] passes run, because a
-    /// re-decode can itself drop a stretch; a round that adds nothing stops.
+    /// Only words whose midpoint falls inside the hole are kept, and a word that
+    /// repeats a hole-edge word is dropped ([`merge_hole_words`]), so the words
+    /// at its edges stay single. Up to [`GAP_REDECODE_ROUNDS`] passes run,
+    /// because a re-decode can itself drop a stretch; a round that adds nothing
+    /// stops.
+    ///
+    /// The audio handed to the recognizer, retries included, is capped at twice
+    /// the first pass's audio ([`REDECODE_BUDGET_SHARE`]), largest holes first;
+    /// holes that do not fit stay holes. Progress continues from `first_share`.
     fn redecode_gaps(
         &mut self,
         samples: &[f32],
         segments: &[(usize, usize)],
         mut words: Vec<Word>,
+        progress: &mut dyn FnMut(f64),
+        first_share: f64,
+        first_pass_audio: usize,
     ) -> Result<Vec<Word>> {
+        let budget = (first_pass_audio as f64 * REDECODE_BUDGET_SHARE) as usize;
+        let mut spent = 0usize;
+        let mut planned = 0usize;
+        let mut holes_decoded = 0usize;
+        let mut last_fraction = first_share;
         // Holes that produced no word at all are not retried in a later round:
         // re-decoding the same window is deterministic, and a VAD false positive
         // would otherwise pay two rounds of retries for silence.
@@ -371,10 +405,21 @@ impl SpeechPass {
                 break;
             }
             let before = words.len();
-            for (hole_start, hole_end) in holes {
-                let first = hole_start as f64 / SAMPLE_RATE as f64;
-                let last = hole_end as f64 / SAMPLE_RATE as f64;
+            // Largest holes first: under the cap they carry the most missing
+            // speech per recognizer call.
+            for (hole_start, hole_end) in largest_first(holes) {
                 let pieces = group_pieces_with(&self.settings, samples, &[(hole_start, hole_end)]);
+                let cost: usize = pieces.iter().map(|(start, end)| end - start).sum();
+                let remaining = budget.saturating_sub(spent);
+                if cost > remaining || cost == 0 {
+                    continue;
+                }
+                // The primary decode fits; spend what is left over on retries,
+                // so the cap covers every sample the re-decode hands to the
+                // recognizer rather than only the first attempt.
+                let retries = ((remaining - cost) / cost).min(RETRY_OFFSETS_SECONDS.len());
+                planned += cost;
+                holes_decoded += 1;
                 let mut decoded = Vec::with_capacity(pieces.len());
                 for (start, end) in &pieces {
                     decoded.push(self.decode_with_retry(
@@ -382,26 +427,48 @@ impl SpeechPass {
                         *start,
                         *end,
                         &[(hole_start, hole_end)],
+                        retries,
+                        &mut spent,
                     )?);
                 }
-                let added = words.len();
-                for word in trim_overlaps(&pieces, &mut decoded) {
-                    let middle = (word.s + word.e) / 2.0;
-                    if middle > first && middle < last {
-                        words.push(word);
-                    }
-                }
-                if words.len() == added {
+                let added = merge_hole_words(
+                    &mut words,
+                    trim_overlaps(&pieces, &mut decoded),
+                    (hole_start, hole_end),
+                );
+                if added == 0 {
                     fruitless.push((hole_start, hole_end));
                 }
+                // Retries can decode more than planned; the fraction is clamped
+                // and still never decreases. The caller emits 1.0 at the end.
+                let fraction =
+                    first_share + (1.0 - first_share) * (spent as f64 / planned as f64).min(1.0);
+                last_fraction = last_fraction.max(fraction.min(0.999));
+                progress(last_fraction);
             }
             words.sort_by(|a, b| a.s.partial_cmp(&b.s).unwrap_or(std::cmp::Ordering::Equal));
             if words.len() == before {
                 break;
             }
         }
+        if planned > 0 {
+            let rate = SAMPLE_RATE as f64;
+            crate::protocol::log(&format!(
+                "hole re-decode: {holes_decoded} holes, {:.1} s planned, {:.1} s decoded with retries, cap {:.1} s",
+                planned as f64 / rate,
+                spent as f64 / rate,
+                budget as f64 / rate
+            ));
+        }
         Ok(words)
     }
+}
+
+/// The holes longest first, so the capped re-decode spends its budget where the
+/// most speech is missing.
+fn largest_first(mut holes: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    holes.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    holes
 }
 
 impl FinalPass for SpeechPass {
@@ -418,16 +485,34 @@ impl FinalPass for SpeechPass {
             return Ok(Vec::new());
         }
         let total = pieces.len();
+        let total_audio: usize = pieces.iter().map(|(start, end)| end - start).sum();
+        let total_audio = total_audio.max(1);
+        let mut decoded_audio = 0usize;
+        let mut last_fraction = 0.0f64;
         let mut words = Vec::with_capacity(total);
-        for (index, (start, end)) in pieces.iter().enumerate() {
+        for (start, end) in pieces.iter() {
             let offset = *start as f64 / SAMPLE_RATE as f64;
             words.push(self.decode(&samples[*start..*end], offset)?);
-            progress((index + 1) as f64 / total as f64);
+            decoded_audio += end - start;
+            // The first pass fills a fixed share of the transcription stage, so
+            // the hole re-decode below keeps moving the same bar instead of
+            // starting after a 100 % event.
+            let fraction = decoded_audio as f64 / total_audio as f64 * FIRST_PASS_PROGRESS_SHARE;
+            last_fraction = last_fraction.max(fraction);
+            progress(last_fraction);
         }
         let mut words = trim_overlaps(&pieces, &mut words);
         if self.settings.gap_redecode_seconds > 0.0 {
-            words = self.redecode_gaps(samples, &segments, words)?;
+            words = self.redecode_gaps(
+                samples,
+                &segments,
+                words,
+                progress,
+                last_fraction,
+                total_audio,
+            )?;
         }
+        progress(1.0);
         Ok(words)
     }
 
@@ -748,6 +833,15 @@ mod tests {
         assert!((missing_seconds(&speech, &words) - 8.0).abs() < 1e-3);
         // No word at all: the whole region is missing.
         assert!((missing_seconds(&speech, &[]) - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_redecode_budget_spends_on_the_largest_holes_first() {
+        let holes = vec![(0, 3_000), (10_000, 30_000), (40_000, 50_000)];
+        assert_eq!(
+            largest_first(holes),
+            vec![(10_000, 30_000), (40_000, 50_000), (0, 3_000)]
+        );
     }
 
     #[test]

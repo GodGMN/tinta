@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- The desktop app builds for Windows and Linux. Those builds cannot open the encrypted library yet, so Tinta explains why in a dialog and then closes.
+- Tinta has a Linux build, as a `.deb` package and an AppImage. It is a preview: it needs the rest of the Linux stack (key store, recording, helpers, call detection), so a bundle from the packaging branch alone cannot open a library or record. The README section **Linux (preview)** lists what works and what does not.
+- CI installs the `.deb` in clean Debian 12 and Ubuntu 24.04 containers and checks every installed binary with `ldd`, so a missing runtime package fails the build. The `tinta-linux-x86_64` artifact is kept for 30 days.
+
 ## 0.9.3 (2026-10-21)
 
 ### Fixed

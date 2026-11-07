@@ -1,0 +1,275 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares. The
+      # macOS build script makes them; a check only needs the files to exist.
+      - name: Create placeholder sidecars
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          for name in tinta-engine tinta-mcp tinta-native-host; do
+            touch "app/src-tauri/binaries/$name-$triple"
+          done
+      # Clippy builds the app in development mode, which uses devUrl, but build the frontend
+      # too so that a release-style build finds dist/.
+      - name: Build the frontend
+        working-directory: app
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Clippy
+        run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+
+  bundle-linux:
+    # Ubuntu 22.04 keeps the build on glibc 2.35, so the bundles run on Debian 12 (glibc 2.36)
+    # and Ubuntu 24.04 (glibc 2.39). `ubuntu-latest` is 24.04, and a build there needs glibc
+    # 2.39, which rules out both. 22.04 has libwebkit2gtk-4.1-dev in universe; if GitHub retires
+    # the image, build the bundle in a 22.04 container instead of moving to ubuntu-latest.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the bundles
+        run: ./scripts/build-linux.sh
+      - name: Check the bundles
+        run: |
+          set -euo pipefail
+          deb="$(ls target/release/bundle/deb/*.deb)"
+          # Save the listing once: `dpkg-deb -c | grep -q` would stop tar with SIGPIPE.
+          contents="$(mktemp)"
+          dpkg-deb -c "$deb" > "$contents"
+          cat "$contents"
+          dpkg-deb -I "$deb"
+          for name in tinta tinta-engine tinta-mcp tinta-native-host; do
+            grep -q "usr/bin/$name$" "$contents" || { echo "missing usr/bin/$name"; exit 1; }
+          done
+          tmp="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$tmp"
+          cat "$tmp/usr/share/applications/Tinta.desktop"
+          grep -qx 'Categories=AudioVideo;Audio;Recorder;' "$tmp/usr/share/applications/Tinta.desktop"
+          appimage="$(ls target/release/bundle/appimage/*.AppImage)"
+          work="$(mktemp -d)"
+          cd "$work"
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          ls -l squashfs-root/usr/bin
+          cat squashfs-root/usr/share/applications/Tinta.desktop
+          for name in tinta tinta-engine tinta-mcp tinta-native-host; do
+            test -x "squashfs-root/usr/bin/$name" || { echo "missing $name in the AppImage"; exit 1; }
+          done
+      # An ldd run on this machine proves nothing: the build image has every -dev package
+      # installed. Install the real .deb in a clean supported release instead, so apt has
+      # to resolve the whole Depends list, and check the installed binaries there.
+      - name: Install the deb in clean Debian 12 and Ubuntu 24.04
+        run: |
+          set -euo pipefail
+          deb="$(ls target/release/bundle/deb/*.deb)"
+          for image in debian:12 ubuntu:24.04; do
+            echo "== $image =="
+            docker run --rm \
+              -v "$PWD/$deb:/tmp/tinta.deb:ro" \
+              "$image" bash -euc '
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends /tmp/tinta.deb
+                for binary in /usr/bin/tinta /usr/bin/tinta-engine \
+                  /usr/bin/tinta-mcp /usr/bin/tinta-native-host; do
+                  test -x "$binary"
+                  if ldd "$binary" | grep "not found"; then
+                    echo "unresolved libraries for $binary"
+                    exit 1
+                  fi
+                done
+              '
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinta-linux-x86_64
+          retention-days: 30
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  app-macos:
+    # The Intel image for the same capacity reason as `core-macos`. This compiles the macOS
+    # platform module, so it proves that the Mac code still builds, but only for
+    # x86_64-apple-darwin: `scripts/build.sh` ships aarch64-apple-darwin, so switch this
+    # back to macos-15/macos-latest before upstreaming.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares.
+      - name: Create placeholder sidecars
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          for name in tinta-engine tinta-mcp tinta-native-host; do
+            touch "app/src-tauri/binaries/$name-$triple"
+          done
+      - name: Clippy
+        run: cargo clippy --locked -p tinta --all-targets -- -D warnings
+
+  app-windows:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: C:\vcpkg
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but builds against OpenSSL. vcpkg provides it for MSVC, and
+      # libsqlite3-sys wants the prefix in OPENSSL_DIR. The build takes most of the job
+      # time, so keep the installed tree between runs, keyed on the port version.
+      - name: Read the vcpkg OpenSSL port version
+        id: openssl
+        shell: pwsh
+        run: |
+          $port = Get-Content C:\vcpkg\ports\openssl\vcpkg.json -Raw | ConvertFrom-Json
+          $version = @($port.version, $port.'version-string', $port.'version-semver', $port.'version-date') |
+            Where-Object { $_ } | Select-Object -First 1
+          $revision = if ($port.'port-version') { $port.'port-version' } else { 0 }
+          "key=vcpkg-openssl-$version-$revision-x64-windows" >> $env:GITHUB_OUTPUT
+      - name: Cache OpenSSL
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: ${{ steps.openssl.outputs.key }}
+      - name: Install OpenSSL
+        run: vcpkg install openssl:x64-windows
+      - name: Point SQLCipher at OpenSSL
+        shell: pwsh
+        run: echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+      # The Tauri build script copies the sidecar binaries that the bundle declares.
+      - name: Create placeholder sidecars
+        shell: pwsh
+        run: |
+          $triple = (rustc -vV | Select-String -Pattern '^host: ').Line.Split(' ')[1]
+          New-Item -ItemType Directory -Force -Path app/src-tauri/binaries | Out-Null
+          foreach ($name in @('tinta-engine', 'tinta-mcp', 'tinta-native-host')) {
+            New-Item -ItemType File -Force -Path "app/src-tauri/binaries/$name-$triple.exe" | Out-Null
+          }
+      - name: Check
+        run: cargo check --locked -p tinta --all-targets
+
+  core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but compiles against the system OpenSSL.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  core-macos:
+    # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15
+    # minutes and were cancelled twice on 2026-11-06), so this uses the Intel
+    # image. The core crate is architecture independent; move this back to
+    # macos-latest when the arm64 queue recovers.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+
+  tntc-swift-fixture:
+    # CryptoKit is macOS-only, so this job checks both directions: Swift-written
+    # chunks are decrypted by the Rust reader, and Rust-written chunks are
+    # decrypted by the engine's own Swift ChunkReader.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the Swift fixtures against ChunkStore.swift
+        run: |
+          swiftc -parse-as-library -O -o "$RUNNER_TEMP/make-tntc-fixture" \
+            engine/Sources/TintaEngine/Protocol.swift \
+            engine/Sources/TintaEngine/ChunkStore.swift \
+            engine/scripts/make-tntc-fixture.swift
+          swiftc -parse-as-library -O -o "$RUNNER_TEMP/read-tntc-fixture" \
+            engine/Sources/TintaEngine/Protocol.swift \
+            engine/Sources/TintaEngine/ChunkStore.swift \
+            engine/scripts/read-tntc-fixture.swift
+      - name: Write Swift TNTC fixture
+        run: '"$RUNNER_TEMP/make-tntc-fixture" "$RUNNER_TEMP/tntc-fixture"'
+      - name: Read the Swift fixture from Rust
+        env:
+          TINTA_TNTC_FIXTURE_DIR: ${{ runner.temp }}/tntc-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored reads_swift_cryptokit_chunks
+      - name: Write a Rust TNTC fixture
+        env:
+          TINTA_TNTC_WRITE_FIXTURE_DIR: ${{ runner.temp }}/tntc-rust-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored writes_rust_chunks
+      - name: Read the Rust fixture with Swift
+        run: '"$RUNNER_TEMP/read-tntc-fixture" "$RUNNER_TEMP/tntc-rust-fixture"'

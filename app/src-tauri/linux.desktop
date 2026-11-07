@@ -1,0 +1,19 @@
+[Desktop Entry]
+{{!-- The same template serves the .deb and the AppImage, because Tauri builds the AppImage
+     from the deb layout. It sets the freedesktop categories that Tauri's own template cannot:
+     `bundle.category` maps to a single category. `AudioVideo` is the one main category, so
+     `desktop-file-validate` gives no "multiple main categories" hint and category menus do
+     not list the app twice; `Audio` and `Recorder` refine it. --}}
+Categories=AudioVideo;Audio;Recorder;
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}}
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name={{name}}
+Terminal=false
+Type=Application
+{{#if mime_type}}
+MimeType={{mime_type}}
+{{/if}}

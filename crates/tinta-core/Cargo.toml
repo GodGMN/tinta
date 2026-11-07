@@ -4,19 +4,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The app and the helper binaries need the SQLCipher database. The Rust engine
+# only links the audio chunks, and leaving the database out keeps SQLCipher and
+# its system OpenSSL out of the engine build on Windows.
+default = ["database"]
+database = ["dep:rusqlite"]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 uuid.workspace = true
 hkdf = "0.12"
 sha2 = "0.10"
+aes-gcm = "0.10"
 hex = "0.4"
 base64 = "0.22"
 rand = "0.8"
-security-framework = "3"
 dirs = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
 tempfile = "3"

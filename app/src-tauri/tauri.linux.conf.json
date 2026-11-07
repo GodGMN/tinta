@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  // Tauri parses this file as JSON5 because `tauri-build` enables its `config-json5`
+  // feature, so these comments are allowed.
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "externalBin": ["binaries/tinta-engine", "binaries/tinta-mcp", "binaries/tinta-native-host"],
+    "shortDescription": "Meeting notes. On your Linux desktop.",
+    "longDescription": "Write your notes, get a transcript with speaker names, and keep everything on your own computer.",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libdbus-1-3",
+          // Needed by the recording engine from PR #10: libpulse-binding loads
+          // libpulse.so.0 and libpulse-simple-binding loads libpulse-simple.so.0, and
+          // both ship in libpulse0 on Debian and Ubuntu. No binary in this packaging
+          // branch needs it yet, so keep it here until #10 lands.
+          "libpulse0",
+          "libssl3 | libssl3t64",
+          "libstdc++6"
+        ],
+        // The Secret Service provider behind org.freedesktop.secrets.
+        // libkf5wallet-bin ships kwalletd5 on Debian 12 and Ubuntu 24.04.
+        // kwalletd6 is the KDE Frameworks 6 daemon and only exists from Debian 13 and
+        // Ubuntu 24.10 on, so it cannot satisfy the alternative on the two releases
+        // this package supports. kwalletmanager is the GUI, not the service.
+        "recommends": ["gnome-keyring | libkf5wallet-bin"],
+        "section": "sound",
+        "desktopTemplate": "linux.desktop"
+      }
+    }
+  }
+}

@@ -204,8 +204,21 @@ pub fn read_chunks(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<V
 /// next file is read. At the 12 h cap that is 2.8 GB per track instead of 2.8 GB
 /// plus 1.4 GB of decrypted chunks.
 pub fn read_track(meeting_dir: &Path, key: &[u8; 32], track: Track) -> Result<Vec<f32>> {
-    let mut output: Vec<f32> = Vec::new();
-    for (name, path) in chunk_names(meeting_dir, track)? {
+    let names = chunk_names(meeting_dir, track)?;
+    // Size the output once from the headers, so a 12 h track is not reallocated (and briefly
+    // doubled) while it grows. The header is unauthenticated, so the size is only a hint:
+    // it is capped, and the loop below still resizes if a chunk ends later.
+    let mut hint = 0i64;
+    for (_, path) in &names {
+        let mut header = [0u8; HEADER_LEN];
+        if fs::File::open(path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header)).is_ok() {
+            let start = i64::from_le_bytes(header[4..12].try_into().unwrap());
+            let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as i64;
+            hint = hint.max(start.saturating_add(count));
+        }
+    }
+    let mut output: Vec<f32> = Vec::with_capacity(hint.clamp(0, MAX_TRACK_SAMPLES) as usize);
+    for (name, path) in names {
         let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let chunk = open_chunk(&name, &bytes, key)?;
         // The header is not authenticated: a corrupted start must not allocate gigabytes.

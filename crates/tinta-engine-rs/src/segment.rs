@@ -150,10 +150,20 @@ pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, u
         }
         pieces.extend(split_to_cap(audio, start, end));
     }
-    assert!(
-        covers_speech(&pieces, segments),
-        "the decode pieces leave a VAD speech region uncovered"
-    );
+    // Grouping covers every region today; if a later change breaks that, decode the
+    // uncovered regions as extra pieces instead of losing speech or the whole pass.
+    if !covers_speech(&pieces, segments) {
+        let uncovered: Vec<(usize, usize)> = segments
+            .iter()
+            .copied()
+            .filter(|&seg| !covers_speech(&pieces, &[seg]))
+            .collect();
+        eprintln!("[tinta-engine] {} VAD regions were not grouped; decoding them separately", uncovered.len());
+        for (start, end) in uncovered {
+            pieces.extend(split_to_cap(audio, start, end.min(audio.len())));
+        }
+        pieces.sort_unstable();
+    }
     pieces
 }
 

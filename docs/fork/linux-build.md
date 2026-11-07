@@ -55,9 +55,11 @@ following chmod) and the socket with mode 0600. It then checks, with `lstat`, th
 folder is a real folder (not a symbolic link), belongs to this user and still has mode
 0700; anything else stops the app with a clear error. When `XDG_RUNTIME_DIR` is unset or
 relative, the app and both helpers use `/run/user/<uid>/tinta` when that folder exists and
-belongs to the user, and otherwise the data folder as on macOS (which the app then creates
-with mode 0700 and checks the same way). `TINTA_DATA_DIR` (used by tests and the self-test)
-always keeps the socket in that data folder. All three processes call the one
+belongs to the user, and otherwise a private `run` subfolder of the data folder
+(`~/.local/share/Tinta/run`, created with mode 0700 and checked the same way; the data
+folder itself stays 0755 for the library). An `XDG_RUNTIME_DIR` that does not belong to
+this user is ignored. `TINTA_DATA_DIR` (used by tests and the self-test) keeps the socket in
+`<TINTA_DATA_DIR>/run`. All three processes call the one
 `tinta_core::paths::socket_path()`, so a helper started without `XDG_RUNTIME_DIR` (ssh,
 cron, a system unit) still finds the socket that the desktop app listens on. macOS keeps
 its existing path.

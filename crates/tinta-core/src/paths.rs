@@ -100,6 +100,11 @@ pub fn socket_dir() -> PathBuf {
             return dir;
         }
     }
+    // The data folder itself is created 0755 for the library, so on Linux the socket gets a
+    // private subfolder there instead of requiring the whole data folder to be 0700.
+    #[cfg(target_os = "linux")]
+    return base_dir().join("run");
+    #[cfg(not(target_os = "linux"))]
     base_dir()
 }
 
@@ -112,7 +117,9 @@ fn runtime_socket_dir(
     uid: u32,
     owned_by: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    if let Some(dir) = runtime.filter(|dir| dir.is_absolute()) {
+    // The runtime folder must belong to this user too: the socket folder inside it could
+    // otherwise be swapped between the check and bind by whoever can write the parent.
+    if let Some(dir) = runtime.filter(|dir| dir.is_absolute() && owned_by(dir)) {
         return Some(dir.join("tinta"));
     }
     let session = PathBuf::from(format!("/run/user/{uid}"));
@@ -227,8 +234,30 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn socket_folder_lives_under_the_session_runtime_dir() {
-        let dir = runtime_socket_dir(Some(Path::new("/run/user/1000")), 1000, |_| false);
+        let dir = runtime_socket_dir(Some(Path::new("/run/user/1000")), 1000, |_| true);
         assert_eq!(dir, Some(PathBuf::from("/run/user/1000/tinta")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_dir_owned_by_someone_else_is_not_used() {
+        let dir = runtime_socket_dir(Some(Path::new("/tmp/shared")), 1000, |dir| {
+            dir == Path::new("/run/user/1000")
+        });
+        assert_eq!(dir, Some(PathBuf::from("/run/user/1000/tinta")));
+        assert_eq!(runtime_socket_dir(Some(Path::new("/tmp/shared")), 1000, |_| false), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_fallback_socket_folder_is_private_inside_a_0755_data_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The data folder stays 0755 for the library; the socket folder inside it is 0700.
+        prepare_private_dir(&data.path().join("run")).unwrap();
+        let mode = std::fs::metadata(data.path().join("run")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[cfg(target_os = "linux")]

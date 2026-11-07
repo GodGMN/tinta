@@ -126,8 +126,15 @@ pub fn open_url(url: &str) -> Result<()> {
 
 /// Opens a folder or a file with its default handler.
 pub fn open_path(path: &Path) -> Result<()> {
-    opener().arg(path).spawn()?;
+    reap(opener().arg(path).spawn()?);
     Ok(())
+}
+
+/// Waits for a launcher in the background so it does not stay a zombie until the app exits.
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Shows a file or a folder in the file manager. A folder opens itself, which is how "Show
@@ -137,13 +144,13 @@ pub fn reveal(path: &Path) -> Result<()> {
     {
         // Explorer selects the item with `/select,`.
         let argument = format!("/select,{}", path.display());
-        Command::new("explorer").arg(argument).spawn()?;
+        reap(Command::new("explorer").arg(argument).spawn()?);
     }
     #[cfg(not(target_os = "windows"))]
     {
         // The file managers of Linux do not select the item, so show the folder that holds it.
         let folder = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        Command::new("xdg-open").arg(folder).spawn()?;
+        reap(Command::new("xdg-open").arg(folder).spawn()?);
     }
     Ok(())
 }

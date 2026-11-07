@@ -1,10 +1,13 @@
 //! Model loading and the two final-pass stages: VAD segmentation + ASR, and
 //! speaker diarization.
 //!
-//! Models load on demand and live only for the duration of one `finalize`: the
+//! Models load on demand and live only as long as a pass uses them: the
 //! recognizer, the VAD and the diarizer are dropped at the end of the pass. A
 //! global lock serializes model use, so two final passes never load the 652 MB
-//! recognizer twice; `Speech` in the Swift engine is an actor for the same reason.
+//! recognizer twice. The recognizer itself is shared through a weak cache, so a
+//! live draft pass and a final pass alive at the same time (the previous
+//! meeting finalizing while the next one records) hold one copy, not two; the
+//! release happens when the last pass that uses it ends.
 //!
 //! Diarization is the task #18 recipe: the sherpa-onnx pipeline over-clusters
 //! the segments at a cosine-dissimilarity threshold of 0.7, the segments are
@@ -28,7 +31,7 @@ use sherpa_onnx::{
     VadModelConfig, VoiceActivityDetector,
 };
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 use crate::audio::SAMPLE_RATE;
 use crate::clustering::{recluster, Options as ClusterOptions, Unit};
@@ -126,7 +129,10 @@ pub struct SpeechPass {
     root: PathBuf,
     threads: Threads,
     settings: Settings,
-    recognizer: Option<OfflineRecognizer>,
+    /// Kept for the life of the pass: dropping it after every utterance would
+    /// free and reload the 652 MB recognizer. It may be the same instance as
+    /// another pass's, through [`RECOGNIZER`].
+    recognizer: Option<Arc<OfflineRecognizer>>,
     notes: Vec<String>,
 }
 
@@ -176,42 +182,65 @@ impl SpeechPass {
         Ok(())
     }
 
-    fn recognizer(&mut self) -> Result<&OfflineRecognizer> {
-        if self.recognizer.is_none() {
-            self.check_installed()?;
-            let group = self.group("transcription")?;
-            let (encoder, decoder, joiner, tokens) = (
-                self.path(group, "encoder")?,
-                self.path(group, "decoder")?,
-                self.path(group, "joiner")?,
-                self.path(group, "tokens")?,
-            );
-            let provider = self.provider()?;
-            let config = OfflineRecognizerConfig {
-                model_config: sherpa_onnx::OfflineModelConfig {
-                    transducer: OfflineTransducerModelConfig {
-                        encoder: Some(encoder),
-                        decoder: Some(decoder),
-                        joiner: Some(joiner),
-                    },
-                    tokens: Some(tokens),
-                    model_type: Some("nemo_transducer".to_string()),
-                    provider: Some(provider),
-                    num_threads: self.threads.asr as i32,
-                    debug: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            self.recognizer = Some(
-                OfflineRecognizer::create(&config)
-                    .context("the transcription model did not load. Install the models again.")?,
-            );
+    /// The recognizer, loaded once per models directory and provider.
+    ///
+    /// A live draft pass and a final pass can be alive at the same time (the
+    /// previous meeting finalizes while the next one records). Both get the same
+    /// instance from the weak cache, so the 652 MB Parakeet loads once. The
+    /// cache holds a `Weak`, so when the last pass drops its `Arc` the models
+    /// are released instead of staying in RSS for the life of the engine.
+    ///
+    /// Callers hold [`MODEL_LOCK`], so only one thread creates or decodes at a
+    /// time. The thread count is whatever the first loader asked for; the live
+    /// pass asks for at most two, so a final pass that reuses its instance runs
+    /// at two threads. That is slower than the final pass's own budget but
+    /// never loads a second copy.
+    fn recognizer(&mut self) -> Result<Arc<OfflineRecognizer>> {
+        if let Some(recognizer) = &self.recognizer {
+            return Ok(recognizer.clone());
         }
-        Ok(self.recognizer.as_ref().expect("loaded above"))
+        self.check_installed()?;
+        let key = RecognizerKey {
+            root: self.root.clone(),
+            provider: self.provider()?,
+        };
+        if let Some(recognizer) = cached_recognizer(&key) {
+            self.recognizer = Some(recognizer.clone());
+            return Ok(recognizer);
+        }
+        let group = self.group("transcription")?;
+        let (encoder, decoder, joiner, tokens) = (
+            self.path(group, "encoder")?,
+            self.path(group, "decoder")?,
+            self.path(group, "joiner")?,
+            self.path(group, "tokens")?,
+        );
+        let config = OfflineRecognizerConfig {
+            model_config: sherpa_onnx::OfflineModelConfig {
+                transducer: OfflineTransducerModelConfig {
+                    encoder: Some(encoder),
+                    decoder: Some(decoder),
+                    joiner: Some(joiner),
+                },
+                tokens: Some(tokens),
+                model_type: Some("nemo_transducer".to_string()),
+                provider: Some(key.provider.clone()),
+                num_threads: self.threads.asr as i32,
+                debug: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let recognizer = Arc::new(
+            OfflineRecognizer::create(&config)
+                .context("the transcription model did not load. Install the models again.")?,
+        );
+        cache_recognizer(&key, &recognizer);
+        self.recognizer = Some(recognizer.clone());
+        Ok(recognizer)
     }
 
-    fn vad(&self) -> Result<VoiceActivityDetector> {
+    pub(crate) fn vad(&self) -> Result<VoiceActivityDetector> {
         self.check_installed()?;
         let group = self.group("vad")?;
         let model = self.path(group, "vad")?;
@@ -305,7 +334,8 @@ impl SpeechPass {
         Ok(out)
     }
 
-    fn decode(&mut self, samples: &[f32], offset: f64) -> Result<Vec<Word>> {
+    /// Decodes one finished speech segment at `offset` seconds.
+    pub(crate) fn decode(&mut self, samples: &[f32], offset: f64) -> Result<Vec<Word>> {
         ensure_recognizer_window(samples.len())?;
         let recognizer = self.recognizer()?;
         let stream = recognizer.create_stream();
@@ -774,9 +804,51 @@ pub fn vad_config(
     }
 }
 
-/// Serializes model work across final passes. The 652 MB recognizer is loaded
-/// once per pass; two passes run one after the other so they cannot both hold it.
+/// Serializes model work across final passes. The recognizer is shared through
+/// [`RECOGNIZER`], so a live pass and a final pass alive at the same time hold
+/// one copy; the lock also means only one of them decodes at a time.
 static MODEL_LOCK: Mutex<()> = Mutex::new(());
+
+/// The recognizer currently loaded, shared by every pass that needs it.
+///
+/// The entry is keyed by the models directory and the ONNX provider, not by the
+/// thread count: a second copy would double the 652 MB for a cosmetic
+/// difference. The weak reference means the models are released when the last
+/// pass using them ends.
+static RECOGNIZER: Mutex<Option<CachedRecognizer>> = Mutex::new(None);
+
+#[derive(Clone, PartialEq, Eq)]
+struct RecognizerKey {
+    root: PathBuf,
+    provider: String,
+}
+
+struct CachedRecognizer {
+    key: RecognizerKey,
+    recognizer: Weak<OfflineRecognizer>,
+}
+
+fn cached_recognizer(key: &RecognizerKey) -> Option<Arc<OfflineRecognizer>> {
+    let cache = RECOGNIZER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = cache.as_ref()?;
+    if &entry.key != key {
+        return None;
+    }
+    entry.recognizer.upgrade()
+}
+
+fn cache_recognizer(key: &RecognizerKey, recognizer: &Arc<OfflineRecognizer>) {
+    let mut cache = RECOGNIZER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = Some(CachedRecognizer {
+        key: key.clone(),
+        recognizer: Arc::downgrade(recognizer),
+    });
+}
+
 /// Runs `work` while holding the model lock.
 ///
 /// A panic inside `work` unwinds through the guard and poisons the mutex. The
@@ -789,6 +861,25 @@ pub fn with_models<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     work()
+}
+
+/// Runs `work` while holding the model lock, or returns `Ok(None)` at once when
+/// another pass holds it.
+///
+/// The live draft worker uses this: during the final pass of the previous
+/// meeting the lock is held for minutes, and the live worker must not queue a
+/// single utterance behind it. One `try_lock` either takes the models or skips
+/// that utterance (the final pass transcribes it anyway); the VAD keeps
+/// feeding, and the skipped span is a zero gap on the meeting clock.
+pub fn try_with_models<T>(work: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    match MODEL_LOCK.try_lock() {
+        Ok(_guard) => work().map(Some),
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let _guard = poisoned.into_inner();
+            work().map(Some)
+        }
+        Err(TryLockError::WouldBlock) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -852,6 +943,40 @@ mod tests {
         assert!(panicked.is_err());
         // The next pass still takes the lock and runs.
         assert_eq!(with_models(|| Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn the_live_pass_gives_up_instead_of_waiting_on_a_final_pass() {
+        // Another thread holds the lock, as a final pass does for minutes.
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            // Another test may have poisoned the lock with a deliberate panic.
+            let _guard = MODEL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ready.send(()).unwrap();
+            let _ = held.recv();
+        });
+        waiting.recv().unwrap();
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let result = try_with_models(|| -> Result<()> {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(matches!(result, Ok(None)), "the live pass gave up");
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        // It skipped at once instead of polling the lock.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "the skip took {:?}",
+            started.elapsed()
+        );
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        // With the lock free the same call runs.
+        assert_eq!(try_with_models(|| Ok(5)).unwrap(), Some(5));
     }
 
     #[test]

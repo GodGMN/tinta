@@ -1,13 +1,15 @@
 //! The engine command loop.
 //!
 //! Commands are handled one at a time on the stdin reader thread, except
-//! `install_models`, `import_audio` and `finalize`: those run on worker threads
-//! and reply when they finish, so `ping`, `models_status`, `calendar`, `sample`
-//! and the other quick commands keep answering during a 487 MB install or a long
-//! final pass. A second install is rejected while one is in flight. Commands
-//! whose features are not implemented yet fail with an `unsupported` error, and
-//! macOS-only commands return the degraded replies from `docs/engine-protocol.md`
-//! so the app does not show errors or retry loops.
+//! `start`, `install_models`, `import_audio` and `finalize`: those run on worker
+//! threads and reply when they finish, so `ping`, `models_status`, `calendar`,
+//! `sample` and the other quick commands keep answering while a capture device
+//! opens, during a 487 MB install or during a long final pass. A second start is
+//! rejected while one is in flight. macOS-only commands return the degraded
+//! replies from `docs/engine-protocol.md` so the app does not show errors or
+//! retry loops.
+
+use crate::recording::{LiveConfig, RecordingSession, StartOptions};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -17,7 +19,7 @@ use serde_json::{json, Map, Value};
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::install;
 use crate::manifest::Manifest;
@@ -38,10 +40,26 @@ pub struct Capabilities {
     pub summaries: bool,
     pub echo_cancellation: bool,
     pub import_audio: bool,
+    pub live_transcription: bool,
 }
 
-/// Commands that belong to the protocol but whose feature is not built yet.
-const UNIMPLEMENTED: &[&str] = &["start", "pause", "resume", "mic_muted", "stop"];
+/// A command that arrived while `start` was still opening its devices. Swift's
+/// `start` blocked the command loop, so a mute or pause clicked right after
+/// Record was applied when capture began; these are replayed in order once the
+/// session is active, with their original wall-clock time for a mute.
+enum PendingCommand {
+    Pause,
+    Resume,
+    MicMuted(bool, i64),
+}
+
+/// The recording session and, while a `start` is opening its devices, the fact
+/// that one is on its way. Guarded so `stop` and the start worker cannot race.
+enum SessionState {
+    Idle,
+    Starting(Vec<PendingCommand>),
+    Active(RecordingSession),
+}
 
 pub struct Engine {
     out: Output,
@@ -49,6 +67,7 @@ pub struct Engine {
     models_root: PathBuf,
     threads: Threads,
     installing: Arc<AtomicBool>,
+    session: Arc<Mutex<SessionState>>,
 }
 
 impl Engine {
@@ -59,7 +78,14 @@ impl Engine {
             models_root,
             threads,
             installing: Arc::new(AtomicBool::new(false)),
+            session: Arc::new(Mutex::new(SessionState::Idle)),
         }
+    }
+
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Emits `ready` and answers lines until stdin ends or a `shutdown` request
@@ -70,12 +96,21 @@ impl Engine {
             json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "capabilities": Capabilities {
+                    capture_system_audio: cfg!(target_os = "linux"),
                     import_audio: true,
+                    live_transcription: cfg!(target_os = "linux"),
                     ..Default::default()
                 },
             }),
         )?;
+        let result = self.read_commands(&mut input);
+        // Stdin EOF and I/O errors still flush the recording, like Swift's
+        // shutdown path.
+        let _ = self.stop_session();
+        result
+    }
 
+    fn read_commands<R: BufRead>(&mut self, input: &mut R) -> io::Result<()> {
         let mut line = String::new();
         loop {
             line.clear();
@@ -98,6 +133,7 @@ impl Engine {
         };
 
         if request.cmd == "shutdown" {
+            let _ = self.stop_session();
             self.out.reply(&request.id, json!({}))?;
             log("shutdown requested");
             return Ok(true);
@@ -115,6 +151,14 @@ impl Engine {
 
         if request.cmd == "import_audio" {
             self.start_import(&request)?;
+            return Ok(false);
+        }
+
+        // Opening a capture stream waits on the server, so `start` runs on a
+        // worker thread: `ping` and `models_status` keep answering while the
+        // devices open, and the reply still waits for the streams, like Swift.
+        if request.cmd == "start" {
+            self.start_session(&request)?;
             return Ok(false);
         }
 
@@ -164,6 +208,49 @@ impl Engine {
             })),
             "call_report" => bail!("Call reading is not available on this platform."),
             "summarize" => bail!("Summaries are not available on this platform."),
+            "start" => {
+                // `handle_line` runs `start` on its own worker before reaching
+                // the command dispatch, so this arm is never the real path.
+                unreachable!("start is handled before the command dispatch");
+            }
+            "pause" => {
+                let mut state = self.lock_session();
+                match &mut *state {
+                    SessionState::Active(session) => session.pause(),
+                    SessionState::Starting(pending) => pending.push(PendingCommand::Pause),
+                    SessionState::Idle => {}
+                }
+                Ok(json!({}))
+            }
+            "resume" => {
+                let mut state = self.lock_session();
+                match &mut *state {
+                    SessionState::Active(session) => session.resume(),
+                    SessionState::Starting(pending) => pending.push(PendingCommand::Resume),
+                    SessionState::Idle => {}
+                }
+                Ok(json!({}))
+            }
+            "mic_muted" => {
+                let muted = params
+                    .get("muted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let t = param_i64(params, "t").unwrap_or_else(crate::recording::now_wall_ms);
+                let mut state = self.lock_session();
+                match &mut *state {
+                    SessionState::Active(session) => session.set_mic_muted(muted, t),
+                    SessionState::Starting(pending) => {
+                        pending.push(PendingCommand::MicMuted(muted, t));
+                    }
+                    SessionState::Idle => {}
+                }
+                Ok(json!({}))
+            }
+            "stop" => match self.stop_session() {
+                Some(message) => bail!(message),
+                None => Ok(json!({})),
+            },
             "sample" => {
                 let dir = param_string(params, "dir")?;
                 let track = match param_string(params, "track")?.as_str() {
@@ -176,11 +263,127 @@ impl Engine {
                 let key = audio_key(params)?;
                 crate::sample::sample(Path::new(&dir), &key, track, start, end)
             }
-            other if UNIMPLEMENTED.contains(&other) => {
-                bail!("unsupported command: {other}")
-            }
             other => bail!("unknown command {other}"),
         }
+    }
+
+    /// Stops and drops the active recording, if any. A `start` whose devices
+    /// are still opening sees `Idle` when it finishes and stops itself.
+    ///
+    /// Returns the message a wedged audio server produced (see
+    /// [`RecordingSession::stop`]), so the `stop` command can answer with an
+    /// error instead of hanging.
+    fn stop_session(&mut self) -> Option<String> {
+        let session = {
+            let mut state = self.lock_session();
+            match std::mem::replace(&mut *state, SessionState::Idle) {
+                SessionState::Active(session) => Some(session),
+                _ => None,
+            }
+        };
+        if let Some(mut session) = session {
+            return session.stop();
+        }
+        None
+    }
+
+    /// Validates the parameters synchronously, then opens both capture streams
+    /// on a worker thread. The reply is written once the devices are open; other
+    /// commands, `ping` and `models_status` included, keep being answered.
+    fn start_session(&mut self, request: &Request) -> io::Result<()> {
+        let params = &request.params;
+        let directory = match param_string(params, "dir") {
+            Ok(directory) => PathBuf::from(directory),
+            Err(error) => return self.out.fail(&request.id, &error.to_string()),
+        };
+        let key = match audio_key(params) {
+            Ok(key) => key,
+            Err(error) => return self.out.fail(&request.id, &error.to_string()),
+        };
+        let source = params
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+            .unwrap_or("all")
+            .to_string();
+        let mic_muted = params
+            .get("mic_muted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // The parameter checks are cheap and run before the session guard, so a
+        // malformed start never changes the session state.
+        let mut state = self.lock_session();
+        if !matches!(*state, SessionState::Idle) {
+            drop(state);
+            return self.out.fail(&request.id, "a recording is already active");
+        }
+        *state = SessionState::Starting(Vec::new());
+        drop(state);
+
+        let out = self.out.clone();
+        let id = request.id.clone();
+        let sessions = self.session.clone();
+        let manifest = self.manifest.clone();
+        let root = self.models_root.clone();
+        let threads = self.threads;
+        std::thread::spawn(move || {
+            let live = live_config(&manifest, &root, threads);
+            let result = catching("the recording start stopped unexpectedly", || {
+                RecordingSession::start(
+                    StartOptions {
+                        directory,
+                        key,
+                        source,
+                        mic_muted,
+                    },
+                    out.clone(),
+                    live,
+                )
+            });
+            let mut state = sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match result {
+                Ok(session) => {
+                    let pending = match std::mem::replace(&mut *state, SessionState::Idle) {
+                        SessionState::Starting(pending) => pending,
+                        _ => {
+                            // `stop` arrived while the devices were opening.
+                            // Dropping the session stops what was capturing.
+                            drop(state);
+                            drop(session);
+                            let _ = out.fail(&id, "the recording was stopped before it started");
+                            return;
+                        }
+                    };
+                    *state = SessionState::Active(session);
+                    let SessionState::Active(session) = &*state else {
+                        unreachable!("the state was just set");
+                    };
+                    let start_wall_ms = session.start_wall_ms();
+                    // Replay the mute, pause and resume commands that arrived
+                    // while the devices were opening, in their original order.
+                    for command in pending {
+                        match command {
+                            PendingCommand::Pause => session.pause(),
+                            PendingCommand::Resume => session.resume(),
+                            PendingCommand::MicMuted(muted, t) => {
+                                session.set_mic_muted(muted, t);
+                            }
+                        }
+                    }
+                    drop(state);
+                    let _ = out.reply(&id, json!({ "start_wall_ms": start_wall_ms }));
+                }
+                Err(error) => {
+                    *state = SessionState::Idle;
+                    drop(state);
+                    let _ = out.fail(&id, &error.to_string());
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Runs one final pass on a worker thread. Two passes may overlap; the speech
@@ -252,6 +455,22 @@ impl Engine {
     }
 }
 
+/// Live drafts need the installed models. `TINTA_ENGINE_LIVE=0` turns them off
+/// for a machine that should spend nothing on them.
+fn live_config(manifest: &Manifest, root: &Path, threads: Threads) -> Option<LiveConfig> {
+    if std::env::var_os("TINTA_ENGINE_LIVE").is_some_and(|value| value == "0") {
+        return None;
+    }
+    if !manifest.all_files_exist(root) {
+        return None;
+    }
+    Some(LiveConfig {
+        manifest: manifest.clone(),
+        models_root: root.to_path_buf(),
+        threads,
+    })
+}
+
 /// Reads a required, non-empty string parameter. The message matches Swift's
 /// `params.string`.
 fn param_string(params: &Map<String, Value>, key: &str) -> Result<String> {
@@ -275,6 +494,15 @@ fn param_usize(params: &Map<String, Value>, key: &str) -> Option<usize> {
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .map(|value| value as usize)
+}
+
+/// An optional integer; Swift accepts both an integer and a float here.
+fn param_i64(params: &Map<String, Value>, key: &str) -> Option<i64> {
+    params.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|value| value as i64))
+    })
 }
 
 /// Decodes `audio_key`, a base64 string of exactly 32 bytes. Anything else is
@@ -402,12 +630,20 @@ mod tests {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["version"], env!("CARGO_PKG_VERSION"));
         let capabilities = ready["capabilities"].as_object().unwrap();
-        assert_eq!(capabilities.len(), 8);
+        assert_eq!(capabilities.len(), 9);
         assert_eq!(capabilities["import_audio"], true);
-        for (name, value) in capabilities {
-            if name != "import_audio" {
-                assert_eq!(value, &Value::Bool(false), "{name}");
-            }
+        assert_eq!(capabilities["capture_app_audio"], false);
+        assert_eq!(capabilities["echo_cancellation"], false);
+        assert_eq!(
+            capabilities["capture_system_audio"],
+            Value::Bool(cfg!(target_os = "linux"))
+        );
+        assert_eq!(
+            capabilities["live_transcription"],
+            Value::Bool(cfg!(target_os = "linux"))
+        );
+        for name in ["calls_detection", "call_reader", "calendar", "summaries"] {
+            assert_eq!(capabilities[name], false, "{name}");
         }
     }
 
@@ -470,6 +706,42 @@ mod tests {
     }
 
     #[test]
+    fn commands_sent_while_start_is_opening_are_queued_in_order() {
+        let mut harness = harness();
+        *harness
+            .engine
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = SessionState::Starting(Vec::new());
+        for line in [
+            "{\"id\":1,\"cmd\":\"mic_muted\",\"params\":{\"muted\":true,\"t\":1700000000000}}",
+            "{\"id\":2,\"cmd\":\"pause\"}",
+            "{\"id\":3,\"cmd\":\"resume\"}",
+        ] {
+            assert!(!harness.engine.handle_line(line).unwrap());
+        }
+        // Every command was acknowledged while the devices were opening.
+        let lines = harness.sink.lines();
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line["ok"] == true));
+        let state = harness
+            .engine
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let SessionState::Starting(pending) = &*state else {
+            panic!("the session left the starting state");
+        };
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(
+            pending[0],
+            PendingCommand::MicMuted(true, 1_700_000_000_000)
+        ));
+        assert!(matches!(pending[1], PendingCommand::Pause));
+        assert!(matches!(pending[2], PendingCommand::Resume));
+    }
+
+    #[test]
     fn unknown_command_fails() {
         let lines = run("{\"id\":3,\"cmd\":\"nonsense\"}");
         assert_eq!(lines[1]["id"], 3);
@@ -481,13 +753,35 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_command_says_unsupported() {
+    fn start_checks_its_parameters_before_opening_a_stream() {
         let lines = run("{\"id\":4,\"cmd\":\"start\",\"params\":{}}");
         assert_eq!(lines[1]["ok"], false);
-        assert!(lines[1]["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported command: start"));
+        assert_eq!(lines[1]["error"], "missing parameter: dir");
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = line(
+            1,
+            "start",
+            json!({
+                "dir": dir.path().display().to_string(),
+                "audio_key": "AAAA",
+            }),
+        );
+        let lines = run(&input);
+        assert_eq!(lines[1]["ok"], false);
+        assert_eq!(lines[1]["error"], "invalid audio key");
+    }
+
+    #[test]
+    fn recording_commands_are_noops_without_a_session() {
+        let lines = run("{\"id\":1,\"cmd\":\"pause\"}\n\
+             {\"id\":2,\"cmd\":\"resume\"}\n\
+             {\"id\":3,\"cmd\":\"mic_muted\",\"params\":{\"muted\":true}}\n\
+             {\"id\":4,\"cmd\":\"stop\"}");
+        for line in &lines[1..] {
+            assert_eq!(line["ok"], true);
+            assert_eq!(line["result"], json!({}));
+        }
     }
 
     #[test]

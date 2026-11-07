@@ -48,7 +48,27 @@ The script resets the branch to `origin/main` and merges each branch with
 
 It prints the head of every merged branch and refuses to finish unless each one
 is an ancestor of the result. The only ref it pushes is `integration/linux`, and
-only with `--force-with-lease`.
+only with `--force-with-lease`. Every fresh run force-updates all
+remote-tracking refs (`+refs/heads/*:refs/remotes/origin/*`), so a rewritten
+port branch is never merged from a stale ref.
+
+### Merged heads (2026-11-07)
+
+| Branch | Head |
+| --- | --- |
+| `feat/3/core-linux` | `11aad879b6e61310b0dd7f15223db781d7335481` |
+| `docs/4/engine-protocol` | `76f0892d5d621222a8fe35ef3d2502517777f621` |
+| `feat/8/tntc-rust` | `2cd957a4249807f8c0f60e4d4ccbe82f0906874a` |
+| `feat/10/linux-keys` | `9db2b0802ba59fa0d215263c37514eb72ef48e7b` |
+| `feat/5/app-linux` | `5dfcd0b8f715373ecc70a12570f159cd913943c5` |
+| `feat/6/capabilities` | `e87e26dfc5e0b71d231d98df70fb3dfab650fc12` |
+| `feat/13/linux-helpers` | `5e79a2ae1168549b0294b1d05f60ed0d6805d0b5` |
+| `feat/7/engine-skeleton` | `f58425f377948648c484e500f3712765da2edf39` |
+| `feat/9/engine-finalize` | `252b01e4375c8c7e77fd29c8c13ff30490001bdc` |
+| `feat/20/recluster` | `910e946477038f1ea02ad93952220c64c4dab888` |
+| `feat/21/segmentation` | `575685074893faeaf48feffe0899674d1e7a82bf` |
+| `feat/11/linux-recording` | `65c89cf758047d8676ca93755670726002c96c75` |
+| `feat/12/linux-packaging` | `8196bdc8cd3818a879e80b8417cba1b6624e424b` |
 
 The branch also has integration-only commits (the AppImage helper fix, the
 smoke test, the keyring test). They carry an `Integration-only: true` trailer.
@@ -97,10 +117,13 @@ These need judgement and are resolved by hand:
   engine builds `tinta-core` without SQLCipher). Keep those attributes and
   `pub mod capabilities;`, plus `pub mod chunks;` and the Linux `peer` module.
 - **`feat/11`: `crates/tinta-engine-rs/src/speech.rs`** — #10 changes the pass
-  to keep a shared `Arc<OfflineRecognizer>` and makes `decode` `pub(crate)` for
-  the live draft; #15 adds the `notes` field for the 4-hour diarization cap.
-  Keep the `Arc` recognizer, the `notes` field and the #15 embedding helpers,
-  with the `pub(crate) fn decode` signature from #10.
+  to keep a shared `Arc<OfflineRecognizer>` (weak `RECOGNIZER` cache) and makes
+  `decode` `pub(crate)` for the live draft; #15 adds the `notes` field for the
+  4-hour diarization cap; #16 adds the `settings` field, the embedding helpers
+  (`embedding_extractor`, `unit_embeddings`), the public `vad_config` and the
+  hole re-decode. Keep all three: the `Arc` recognizer, `notes` and `settings`
+  fields, the #15/#16 helpers, one `MODEL_LOCK`, the `RECOGNIZER` cache, and
+  the `pub(crate) fn decode` signature from #10.
 - **`feat/12`: `docs/fork/linux-build.md`** — the packaging branch rewrites the
   document for the whole port. Keep its bundle and AppImage sections, and keep
   the key-store, socket, peer-check and engine sections resolved above.

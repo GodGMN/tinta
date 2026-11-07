@@ -21,6 +21,9 @@ tauri = { version = "2" }
 tauri-plugin-dialog = "2"
 base64 = "0.22"
 
+[dev-dependencies]
+tempfile = "3"
+
 # The macOS-only app code, and the private API that makes the recording bubble transparent.
 # `tauri-build` compares the features of the base `tauri` dependency with the merged config's
 # `macOSPrivateApi`, so the feature lives here and the flag stays out of every config file.

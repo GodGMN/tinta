@@ -25,8 +25,11 @@ security-framework = "3"
 
 # Secret Service over dbus, without a tokio runtime. Vendoring dbus avoids a libdbus-dev
 # build dependency; crypto-rust avoids OpenSSL for the DH key exchange.
+# The peer check reads the user ID and the executable of the process at the other end of
+# the app socket.
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["windows-native"] }

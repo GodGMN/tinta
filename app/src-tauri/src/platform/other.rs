@@ -1,13 +1,19 @@
-//! Stand-ins for the macOS integration on Windows and Linux.
+//! Stand-ins for the macOS integration on Windows, and the shared Linux items.
 //!
 //! Each item either does nothing, because the macOS feature has no counterpart here, or
-//! refuses with a clear error, so a caller never believes that it worked. Keep the items in
+//! refuses with a clear error, so a caller never believes that it worked. The Linux-specific
+//! parts live in `platform/linux.rs`; this file re-exports them on Linux. Keep the items in
 //! step with `platform/macos.rs`.
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+
+#[cfg(target_os = "linux")]
+pub use super::linux::{
+    authenticate, browsers, default_browser, install_native_host, remove_old_native_host,
+};
 
 /// The value of the `call_browser` setting that selects the default browser.
 pub const DEFAULT_BROWSER: &str = "default";
@@ -51,40 +57,60 @@ pub fn helper_path(name: &str) -> PathBuf {
 }
 
 /// Chrome starts the Meet extension host from a manifest that differs on each platform.
-/// Windows and Linux registration comes with the rest of the port, so the app runs without
-/// the extension until then.
+/// Windows registration comes with the rest of the port, so the app runs without the extension
+/// until then.
+#[cfg(not(target_os = "linux"))]
 pub fn install_native_host() -> Result<PathBuf> {
     Ok(PathBuf::new())
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn remove_old_native_host() {}
 
 /// The platform peer check is not implemented yet. The Windows build has no app socket, and
-/// the Linux one rejects every connection until the check exists: fail closed.
+/// the check there rejects every connection until the named pipes exist: fail closed.
+#[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-pub fn peer_path(_fd: i32) -> Option<PathBuf> {
+pub fn authenticate(_fd: i32) -> Option<PathBuf> {
     None
 }
 
-/// Rejects every peer: helper authentication is not implemented on this platform yet.
-#[allow(dead_code)]
-pub fn trusted_peer(_path: &Path) -> bool {
-    false
-}
-
 /// The system default browser, when the platform names one.
+#[cfg(not(target_os = "linux"))]
 pub fn default_browser() -> Option<Browser> {
     None
 }
 
-/// The browsers that the user can select are a macOS list for now.
+/// The browsers that the user can select on Windows.
+#[cfg(not(target_os = "linux"))]
 pub fn browsers() -> Vec<Browser> {
     Vec::new()
 }
 
-/// Opens a call link in the default handler and records all system audio: the app cannot pick
-/// a browser without the macOS browser list, and the browser processes play the call audio.
-pub fn open_call(link: &tinta_core::calendar::Link, _browser: &str) -> String {
+/// Starts `command` with `arg` and reaps the launcher in the background. Chrome hands the
+/// request to the running browser and exits, so an unreaped child would stay a zombie until
+/// the app exits.
+#[cfg(target_os = "linux")]
+fn spawn_detached(command: &str, arg: &str) -> std::io::Result<()> {
+    let mut child = Command::new(command).arg(arg).spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Opens a call link in the selected browser and returns the recording source for the call.
+/// The macOS browser list names bundle IDs; the Linux one names executables. A browser that is
+/// not installed now, and the default browser, give the handler of the system.
+pub fn open_call(link: &tinta_core::calendar::Link, browser: &str) -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(command) = super::linux::browser_command(browser) {
+        if spawn_detached(command, &link.url).is_ok() {
+            return "all".to_string();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = browser;
     let _ = open_url(&link.url);
     "all".to_string()
 }
@@ -100,23 +126,31 @@ pub fn open_url(url: &str) -> Result<()> {
 
 /// Opens a folder or a file with its default handler.
 pub fn open_path(path: &Path) -> Result<()> {
-    opener().arg(path).spawn()?;
+    reap(opener().arg(path).spawn()?);
     Ok(())
 }
 
-/// Shows a file or a folder in the file manager.
+/// Waits for a launcher in the background so it does not stay a zombie until the app exits.
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+/// Shows a file or a folder in the file manager. A folder opens itself, which is how "Show
+/// extension folder" opens the folder that Chrome loads.
 pub fn reveal(path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // Explorer selects the item with `/select,`.
         let argument = format!("/select,{}", path.display());
-        Command::new("explorer").arg(argument).spawn()?;
+        reap(Command::new("explorer").arg(argument).spawn()?);
     }
     #[cfg(not(target_os = "windows"))]
     {
         // The file managers of Linux do not select the item, so show the folder that holds it.
-        let folder = path.parent().unwrap_or(path);
-        Command::new("xdg-open").arg(folder).spawn()?;
+        let folder = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+        reap(Command::new("xdg-open").arg(folder).spawn()?);
     }
     Ok(())
 }

@@ -151,6 +151,13 @@ pub fn trusted_peer(path: &Path) -> bool {
     valid
 }
 
+/// The full check for a connected socket: the peer is one of the helper binaries next to the
+/// app and its code signature is valid.
+pub fn authenticate(fd: i32) -> Option<PathBuf> {
+    let path = peer_path(fd)?;
+    trusted_peer(&path).then_some(path)
+}
+
 /// The value of the `call_browser` setting that selects the default browser of macOS.
 pub const DEFAULT_BROWSER: &str = "default";
 

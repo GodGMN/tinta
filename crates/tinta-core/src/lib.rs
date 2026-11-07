@@ -9,6 +9,8 @@ pub mod granola;
 pub mod keys;
 pub mod naming;
 pub mod paths;
+#[cfg(target_os = "linux")]
+pub mod peer;
 pub mod protocol;
 pub mod tools;
 pub mod transcript;

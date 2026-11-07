@@ -159,10 +159,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libssl-dev
-          cargo test --locked -p tinta-core --lib --no-run
-          binary="$(find target/debug/deps -maxdepth 1 -type f -executable -name 'tinta_core-*' | head -n 1)"
+          cargo test --locked -p tinta-core --lib --no-run --message-format=json \
+            > "$RUNNER_TEMP/cargo-test.json"
+          binary="$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' \
+            "$RUNNER_TEMP/cargo-test.json" | tail -n 1)"
           test -n "$binary"
-          echo "TINTA_CORE_TEST=$PWD/$binary" >> "$GITHUB_ENV"
+          echo "TINTA_CORE_TEST=$binary" >> "$GITHUB_ENV"
       - name: Install the .deb and run the session smoke test
         env:
           TINTA_ENGINE_MODELS_DIR: ${{ github.workspace }}/.tinta-models

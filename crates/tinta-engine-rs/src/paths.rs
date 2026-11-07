@@ -1,9 +1,10 @@
 //! Where the engine keeps its models.
 //!
-//! The models live under the platform's local app data folder, next to the
-//! app's own `Tinta` folder (`crates/tinta-core/src/paths.rs` uses the same
-//! base). `data_local_dir` avoids syncing roughly 700 MB through a Windows
-//! roaming profile.
+//! The models live under the platform's local app data folder. On macOS and
+//! Linux that is the same base as the app's own `Tinta` folder
+//! (`crates/tinta-core/src/paths.rs`); on Windows the app uses Roaming
+//! `%APPDATA%` and the models use `%LOCALAPPDATA%`, so roughly 700 MB is not
+//! synced through a roaming profile.
 //!
 //! `TINTA_DATA_DIR` is the app's own override for the `Tinta` folder, so the
 //! engine honours it too: the models then live in `<TINTA_DATA_DIR>/models`.

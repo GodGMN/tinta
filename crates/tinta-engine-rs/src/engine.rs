@@ -181,12 +181,16 @@ impl Engine {
         let installing = self.installing.clone();
         let id = id.clone();
         std::thread::spawn(move || {
-            let result = install::install(&manifest, &root, &out, &threads);
-            let _ = match result {
-                Ok(()) => out.reply(&id, json!({ "installed": true })),
-                Err(error) => out.fail(&id, &error.to_string()),
-            };
+            // A panic must still clear the flag and answer the request.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                install::install(&manifest, &root, &out, &threads)
+            }));
             installing.store(false, Ordering::SeqCst);
+            let _ = match result {
+                Ok(Ok(())) => out.reply(&id, json!({ "installed": true })),
+                Ok(Err(error)) => out.fail(&id, &error.to_string()),
+                Err(_) => out.fail(&id, "the model install stopped unexpectedly"),
+            };
         });
         Ok(())
     }

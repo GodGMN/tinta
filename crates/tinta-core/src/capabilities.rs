@@ -126,6 +126,17 @@ mod tests {
     }
 
     #[test]
+    fn unknown_names_are_ignored() {
+        // Another branch may add a capability, for example `live_transcription`; an app that
+        // does not know it reads only the names it knows and leaves the rest on.
+        let message = json!({"capabilities": {"live_transcription": false, "calendar": false}});
+        let capabilities = Capabilities::from_json(&message);
+        assert!(!capabilities.calendar);
+        assert!(capabilities.summaries);
+        assert!(capabilities.capture_system_audio);
+    }
+
+    #[test]
     fn serializes_every_field_for_the_window() {
         let text = serde_json::to_string(&Capabilities::default()).unwrap();
         for field in [

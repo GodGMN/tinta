@@ -1013,6 +1013,23 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // Windows release builds have no console, so a panic here would close the app
+            // without a message. Show why it cannot start in a native dialog and exit when
+            // the user closes it. A blocking dialog would deadlock the main thread.
+            #[cfg(not(target_os = "macos"))]
+            if let Err(error) = init(Some(app.handle().clone())) {
+                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                if let Some(window) = tauri::Manager::get_webview_window(app, "main") {
+                    let _ = window.hide();
+                }
+                app.dialog()
+                    .message(error.to_string())
+                    .title("Tinta cannot start")
+                    .kind(MessageDialogKind::Error)
+                    .show(|_| std::process::exit(1));
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
             init(Some(app.handle().clone())).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             if let Ok(resources) = tauri::Manager::path(app).resource_dir() {
                 system::update_extension(&resources.join("extension"));

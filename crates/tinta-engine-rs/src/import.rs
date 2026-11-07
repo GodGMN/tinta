@@ -298,6 +298,37 @@ mod tests {
     }
 
     #[test]
+    fn a_file_declaring_more_than_twelve_hours_is_rejected_before_writing() {
+        // A sparse WAV header: the data chunk declares 12 h + 1 s at 16 kHz but
+        // the file has no samples. The import must fail from `n_frames` without
+        // creating a single chunk.
+        let dir = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let path = source.path().join("too-long.wav");
+        let bytes = ((MAX_TRACK_SAMPLES + SAMPLE_RATE as i64) * 2) as u32;
+        let mut header = Vec::with_capacity(44);
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36 + bytes).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        header.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&bytes.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let out = Output::new(std::io::sink());
+        let error = import_audio(dir.path(), &key(), &path, &out).unwrap_err();
+        assert!(error.to_string().contains("12 hour"), "{error}");
+        assert!(remote_entries(dir.path()).is_empty());
+        assert!(!Track::Remote.directory(dir.path()).exists());
+    }
+
+    #[test]
     fn a_missing_file_is_an_error() {
         let dir = TempDir::new().unwrap();
         let out = Output::new(std::io::sink());

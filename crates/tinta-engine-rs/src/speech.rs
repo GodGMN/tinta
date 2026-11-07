@@ -35,6 +35,24 @@ const VAD_BUFFER_SECONDS: f32 = 60.0;
 /// `Speech.diarize` skips the diarizer below this much audio.
 const MIN_DIARIZATION_SECONDS: usize = 2 * SAMPLE_RATE as usize;
 
+/// The diarizer gets at most this much of a track.
+///
+/// sherpa-onnx's complete-linkage clustering builds an n × n distance matrix over
+/// the segment embeddings, so memory grows quadratically with the segment count.
+/// Measured on the task #2 AMI test meetings (pyannote segmentation 3.0, window
+/// shift 0.2, complete linkage at 0.7): 172-329 segments for 29.5-55.9 minutes,
+/// that is **350-423 segments per audio hour** (mean 382). At 4 h that is about
+/// 1,530 segments and a 9 MB f32 matrix; the 12 h codec cap would be about 4,600
+/// segments and 85 MB by the same density. The pathological upper bound (one
+/// segment per 2 s window for each of 3 local speakers, 5,400 per hour) would be
+/// 1.9 GB at 4 h, which is why the input is capped there instead of at 12 h.
+/// The high-level sherpa-onnx API only exposes the segments after clustering, so
+/// the guard has to be on the audio length. A longer remote track is still fully
+/// transcribed; only the speaker labels stop at 4 h. Task #18 (PR #9) replaces
+/// `cluster_speakers` with over-cluster + centroid merge + embedding
+/// reassignment and removes this cap.
+const MAX_DIARIZATION_SECONDS: usize = 4 * 60 * 60;
+
 /// One final pass. `progress` receives the fraction after each unit of work, in
 /// the order the Swift engine emits it.
 pub trait FinalPass {
@@ -228,6 +246,15 @@ impl FinalPass for SpeechPass {
         if samples.len() <= MIN_DIARIZATION_SECONDS {
             return Ok(Vec::new());
         }
+        let samples = if samples.len() > MAX_DIARIZATION_SECONDS * SAMPLE_RATE as usize {
+            crate::protocol::log(&format!(
+                "diarizing the first {MAX_DIARIZATION_SECONDS} s of a {} s remote track",
+                samples.len() / SAMPLE_RATE as usize
+            ));
+            &samples[..MAX_DIARIZATION_SECONDS * SAMPLE_RATE as usize]
+        } else {
+            samples
+        };
         let diarizer = self.diarizer(max_speakers)?;
         progress(0.0);
         let result = diarizer
@@ -253,10 +280,13 @@ impl FinalPass for SpeechPass {
 /// linkage with the given cosine-dissimilarity threshold (`0.7` over-clusters
 /// rather than merging speakers, per the benchmark).
 ///
-/// `max_speakers` is accepted for protocol parity but not applied yet. Swift uses
-/// it as a *cap* (`OfflineDiarizerConfig.withSpeakers(min: nil, max:)`), while
+/// `max_speakers` is accepted for protocol parity but **ignored**: Swift uses it
+/// as a *cap* (`OfflineDiarizerConfig.withSpeakers(min: nil, max:)`), while
 /// sherpa-onnx can only force an *exact* cluster count, which design condition 6
-/// forbids. Task #18's replacement closes that gap after the centroid merge.
+/// forbids. The measured effect is visible: the two-speaker test clip comes back
+/// with four speakers. Task #18 (PR #9, `spike/18/diarization`) replaces the
+/// internals of this function with over-cluster + centroid merge + reassignment
+/// by embedding, where a cap fits naturally; the signature stays the same.
 pub fn cluster_speakers(threshold: f32, max_speakers: Option<usize>) -> FastClusteringConfig {
     let _ = max_speakers;
     FastClusteringConfig {
@@ -318,10 +348,16 @@ fn tokens_to_words(
 static MODEL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Runs `work` while holding the model lock.
+///
+/// A panic inside `work` unwinds through the guard and poisons the mutex. The
+/// guarded data is just `()`, and the models live in the `SpeechPass` that was
+/// unwinding, so recovering the inner value is safe: the next finalize loads its
+/// own models and runs instead of failing with "the model lock is poisoned"
+/// until the engine restarts.
 pub fn with_models<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     let _guard = MODEL_LOCK
         .lock()
-        .map_err(|_| anyhow::anyhow!("the model lock is poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     work()
 }
 
@@ -352,6 +388,16 @@ mod tests {
             words.iter().map(|word| word.w.as_str()).collect::<Vec<_>>(),
             vec!["Hello", "there"]
         );
+    }
+
+    #[test]
+    fn a_panic_does_not_poison_the_model_lock() {
+        let panicked = std::panic::catch_unwind(|| -> Result<()> {
+            with_models(|| -> Result<()> { panic!("a model callback panicked") })
+        });
+        assert!(panicked.is_err());
+        // The next pass still takes the lock and runs.
+        assert_eq!(with_models(|| Ok(7)).unwrap(), 7);
     }
 
     #[test]

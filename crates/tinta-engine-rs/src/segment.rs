@@ -115,13 +115,18 @@ fn split_run(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
 /// Groups VAD speech into decode pieces with pre-roll, post-roll, a 10 s minimum
 /// and the 60 s hard cap. Adjacent runs closer than 0.5 s merge; the pieces
 /// themselves may overlap, and [`trim_overlaps`] de-duplicates their words.
+///
+/// Every piece starts at its own speech start minus the pre-roll, never at 0:
+/// a track whose first speech is at 5 minutes must not produce a 0–60 s piece.
+/// A piece over the hard cap is split at the quietest points, never truncated,
+/// so no speech region is ever left out. [`covers_speech`] checks that invariant
+/// in debug builds and in the tests.
 pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let max_piece = samples(MAX_PIECE_SECONDS);
     let join_gap = samples(JOIN_GAP_SECONDS);
     let pre = samples(PRE_ROLL_SECONDS);
     let post = samples(POST_ROLL_SECONDS);
     let min_piece = samples(MIN_PIECE_SECONDS);
-    let cap = samples(MAX_ASR_SECONDS);
 
     let mut groups: Vec<(usize, usize)> = Vec::new();
     for (segment_start, segment_end) in segments {
@@ -137,15 +142,56 @@ pub fn group_pieces(audio: &[f32], segments: &[(usize, usize)]) -> Vec<(usize, u
     }
 
     let mut pieces = Vec::new();
-    for (index, (a, b)) in groups.iter().enumerate() {
-        let start = if index == 0 { 0 } else { a.saturating_sub(pre) };
+    for (a, b) in groups {
+        let start = a.saturating_sub(pre);
         let end = (b + post).max(start + min_piece).min(audio.len());
         if end <= start {
             continue;
         }
-        pieces.push((start, end.min(start + cap)));
+        pieces.extend(split_to_cap(audio, start, end));
+    }
+    debug_assert!(
+        covers_speech(&pieces, segments),
+        "the decode pieces leave a VAD speech region uncovered"
+    );
+    pieces
+}
+
+/// Splits `[start, end)` into pieces of at most [`MAX_ASR_SECONDS`] at the
+/// quietest points. Groups are at most 30 s, so this only fires if a future
+/// change lengthens them; it must split rather than truncate, because truncating
+/// silently drops whatever comes after the cap.
+fn split_to_cap(audio: &[f32], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let cap = samples(MAX_ASR_SECONDS);
+    let mut pieces = Vec::new();
+    let mut position = start;
+    while end.saturating_sub(position) > cap {
+        let hi = position + cap;
+        let lo = position + (cap as f32 * 0.6) as usize;
+        let split = quietest_point(audio, lo, hi).clamp(position + 1, hi);
+        pieces.push((position, split));
+        position = split;
+    }
+    if end > position {
+        pieces.push((position, end));
     }
     pieces
+}
+
+/// True when every VAD speech region lies inside the union of the decode pieces.
+/// A hole means speech the recognizer never sees, so [`group_pieces`] asserts it
+/// and the tests check the awkward cases directly.
+pub fn covers_speech(pieces: &[(usize, usize)], segments: &[(usize, usize)]) -> bool {
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for &(start, end) in pieces {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    segments
+        .iter()
+        .all(|&(start, end)| merged.iter().any(|&(a, b)| a <= start && b >= end))
 }
 
 /// De-duplicates words in overlapping pieces at the midpoint of the overlap on
@@ -182,11 +228,14 @@ mod tests {
     #[test]
     fn pieces_are_at_most_thirty_seconds_and_never_over_the_hard_cap() {
         let audio = silence(samples(180.0));
-        let pieces = group_pieces(&audio, &[(0, samples(180.0))]);
+        let run = [(0, samples(180.0))];
+        let pieces = group_pieces(&audio, &run);
         assert!(pieces.len() >= 6, "pieces {}", pieces.len());
         for (start, end) in &pieces {
             let seconds = (end - start) as f32 / SAMPLE_RATE as f32;
-            assert!(seconds <= MAX_PIECE_SECONDS + 0.01, "piece {seconds} s");
+            // A 30 s group plus its 2 s pre-roll and 1 s post-roll.
+            let longest = MAX_PIECE_SECONDS + PRE_ROLL_SECONDS + POST_ROLL_SECONDS;
+            assert!(seconds <= longest + 0.01, "piece {seconds} s");
             assert!(seconds <= MAX_ASR_SECONDS, "piece over the hard cap");
             ensure_recognizer_window(end - start).unwrap();
             assert!(end <= &audio.len());
@@ -199,6 +248,81 @@ mod tests {
         // The run is covered from 0 to the end.
         assert_eq!(pieces.first().unwrap().0, 0);
         assert_eq!(pieces.last().unwrap().1, audio.len());
+        assert!(covers_speech(&pieces, &run));
+    }
+
+    #[test]
+    fn a_track_that_starts_with_five_minutes_of_silence_is_covered() {
+        let audio = silence(samples(420.0));
+        let run = [(samples(300.0), samples(305.0))];
+        let pieces = group_pieces(&audio, &run);
+        assert_eq!(pieces.len(), 1, "pieces {pieces:?}");
+        // The piece starts at the speech minus the 2 s pre-roll, not at 0.
+        assert_eq!(pieces[0].0, samples(298.0));
+        // Five seconds of speech plus 1 s of post-roll, extended to 10 s.
+        assert_eq!(pieces[0].1, samples(308.0));
+        assert!(covers_speech(&pieces, &run));
+    }
+
+    #[test]
+    fn an_opening_run_past_sixty_seconds_is_not_truncated() {
+        let audio = silence(samples(120.0));
+        let run = [(samples(45.0), samples(74.0))];
+        let pieces = group_pieces(&audio, &run);
+        assert_eq!(pieces.len(), 1, "pieces {pieces:?}");
+        assert_eq!(pieces[0].0, samples(43.0));
+        assert_eq!(pieces[0].1, samples(75.0));
+        // The speech after 60 s is inside the piece, so the cap never truncates.
+        assert!(pieces[0].1 > samples(60.0));
+        assert!(covers_speech(&pieces, &run));
+    }
+
+    #[test]
+    fn a_three_minute_run_has_no_holes_and_covers_every_second() {
+        let audio = silence(samples(180.0));
+        let run = [(0, samples(180.0))];
+        let pieces = group_pieces(&audio, &run);
+        assert!(pieces.len() >= 6, "pieces {}", pieces.len());
+        for &(start, end) in &pieces {
+            ensure_recognizer_window(end - start).unwrap();
+        }
+        for pair in pieces.windows(2) {
+            assert!(pair[1].0 <= pair[0].1, "hole between pieces");
+        }
+        assert_eq!(pieces.first().unwrap().0, 0);
+        assert!(pieces.last().unwrap().1 >= samples(180.0));
+        assert!(covers_speech(&pieces, &run));
+    }
+
+    #[test]
+    fn a_piece_over_the_hard_cap_is_split_at_the_quietest_point() {
+        let mut audio = silence(samples(150.0));
+        for second in [50usize, 100] {
+            for sample in audio
+                .iter_mut()
+                .skip(second * SAMPLE_RATE as usize)
+                .take(samples(0.05))
+            {
+                *sample = 1.0;
+            }
+        }
+        let pieces = split_to_cap(&audio, 0, audio.len());
+        assert!(pieces.len() >= 3, "pieces {pieces:?}");
+        assert_eq!(pieces.first().unwrap().0, 0);
+        assert_eq!(pieces.last().unwrap().1, audio.len());
+        for &(start, end) in &pieces {
+            ensure_recognizer_window(end - start).unwrap();
+        }
+        for pair in pieces.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "the split must not drop samples");
+            let cut = pair[0].1;
+            for loud in [50 * SAMPLE_RATE as usize, 100 * SAMPLE_RATE as usize] {
+                assert!(
+                    cut <= loud || cut >= loud + samples(0.05),
+                    "cut landed in the loud window at {loud}"
+                );
+            }
+        }
     }
 
     #[test]

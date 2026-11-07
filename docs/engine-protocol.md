@@ -600,7 +600,7 @@ call-app change (`lib.rs:489-497`), always with a wall-clock timestamp.
 | result | `{"tracks": {"mic": TrackResult, "remote": TrackResult}, "duration": number, "language"?: string}` (`Engine.swift:229-231`) |
 | errors | chunk read/decrypt errors (`"invalid chunk <name>"` and CryptoKit failures), invalid key, model missing/hash mismatch (`ChunkStore.swift:102-123`; `Speech.swift:71-90`, `120-133`) |
 | events | `finalize_progress` in track order: remote transcription windows, remote diarization (only when the remote track has words), then mic transcription windows; the transcription fraction restarts at `1/n` for each track (`Engine.swift:214-226`; see [§4](#4-events)) |
-| notes | **Allowed while a recording is active** — the comment at `Engine.swift:206` states this, and nothing in the app prevents a new recording from starting while another meeting finalizes: `start_recording` checks only the active session and `started_at` (`lib.rs:231-240`), while the final pass is tracked per meeting id (`lib.rs:136`, `529-543`). Read-only on disk. Two `finalize` calls for different meetings may also overlap; the `Speech` actor serializes model work (`Speech.swift:56`, `180-217`), but a second engine should not assume sequential calls. The app sends `max_speakers` only when there are remote participants, equal to their count (`lib.rs:565-569`). Timeout 1 h. |
+| notes | **Allowed while a recording is active** — the comment at `Engine.swift:206` states this, and nothing in the app prevents a new recording from starting while another meeting finalizes: `start_recording` checks only the active session and `started_at` (`lib.rs:231-240`), while the final pass is tracked per meeting id (`lib.rs:136`, `529-543`). Read-only on disk. Two `finalize` calls for different meetings may also overlap; the `Speech` actor serializes model work (`Speech.swift:56`, `180-217`), but a second engine should not assume sequential calls. The Rust engine runs on a worker thread, takes a global model lock before reading either track, and recovers that lock if a pass panics: a panic replies with `the final pass stopped unexpectedly` instead of leaving the app to time out, and a later pass still runs. The stages within one pass are sequential on purpose (see the behavioral details). The app sends `max_speakers` only when there are remote participants, equal to their count (`lib.rs:565-569`); the Rust engine accepts and ignores it until task #18. Timeout 1 h. |
 
 `TrackResult` (`transcript.rs:8-30` is the consumer):
 
@@ -633,12 +633,42 @@ Behavioral details:
   at the quietest 50 ms window, 2 s of pre-roll, 1 s of post-roll and a 10 s minimum,
   with a 60 s cap checked in code before every recognizer call and no forced 20 s flush.
   Overlapping pieces are de-duplicated at the overlap midpoint and sorted by time
-  (`crates/tinta-engine-rs/src/segment.rs`). The result shape and the event order do not
-  change. The Rust engine does not apply `max_speakers` yet: Swift treats it as a cap,
-  while sherpa-onnx can only force an exact cluster count, and the binding design
-  conditions say never to force a fixed count. The parameter is accepted and reaches the
-  single `cluster_speakers` function (`crates/tinta-engine-rs/src/speech.rs`), which a
-  later task replaces with over-cluster + merge, where the cap fits.
+  (`crates/tinta-engine-rs/src/segment.rs`). Each piece starts at its own VAD speech
+  start minus the 2 s pre-roll, never at 0, and a piece over the 60 s cap is split at the
+  quietest point instead of truncated, so a track whose first speech is after a minute of
+  silence is still transcribed and no opening run loses its tail. The result shape and
+  the event order do not change.
+- **The stages run sequentially on purpose**: remote transcription, remote diarization,
+  then microphone transcription, one after the other. The binding design condition for
+  the fork says to run ASR and diarization concurrently, but Swift's app relies on this
+  event order (`Engine.swift:214-226`; see `finalize_progress` in §4), and running them
+  in parallel would interleave the progress events. The measured 8-core budget still
+  fits; a later engine may overlap the work only if it keeps the event order.
+- **Memory at the 12 h cap**: a track is 691,200,000 samples, 2.76 GB as f32. `finalize`
+  takes the model lock *before* reading either track, so a queued second pass holds no
+  audio, and `read_track` decrypts one 5 s chunk at a time instead of holding every
+  decrypted i16 chunk next to the f32 track. Both tracks are alive during microphone
+  transcription, so the peak is about **5.5 GB of audio plus under 1 GB of models**;
+  the remote buffer is dropped right after the echo filter. At 1 h the same peak is about
+  460 MB.
+- **Diarization is capped at the first 4 h of a remote track** (`MAX_DIARIZATION_SECONDS`
+  in `crates/tinta-engine-rs/src/speech.rs`). sherpa-onnx's complete-linkage clustering
+  builds an n × n distance matrix over segment embeddings. Measured on the task #2 AMI
+  test meetings: 172-329 segments for 29.5-55.9 minutes, that is 350-423 segments per
+  audio hour (mean 382), so 4 h is about 1,530 segments and a 9 MB matrix. The 12 h codec
+  cap would be about 4,600 segments and 85 MB by the same density; the pathological
+  upper bound (one segment per 2 s window for 3 local speakers, 5,400 per hour) is what
+  the 4 h cap bounds to 1.9 GB. sherpa-onnx exposes segments only after clustering, so
+  the guard has to be on the audio length. Words and the transcript still cover the whole
+  track; only speaker labels stop at 4 h.
+- **`max_speakers` is accepted but ignored.** Swift treats it as a cap
+  (`OfflineDiarizerConfig.withSpeakers(min: nil, max:)`), while sherpa-onnx can only
+  force an exact cluster count, and the binding design conditions say never to force a
+  fixed count. The parameter reaches the single `cluster_speakers` function
+  (`crates/tinta-engine-rs/src/speech.rs`); the measured effect is that the two-speaker
+  test clip comes back with four speakers. Task #18 (PR #9, `spike/18/diarization`)
+  replaces that function's internals with over-cluster + centroid merge + reassignment by
+  embedding, where the cap fits; the signature stays the same.
 - Diarization loads a fresh diarizer per final pass and releases it, because Core ML keeps
   GPU memory proportional to audio length (`Speech.swift:135-147`).
 - A missing `audio/remote` or `audio/mic` directory reads as an empty track
@@ -664,7 +694,7 @@ Behavioral details:
 | result | `{"duration": number}` (seconds) (`Engine.swift:253`) |
 | errors | `"missing parameter: …"`, `"cannot allocate buffer"`, AVFoundation open/read errors, chunk write errors (the latter are events, not errors) |
 | events | `error` if a chunk write fails (`ChunkStore.swift:89-91`) |
-| notes | Imports a file as the **remote** track so the final pass separates all voices in it: decode with `AVAudioFile`, resample to 16 kHz mono, append sequential samples starting at index 0, flush (`Engine.swift:235-254`). Only `audio/remote/*.tntc` is written; there is no `audio/mic`, no session JSON, and no database change. The app creates the meeting first, calls this, marks it stopped, then finalizes on a new thread (`commands.rs:323-343`). 10-minute timeout. The Rust engine decodes wav, mp3, m4a/AAC, ogg/Vorbis and flac with symphonia, averages the channels into mono and resamples with rubato (`crates/tinta-engine-rs/src/audio.rs`); a 16 kHz input is appended without resampling. A chunk write failure is an `error` event and the import continues, as in Swift. |
+| notes | Imports a file as the **remote** track so the final pass separates all voices in it: decode with `AVAudioFile`, resample to 16 kHz mono, append sequential samples starting at index 0, flush (`Engine.swift:235-254`). Only `audio/remote/*.tntc` is written; there is no `audio/mic`, no session JSON, and no database change. The app creates the meeting first, calls this, marks it stopped, then finalizes on a new thread (`commands.rs:323-343`). 10-minute timeout. The Rust engine decodes wav, mp3, m4a/AAC, ogg/Vorbis and flac with symphonia, averages the channels into mono and resamples with rubato (`crates/tinta-engine-rs/src/audio.rs`); a 16 kHz input is appended without resampling. Gapless decoding is on, so the AAC/MP3 encoder delay and padding are trimmed and the imported timeline starts where the source audio does, like `AVAudioFile`. The resampler output is trimmed to `round(input_frames × 16000 / rate)`, so a 60 s 48 kHz or 44.1 kHz file yields exactly 960,000 samples; tests import both rates end to end, plus a short MP3 fixture for the gapless path. A file longer than the 12 h track limit is rejected at import time with a clear error (`the audio is longer than the 12 hour track limit…`) instead of writing a track that `finalize` would later fail to read as "a chunk header is corrupt". A chunk write failure is an `error` event and the import continues, as in Swift. A panic in the worker is caught and answered with an error reply. |
 
 ---
 
@@ -746,8 +776,13 @@ Rules for a second engine, summarized:
    refuse a command just because another runs, except `start` while a session exists
    (`Engine.swift:185`).
 2. Keep per-session state behind a lock/actor: audio, mutes, pause state.
-3. Serialize model access or accept queueing; do not load the same model twice.
+3. Serialize model access or accept queueing; do not load the same model twice. A panic
+   while a pass holds the lock must still answer the request and must not leave the lock
+   unusable for later calls.
 4. Write each JSON line atomically.
+5. Within one `finalize`, run the stages sequentially (remote ASR, remote diarization,
+   mic ASR) so Swift's `finalize_progress` order is preserved; this is the documented
+   deviation from the fork's "run ASR and diarization concurrently" design condition.
 
 ---
 

@@ -48,13 +48,15 @@ impl AudioDecoder {
         if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
             hint.with_extension(extension);
         }
+        // Gapless trims the encoder delay and padding that AAC and MP3 carry, so
+        // the imported timeline starts where the source audio does, like
+        // `AVAudioFile` in the Swift engine.
+        let options = FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
         let probed = symphonia::default::get_probe()
-            .format(
-                &hint,
-                stream,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
-            )
+            .format(&hint, stream, &options, &MetadataOptions::default())
             .with_context(|| format!("cannot read the audio format of {}", path.display()))?;
         let format = probed.format;
         let track = format
@@ -198,6 +200,11 @@ impl Resampler48 {
     }
 
     /// Resamples the remaining samples and flushes the filter tail. Call once.
+    ///
+    /// A streamed caller clears `out` after every push, so the length check and
+    /// the trim use [`Resampler48::produced`] (the whole stream) and never
+    /// `out.len()` (just the tail). The flush adds up to one chunk of filter
+    /// tail; the trim removes it from the tail buffer before it is written.
     pub fn finish(&mut self, out: &mut Vec<f32>, input_frames: usize) -> Result<()> {
         if !self.pending.is_empty() {
             let tail = std::mem::take(&mut self.pending);
@@ -207,10 +214,11 @@ impl Resampler48 {
                 .map_err(|error| anyhow::anyhow!("cannot resample the audio: {error}"))?;
             self.emit(&waves[0], out);
         }
+        let expected = self.expected_output(input_frames);
         // Two zero-fed calls flush the sinc filter's tail.
         let zeros = vec![0.0f32; RESAMPLE_CHUNK];
         for _ in 0..2 {
-            if out.len() >= self.expected_output(input_frames) {
+            if self.produced >= expected {
                 break;
             }
             let waves = self
@@ -219,7 +227,13 @@ impl Resampler48 {
                 .map_err(|error| anyhow::anyhow!("cannot flush the resampler: {error}"))?;
             self.emit(&waves[0], out);
         }
-        out.truncate(self.expected_output(input_frames));
+        // Trim to `round(input * 16000 / rate)` so a streamed import has the
+        // same length as an unstreamed one. The extra samples are always in this
+        // tail (one flush chunk at most); `saturating_sub` is only a safety net.
+        let extra = self.produced.saturating_sub(expected);
+        let keep = out.len().saturating_sub(extra);
+        out.truncate(keep);
+        self.produced = expected.min(self.produced);
         Ok(())
     }
 
@@ -250,7 +264,11 @@ pub fn resample_to_16k(samples: &[f32], source_rate: u32) -> Result<Vec<f32>> {
 /// Writes a canonical 44-byte PCM header and 16-bit little-endian mono samples,
 /// byte for byte like `ChunkReader.wav` in `ChunkStore.swift`.
 pub fn wav(samples: &[f32]) -> Vec<u8> {
-    let sample_rate = SAMPLE_RATE;
+    wav_at(samples, SAMPLE_RATE)
+}
+
+/// Same layout at an arbitrary sample rate, for the import tests.
+pub(crate) fn wav_at(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     let byte_count = (samples.len() * 2) as u32;
     let mut data = Vec::with_capacity(44 + samples.len() * 2);
     data.extend_from_slice(b"RIFF");
@@ -336,6 +354,38 @@ mod tests {
         );
         let frequency = dominant_frequency(&output[400..31_600], 16_000);
         assert!((frequency - 300.0).abs() < 5.0, "frequency {frequency}");
+    }
+
+    /// Pushes like `import_audio`: every packet is emitted and `out` is cleared,
+    /// so only `finish` can trim the filter tail.
+    fn stream(rate: u32, seconds: f32, packet: usize) -> Vec<f32> {
+        let input = sine(rate, seconds, 440.0);
+        let mut resampler = Resampler48::new(rate).unwrap();
+        let mut out = Vec::new();
+        let mut total = Vec::new();
+        for chunk in input.chunks(packet) {
+            resampler.push(chunk, &mut out).unwrap();
+            total.append(&mut out);
+        }
+        resampler.finish(&mut out, input.len()).unwrap();
+        total.append(&mut out);
+        total
+    }
+
+    #[test]
+    fn a_streamed_48k_import_has_exactly_the_expected_length() {
+        // 60 s at 48 kHz in 24 ms packets used to produce 963,882 samples
+        // (0.24 s of filter tail) instead of 960,000.
+        let output = stream(48_000, 60.0, 1_152);
+        assert_eq!(output.len(), 960_000);
+    }
+
+    #[test]
+    fn a_streamed_44k_import_has_exactly_the_expected_length() {
+        let input_frames: usize = 44_100 * 60;
+        assert_eq!(input_frames * 16_000 / 44_100, 960_000);
+        let output = stream(44_100, 60.0, 1_152);
+        assert_eq!(output.len(), 960_000);
     }
 
     #[test]

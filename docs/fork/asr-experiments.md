@@ -19,10 +19,11 @@ int8 weights and Conv left in fp32 fixes the failure at 0.9 GB:
 - it keeps **102 % of the fp32 tcpWER gain** (5.5 of 5.4 points) at **0.90 GB
   of model instead of 2.55 GB** and **3.0 GiB of engine peak RSS instead of
   4.2 GiB**;
-- on the 1,000-utterance AMI IHM sample it is the best model: **13.16 % WER**
-  against 13.79 % for fp32 and 14.94 % for int8; the paired delta against int8
-  is -1.78 points (95 % CI -3.53 to +0.15, bootstrapped over the 16 true
-  speakers), so the direction is right but the sample alone is not conclusive.
+- on the 1,000-utterance AMI IHM sample it is at least as good as fp32:
+  **13.16 % WER** against 13.79 % for fp32 and 14.94 % for int8; the paired
+  delta against int8 is -1.78 points (95 % CI -3.53 to +0.15, bootstrapped over
+  the 16 true speakers), so the direction is right but the sample alone is not
+  conclusive, and the fp32 gap is within noise.
 
 **Recommendation: ship the requantized encoder as the default model, keep fp32
 as an opt-in "high accuracy" download for machines with at least 16 GB.** The
@@ -37,14 +38,22 @@ leaves.
 
 The stream metric changes the picture. tcpWER against the merged reference is
 **25.7 % for int8 and 20.2 % for the requantized encoder**; the *single-stream
-oracle* is 23.2 %. The oracle is not an upper bound under a stream metric: it
-is a decode of short reference clips, and the pipeline's long-window decode is
-better per word. The per-utterance midpoint scorer overstates the segmentation
-damage by about **4.7 points** (pipeline minus single-stream oracle: +1.8 per
-utterance against -2.9 tcpWER for fp32), even though the two metrics' levels
-differ by about 15 points. tcpWER should be the standing check for transcript
-quality; the per-utterance number stays as the segmentation/attribution
-diagnostic.
+oracle* is an int8 decode at 23.2 %. Compare like with like: with int8 on both
+sides, segmentation costs **+2.5 tcpWER points** (25.7 % pipeline against
+23.2 % oracle), while the per-utterance midpoint scorer reports +4.3 points
+against the same oracle, so it overstates the damage by **1.8 points**. The
+oracle is not an upper bound under a stream metric: it is a decode of short
+reference clips, and the pipeline's long-window decode is better per word. The
+requantized pipeline's 20.2 % is below that int8 oracle because it is a better
+model, not because segmentation helps. tcpWER should be the standing check for
+transcript quality; the per-utterance number stays as the
+segmentation/attribution diagnostic.
+
+The requantized encoder is **equivalent to fp32 within noise** (at least as
+good: 0.1 point better tcpWER at 5 s and 0.2 at 1 s, with a per-utterance delta
+of 0.1 point in its favour). It is not a quality improvement over fp32; the
+gain over int8 comes from recovering deletions (485 -> 283) at the cost of more
+insertions (160 -> 260, against fp32's 247).
 
 ## The review's finding and the new encoder
 
@@ -117,7 +126,20 @@ real audio is the window and the three evaluations below.
 | fp32, for comparison | 2,549,778,581 B (2,432 MiB) |
 
 The script verifies both input hashes and the output hash, and fails if the
-recipe changes without updating the pin.
+recipe changes without updating the pin. It writes `<output>.tmp`, checks the
+hash and only then renames it over `--output`, so a failed run never leaves an
+unpinned `encoder.int8.onnx` in a live models root. The quantizer versions are
+pinned in `scripts/fork/segmentation/requirements-quant.txt`
+(`onnxruntime==1.31.1`, `onnx==1.23.2`, `numpy==2.4.6`) and printed at startup,
+because the output hash depends on them.
+
+A CI matrix (`asr-requant-portability` in `.github/workflows/ci.yml`) rebuilds
+the encoder with those pins on x64 AVX2, x64 with AVX-512/VNNI, Linux arm64 and
+Windows arm64, verifies the output hash (falling back to a per-tensor digest if
+a platform rounds differently) and decodes the committed 13.4 s clip, asserting
+at least 28 words and at most 10 % normalized WER against the fp32 reference.
+It runs when the manifest, the script, the quantizer pins, `Cargo.lock` or the
+fixture change, and weekly.
 
 ## The failing window
 
@@ -241,23 +263,26 @@ For fp32, the same run is **35.4 % per utterance and 20.3 % tcpWER**. The
 every pipeline word to one reference window, so it charges a merge or a shift
 twice and cannot represent a single stream in an overlap.
 
-The segmentation damage is pipeline minus single-stream oracle, and there the
-per-utterance scorer overstates by about **4.7 points**: +1.8 points per
-utterance against -2.9 points tcpWER. The earlier draft's "~15 points" (and its
-"12 points" / "14.7-point" variants) conflated the level shift with the
-damage. One number: **4.7 points**, and it applies to the int8 and requantized
-variants as well (int8: +4.3 per utterance against +2.5 tcpWER, a 1.8-point
-difference; the fp32 row is the 4.7-point case because the single-stream oracle
-is closer to the pipeline per utterance).
+The segmentation damage is pipeline minus single-stream oracle, and both sides
+must use the same model. The single-stream oracle (`evidence/19`) is an **int8**
+decode, so the matched comparison is the int8 pipeline: **+4.3 points per
+utterance against +2.5 points tcpWER**, which means the per-utterance scorer
+overstates the damage by about **1.8 points**. The first draft compared the
+fp32/requantized pipeline (+1.8 points per utterance) with that int8 oracle
+(-2.9 points tcpWER) and reported 4.7 points; the round-2 re-review caught that
+it mixed a model gain with segmentation damage. The 1.8-point overstatement is
+the number that transfers: the fp32 and requantized pipelines show the same
+per-utterance-versus-stream difference (int8: +4.3 against +2.5).
 
 Two consequences:
 
-1. **The "gap to the oracle" target has to be dropped.** Under a stream metric
-   the pipeline is *better* than the single-stream oracle (20.2 % vs 23.2 %),
-   because the oracle is a decode of short reference clips and the pipeline
-   decodes 60 s windows. A decode of the dataset's boundaries is not an upper
-   bound on word accuracy. Per utterance the oracle still is, but that is a
-   different question.
+1. **Keep the gap-to-the-oracle target.** With a matched model, segmentation
+   still costs 2.5 tcpWER points, and closing that gap is the target. The
+   requantized pipeline's 20.2 % is below the int8 oracle (23.2 %) because it
+   uses a better model, not because the segmentation became free; a
+   requantized-model oracle would move the reference point. Decoding the 1,291
+   oracle clips with the requantized encoder would settle it, but that is a
+   batch of short clips and not urgent.
 2. **cpWER and the speaker-reference view become the check once words carry
    speaker labels.** The oracle's 24.0 % tcpWER / 22.9 % cpWER with speakers is
    the number a diarized engine should approach. A single-stream hypothesis
@@ -351,10 +376,11 @@ deletions.
    and 3.0 GiB of engine RSS. The decision rule from the review is met: the
    window recovers and tcpWER is below 21.8 %.
 2. **Offer fp32 only as an opt-in "high accuracy" model for machines with at
-   least 16 GB.** It is 0.1 point tcpWER better at 5 s and 0.2 at 1 s, and it
-   costs 2.55 GB of model and 4.2 GiB of engine RSS. That is a RAM decision,
-   not a second default: do not offer both side by side for no reason. On 8 GB
-   the requantized encoder is the only one with margin.
+   least 16 GB.** It is within noise of the requantized encoder (0.1 point
+   worse tcpWER at 5 s and 0.2 at 1 s), and it costs 2.55 GB of model and
+   4.2 GiB of engine RSS. That is a RAM decision, not a second default: do not
+   offer both side by side for no reason. On 8 GB the requantized encoder is
+   the only one with margin.
 3. **Keep the hole re-decode.** With fp32 it is still worth 2.1 points tcpWER
    (22.4 % without it, 20.3 % with it) and 1.1 points per utterance. With the
    requantized encoder it repairs 11 / 3 / 33 holes instead of 9 / 6 / 36 for
@@ -401,14 +427,22 @@ tinta-segmentation --wav "$ROOT/data/ES2004b.Mix-Headset.wav" \
 
 | Path | Purpose |
 |---|---|
-| `scripts/fork/segmentation/requantize-encoder.py` | the new encoder: MatMul-only per-channel QInt8, Conv fp32, metadata copy, pinned input/output SHA-256 |
+| `scripts/fork/segmentation/requantize-encoder.py` | the new encoder: MatMul-only per-channel QInt8, Conv fp32, metadata copy, temp file + atomic rename, pinned input/output SHA-256 |
+| `scripts/fork/segmentation/requirements-quant.txt` | pinned `onnxruntime` / `onnx` / `numpy` for the quantizer |
+| `scripts/fork/segmentation/fetch-model-fp32.py` | cross-platform pinned fp32 download and manifest layout for CI (the `.sh` is the local equivalent) |
+| `scripts/fork/segmentation/verify-requant.py` | encoder hash check with a per-tensor digest fallback for cross-platform rounding |
+| `scripts/fork/segmentation/requant-digest.json` | 1,046-tensor digest of the pinned encoder, used by the fallback |
+| `scripts/fork/segmentation/check-clip.py` | decode + word-count/WER gate for the committed clip |
 | `scripts/fork/segmentation/fetch-model-fp32.sh` | pinned fp32 download, SHA-256, manifest layout |
 | `scripts/fork/segmentation/run-asr-experiments.sh` | the three experiments with the engine's path; same-round int8 / requant / fp32 with `--finalize` |
 | `scripts/fork/segmentation/ihm-sample.py` | the deterministic 1,000-row sample generator and the speaker-cluster bootstrap scorer |
 | `scripts/fork/segmentation/score-meeteval.py` | tcpWER at collars 5 s and 1 s and cpWER, merged and speaker references, symmetric normalization |
 | `scripts/fork/segmentation/score.py` | per-utterance scoring, with the short-row/backchannel table |
 | `scripts/fork/segmentation/src/main.rs` | `--diarize`, `--split-turns`, `--window`, `--finalize` |
-| `crates/tinta-engine-rs/src/speech.rs` | `transcribe_pieces`, the explicit piece-plan seam; empty-input guard and the single-piece test |
+| `crates/tinta-engine-rs/src/speech.rs` | `transcribe_pieces`, the explicit piece-plan seam; empty-input guard in `transcribe` and `transcribe_pieces`, with tests |
+| `crates/tinta-engine-rs/examples/decode-clip.rs` | decodes one clip as a single explicit piece and prints words as JSON; used by the portability CI job |
+| `crates/tinta-engine-rs/tests/fixtures/es2004b-235.4-248.8.wav` | the 13.4 s AMI excerpt (CC BY 4.0, see `ATTRIBUTION.md`), 428,878 B |
+| `crates/tinta-engine-rs/tests/fixtures/es2004b-235.4-248.8.ref.txt` | the fp32 reference text for that clip |
 
 Evidence: `evidence/tinta-fork/23/results/` (decodes, scores, meeteval JSON,
 RSS/time logs) and `evidence/tinta-fork/23/logs/`. `turns-<meeting>.json` are
@@ -418,6 +452,44 @@ same-round decodes, `fp32-runs-<meeting>.json` the no-re-decode pass,
 `split-<meeting>.json` the speaker-split pass, and `ihm-sample-<variant>.jsonl`
 the 1,000-row IHM decodes. The `r1/` directory keeps the first round's decodes
 (int8 copied from task #21, fp32 without the finalize RSS measurement).
+
+## Model licensing
+
+Parakeet TDT 0.6B v3 is **CC BY 4.0**. NVIDIA's model card
+(<https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3>) says "Use of this model
+is governed by the CC-BY-4.0 license", and the Hub metadata is `cc-by-4.0`. The
+`csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3` fp32 export and its int8
+sibling carry the same license.
+
+CC BY 4.0 allows redistributing an adapted model, including commercially, if
+the redistribution:
+
+1. credits **NVIDIA** as the creator;
+2. links the license, <https://creativecommons.org/licenses/by/4.0/>;
+3. **states that the model was modified** — here: "re-quantized from the
+   sherpa-onnx fp32 ONNX export: MatMul-only per-channel int8 with
+   `reduce_range=True`, Conv kept fp32";
+4. does not imply that NVIDIA endorses Tinta;
+5. adds no further restrictions (no DRM, no extra terms on the file).
+
+Credit the sherpa-onnx export (`csukuangfj`) as the intermediate source as good
+practice. The app's third-party notices should carry: "Parakeet TDT 0.6B v3 ©
+NVIDIA, CC BY 4.0, modified (int8 re-quantization); ONNX export by
+csukuangfj/sherpa-onnx."
+
+A future hosting choice is a Hugging Face model repository under the user's
+account with all four files (the requantized encoder plus the int8 decoder,
+joiner and `tokens.txt`, about 18 MB extra), so one revision pins the whole
+model. The engine would download
+`https://huggingface.co/<repo>/resolve/<commit-sha>/<file>` and check the
+sha256 in `models.json`, the same pattern as the current csukuangfj source. A
+GitHub release asset on `GodGMN/tinta` is a fine mirror or fallback, not the
+primary. Do not host the fp32 opt-in: keep pointing at csukuangfj's pinned
+revision.
+
+The draft model card (README) for that repository is
+`docs/fork/model-card-requant.md`. No repository was created and nothing was
+uploaded.
 
 ## Limitations
 
@@ -446,5 +518,7 @@ the 1,000-row IHM decodes. The `r1/` directory keeps the first round's decodes
 - **ES2004b is still the tuning meeting** for the segmentation settings; the
   models and metrics were measured on all three, but the settings themselves
   were not re-tuned for the new encoder.
-- **No audio or models are committed.** The fp32 files and the requantized
-  encoder live in the evidence directory and are pinned by hash.
+- **No models are committed.** The fp32 files and the requantized encoder live
+  in the evidence directory and are pinned by hash. The only committed audio is
+  the 13.4 s AMI excerpt used by the portability CI job, with attribution in
+  `crates/tinta-engine-rs/tests/fixtures/ATTRIBUTION.md`.

@@ -1,0 +1,6 @@
+# Pinned quantizer for requantize-encoder.py. The output SHA-256 depends on
+# these versions: 23c100540a23ac714ece37ba69c2c59bad9fc70ab1e0bd5b368f98d71a2c336f
+# was measured with exactly this set (Python 3.12 on linux x86_64).
+onnx==1.23.2
+onnxruntime==1.31.1
+numpy==2.4.6

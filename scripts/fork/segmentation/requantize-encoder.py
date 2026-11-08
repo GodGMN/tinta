@@ -33,7 +33,10 @@ Usage:
   requantize-encoder.py --input-dir MODELS/parakeet-tdt-0.6b-v3 \
                         --output MODELS/requant-root/parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx
 
-Requires `onnx` and `onnxruntime` in a venv outside the repository.
+Requires `onnx` and `onnxruntime` in a venv outside the repository; the
+versions are pinned in `scripts/fork/segmentation/requirements-quant.txt` and
+printed at startup, because the output hash depends on them. The script writes
+`<output>.tmp`, verifies the hash, and only then renames it over `--output`.
 """
 
 import argparse
@@ -43,7 +46,9 @@ import json
 import os
 import sys
 
+import numpy as np
 import onnx
+import onnxruntime
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
 # The fp32 export of csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3 at
@@ -93,6 +98,12 @@ def main():
     )
     args = parser.parse_args()
 
+    # The output hash depends on the quantizer, so print exactly what ran.
+    print(
+        f"onnxruntime {onnxruntime.__version__}, "
+        f"onnx {onnx.__version__}, numpy {np.__version__}"
+    )
+
     encoder = os.path.join(args.input_dir, "encoder.onnx")
     weights = os.path.join(args.input_dir, "encoder.weights")
     input_hashes = {
@@ -109,36 +120,48 @@ def main():
         raise SystemExit("the fp32 encoder has no metadata_props; sherpa-onnx needs them")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    # Never write the pinned path before the pin is checked: a live models root
+    # would otherwise keep an unpinned file when the script exits non-zero.
+    output = os.path.abspath(args.output)
+    tmp = output + ".tmp"
+    if os.path.exists(tmp):
+        os.unlink(tmp)
     # quantize_dynamic loads the external weights itself and, with
     # use_external_data_format=False, saves one file. The quantized encoder is
     # expected around 0.9 GB, below the 2 GB protobuf limit; if a future
     # variant crosses it, flip the flag and ship encoder.weights next to it.
-    quantize_dynamic(
-        encoder,
-        args.output,
-        op_types_to_quantize=OP_TYPES,
-        per_channel=True,
-        reduce_range=True,  # non-VNNI x86: without it the encoder is broken
-        weight_type=QuantType.QInt8,
-        use_external_data_format=False,
-    )
+    try:
+        quantize_dynamic(
+            encoder,
+            tmp,
+            op_types_to_quantize=OP_TYPES,
+            per_channel=True,
+            reduce_range=True,  # non-VNNI x86: without it the encoder is broken
+            weight_type=QuantType.QInt8,
+            use_external_data_format=False,
+        )
 
-    # quantize_dynamic rebuilds the graph but keeps metadata_props in practice;
-    # set them explicitly so the file does not depend on that.
-    quantized = onnx.load(args.output, load_external_data=False)
-    del quantized.metadata_props[:]
-    for key, value in original_metadata:
-        prop = quantized.metadata_props.add()
-        prop.key = key
-        prop.value = value
-    onnx.save_model(quantized, args.output, save_as_external_data=False)
+        # quantize_dynamic rebuilds the graph but keeps metadata_props in
+        # practice; set them explicitly so the file does not depend on that.
+        quantized = onnx.load(tmp, load_external_data=False)
+        del quantized.metadata_props[:]
+        for key, value in original_metadata:
+            prop = quantized.metadata_props.add()
+            prop.key = key
+            prop.value = value
+        onnx.save_model(quantized, tmp, save_as_external_data=False)
 
-    ops = op_counts(quantized)
-    size = os.path.getsize(args.output)
-    output_hash = sha256(args.output)
+        ops = op_counts(quantized)
+        size = os.path.getsize(tmp)
+        output_hash = sha256(tmp)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
     summary = {
         "input_sha256": input_hashes,
-        "output": args.output,
+        "output": output,
         "output_sha256": output_hash,
         "output_bytes": size,
         "output_gib": round(size / 2**30, 3),
@@ -153,10 +176,13 @@ def main():
     }
     print(json.dumps(summary, indent=1))
     if OUTPUT_SHA256 and output_hash != OUTPUT_SHA256 and not args.allow_unpinned_output:
+        os.unlink(tmp)
         raise SystemExit(
             f"output sha256 {output_hash} does not match OUTPUT_SHA256 {OUTPUT_SHA256}; "
             "update the pin if the recipe changed"
         )
+    # The rename is atomic, so a reader never sees a half-written encoder.
+    os.replace(tmp, output)
     return 0
 
 

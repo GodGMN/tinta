@@ -464,6 +464,9 @@ impl SpeechPass {
     }
 }
 
+/// The per-piece decode callback: samples and offset in, words out.
+type DecodeFn<'a> = dyn FnMut(&[f32], f64) -> Result<Vec<Word>> + 'a;
+
 /// The first pass over an explicit piece plan: decode each piece at its offset,
 /// trim the words that fall into a neighbouring piece, and report how much of
 /// the progress bar the pass filled.
@@ -474,7 +477,7 @@ fn first_pass_words(
     samples: &[f32],
     pieces: &[(usize, usize)],
     progress: &mut dyn FnMut(f64),
-    decode: &mut dyn FnMut(&[f32], f64) -> Result<Vec<Word>>,
+    decode: &mut DecodeFn<'_>,
 ) -> Result<(Vec<Word>, f64, usize)> {
     let total_audio: usize = pieces.iter().map(|(start, end)| end - start).sum();
     let total_audio = total_audio.max(1);
@@ -542,7 +545,12 @@ impl SpeechPass {
 
 impl FinalPass for SpeechPass {
     fn transcribe(&mut self, samples: &[f32], progress: &mut dyn FnMut(f64)) -> Result<Vec<Word>> {
-        // The empty-input guard is in `transcribe_pieces`, which this calls.
+        // Empty audio has a defined answer and must not depend on the models
+        // being installed: return before `check_installed` and before the VAD
+        // load. `transcribe_pieces` keeps its own guard for direct callers.
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
         self.check_installed()?;
         let vad = self.vad()?;
         let segments = vad_segments(&vad, samples);
@@ -898,6 +906,25 @@ mod tests {
             .transcribe_pieces(&[0.0; 100], &[], Vec::new(), &mut progress)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn transcribe_returns_nothing_for_empty_audio_before_loading_models() {
+        // Regression for the task #23 review: an empty final pass used to return
+        // `Ok([])` before any model work. After the guard moved into
+        // `transcribe_pieces`, `transcribe` called `check_installed` and loaded
+        // the VAD first, so empty audio with no models became an error.
+        let mut pass = SpeechPass::with_settings(
+            Manifest::embedded(),
+            PathBuf::from("/nonexistent-models-root"),
+            Threads::for_tests(),
+            Settings::default(),
+        );
+        let mut progress = |_fraction: f64| {};
+        assert!(FinalPass::transcribe(&mut pass, &[], &mut progress)
+            .unwrap()
+            .is_empty());
+        assert!(pass.recognizer.is_none());
     }
 
     #[test]

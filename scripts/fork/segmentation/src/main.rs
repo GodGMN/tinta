@@ -22,7 +22,7 @@ use std::time::Instant;
 use tinta_engine_rs::audio::SAMPLE_RATE;
 use tinta_engine_rs::manifest::Manifest;
 use tinta_engine_rs::segment::{covers_speech, group_pieces_with, vad_segments, Settings};
-use tinta_engine_rs::speech::{vad_config, SpeechPass};
+use tinta_engine_rs::speech::{vad_config, FinalPass, SpeechPass};
 use tinta_engine_rs::threads::Threads;
 
 const VAD_BUFFER_SECONDS: f32 = 120.0;
@@ -42,6 +42,10 @@ struct Args {
     /// Run the engine's diarizer on the wav and write its turns, so the speaker
     /// split experiment uses the shipped post-clustering path.
     diarize: bool,
+    /// After transcribing, run the engine's diarizer in the same process. This
+    /// is the shape of `finalize` (recognizer still loaded while the diarizer
+    /// runs), so peak RSS includes both models.
+    finalize: bool,
     /// Split pieces at a diarized speaker change that falls inside a silence of
     /// at least `split_gap` seconds, for the task #23 experiment.
     split_turns: Option<PathBuf>,
@@ -55,6 +59,7 @@ fn parse_args() -> Result<Args> {
     let mut window = None;
     let mut turns = None;
     let mut diarize = false;
+    let mut finalize = false;
     let mut split_turns = None;
     let mut split_gap = 0.2f32;
     while let Some(flag) = args.next() {
@@ -67,6 +72,7 @@ fn parse_args() -> Result<Args> {
             "--output" => output = Some(PathBuf::from(value()?)),
             "--turns" => turns = Some(PathBuf::from(value()?)),
             "--diarize" => diarize = true,
+            "--finalize" => finalize = true,
             "--split-turns" => split_turns = Some(PathBuf::from(value()?)),
             "--split-gap" => split_gap = value()?.parse().context("--split-gap is seconds")?,
             "--threads" => threads = value()?.parse().context("--threads is a number")?,
@@ -90,6 +96,7 @@ fn parse_args() -> Result<Args> {
         window,
         turns,
         diarize,
+        finalize,
         split_turns,
         split_gap,
     })
@@ -351,6 +358,39 @@ fn main() -> Result<()> {
         }
     })?;
     let pass_seconds = started.elapsed().as_secs_f64();
+    // `--finalize` mirrors `FinalPass::transcribe` + `FinalPass::diarize` in one
+    // process: the recognizer is still loaded, so the peak RSS includes both
+    // models. It is the engine's real finalize shape, not the batch harness.
+    let finalize = if args.finalize {
+        let started = Instant::now();
+        let mut last_tenth = 0u32;
+        let segments = FinalPass::diarize(&mut pass, &samples, None, &mut |fraction| {
+            let tenth = (fraction * 10.0) as u32;
+            if tenth > last_tenth {
+                last_tenth = tenth;
+                eprintln!("  diarization {:.0} %", fraction * 100.0);
+            }
+        })?;
+        let speakers = segments
+            .iter()
+            .map(|segment| segment.speaker.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "  finalize diarization: {} speakers, {} segments, {:.0} s",
+            speakers,
+            segments.len(),
+            seconds
+        );
+        Some(json!({
+            "diarization_seconds": seconds,
+            "num_speakers": speakers,
+            "num_segments": segments.len(),
+        }))
+    } else {
+        None
+    };
     let piece_words: Vec<usize> = pieces
         .iter()
         .map(|(start, end)| {
@@ -381,6 +421,7 @@ fn main() -> Result<()> {
         "speech_seconds": speech_seconds as f64 / SAMPLE_RATE as f64,
         "vad_seconds": vad_seconds,
         "pass_seconds": pass_seconds,
+        "finalize": finalize,
         "pieces": pieces.len(),
         "longest_piece_seconds": longest,
         "piece_list": pieces

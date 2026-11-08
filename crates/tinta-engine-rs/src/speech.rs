@@ -464,6 +464,38 @@ impl SpeechPass {
     }
 }
 
+/// The first pass over an explicit piece plan: decode each piece at its offset,
+/// trim the words that fall into a neighbouring piece, and report how much of
+/// the progress bar the pass filled.
+///
+/// The decoder is a parameter so the piece-plan seam can be tested without
+/// loading a model; `transcribe_pieces` passes `SpeechPass::decode`.
+fn first_pass_words(
+    samples: &[f32],
+    pieces: &[(usize, usize)],
+    progress: &mut dyn FnMut(f64),
+    decode: &mut dyn FnMut(&[f32], f64) -> Result<Vec<Word>>,
+) -> Result<(Vec<Word>, f64, usize)> {
+    let total_audio: usize = pieces.iter().map(|(start, end)| end - start).sum();
+    let total_audio = total_audio.max(1);
+    let mut decoded_audio = 0usize;
+    let mut last_fraction = 0.0f64;
+    let mut words = Vec::with_capacity(pieces.len());
+    for (start, end) in pieces.iter() {
+        let offset = *start as f64 / SAMPLE_RATE as f64;
+        words.push(decode(&samples[*start..*end], offset)?);
+        decoded_audio += end - start;
+        // The first pass fills a fixed share of the transcription stage, so the
+        // hole re-decode keeps moving the same bar instead of starting after a
+        // 100 % event.
+        let fraction = decoded_audio as f64 / total_audio as f64 * FIRST_PASS_PROGRESS_SHARE;
+        last_fraction = last_fraction.max(fraction);
+        progress(last_fraction);
+    }
+    let words = trim_overlaps(pieces, &mut words);
+    Ok((words, last_fraction, total_audio))
+}
+
 /// The holes longest first, so the capped re-decode spends its budget where the
 /// most speech is missing.
 fn largest_first(mut holes: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -483,28 +515,16 @@ impl SpeechPass {
         pieces: Vec<(usize, usize)>,
         progress: &mut dyn FnMut(f64),
     ) -> Result<Vec<Word>> {
-        self.check_installed()?;
-        if pieces.is_empty() {
+        // Both guards live here, not in `transcribe`: a caller that passes an
+        // explicit plan must get the same empty-input behavior.
+        if samples.is_empty() || pieces.is_empty() {
             return Ok(Vec::new());
         }
-        let total = pieces.len();
-        let total_audio: usize = pieces.iter().map(|(start, end)| end - start).sum();
-        let total_audio = total_audio.max(1);
-        let mut decoded_audio = 0usize;
-        let mut last_fraction = 0.0f64;
-        let mut words = Vec::with_capacity(total);
-        for (start, end) in pieces.iter() {
-            let offset = *start as f64 / SAMPLE_RATE as f64;
-            words.push(self.decode(&samples[*start..*end], offset)?);
-            decoded_audio += end - start;
-            // The first pass fills a fixed share of the transcription stage, so
-            // the hole re-decode below keeps moving the same bar instead of
-            // starting after a 100 % event.
-            let fraction = decoded_audio as f64 / total_audio as f64 * FIRST_PASS_PROGRESS_SHARE;
-            last_fraction = last_fraction.max(fraction);
-            progress(last_fraction);
-        }
-        let mut words = trim_overlaps(&pieces, &mut words);
+        self.check_installed()?;
+        let (mut words, last_fraction, total_audio) = {
+            let mut decode = |samples: &[f32], offset: f64| self.decode(samples, offset);
+            first_pass_words(samples, &pieces, progress, &mut decode)?
+        };
         if self.settings.gap_redecode_seconds > 0.0 {
             words = self.redecode_gaps(
                 samples,
@@ -522,9 +542,7 @@ impl SpeechPass {
 
 impl FinalPass for SpeechPass {
     fn transcribe(&mut self, samples: &[f32], progress: &mut dyn FnMut(f64)) -> Result<Vec<Word>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
+        // The empty-input guard is in `transcribe_pieces`, which this calls.
         self.check_installed()?;
         let vad = self.vad()?;
         let segments = vad_segments(&vad, samples);
@@ -859,6 +877,58 @@ mod tests {
             largest_first(holes),
             vec![(10_000, 30_000), (40_000, 50_000), (0, 3_000)]
         );
+    }
+
+    #[test]
+    fn transcribe_pieces_returns_nothing_for_empty_audio_or_an_empty_plan() {
+        // A root that does not exist: the guard must return before any model
+        // load, which is the direct-caller case the review asked for.
+        let mut pass = SpeechPass::with_settings(
+            Manifest::embedded(),
+            PathBuf::from("/nonexistent-models-root"),
+            Threads::for_tests(),
+            Settings::default(),
+        );
+        let mut progress = |_fraction: f64| {};
+        assert!(pass
+            .transcribe_pieces(&[], &[], vec![(0, SAMPLE_RATE as usize)], &mut progress)
+            .unwrap()
+            .is_empty());
+        assert!(pass
+            .transcribe_pieces(&[0.0; 100], &[], Vec::new(), &mut progress)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn transcribe_pieces_decodes_a_single_piece_once() {
+        // The same first pass `transcribe_pieces` runs, with a fake decoder so
+        // the test needs no model. One piece must be one recognizer call with
+        // the piece's slice and offset, and its word must survive trimming.
+        let samples = vec![0.25f32; SAMPLE_RATE as usize * 2];
+        let pieces = vec![(SAMPLE_RATE as usize / 2, SAMPLE_RATE as usize * 3 / 2)];
+        let mut calls = Vec::new();
+        let mut fractions = Vec::new();
+        let (words, fraction, total_audio) = first_pass_words(
+            &samples,
+            &pieces,
+            &mut |value| fractions.push(value),
+            &mut |slice: &[f32], offset: f64| {
+                calls.push((slice.len(), offset));
+                Ok(vec![Word {
+                    w: "hello".to_string(),
+                    s: offset,
+                    e: offset + 0.5,
+                }])
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, vec![(SAMPLE_RATE as usize, 0.5)]);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].w, "hello");
+        assert_eq!(total_audio, SAMPLE_RATE as usize);
+        assert!((fraction - FIRST_PASS_PROGRESS_SHARE).abs() < 1e-9);
+        assert_eq!(fractions, vec![fraction]);
     }
 
     #[test]

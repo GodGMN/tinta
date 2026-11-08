@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream-level scoring with meeteval: tcpWER (collar 5 s) and cpWER.
+"""Stream-level scoring with meeteval: tcpWER (collars 5 s and 1 s) and cpWER.
 
 The per-utterance scorer (`score.py`) assigns every word to exactly one
 reference row, which mis-prices a single-channel stream in overlaps: the
@@ -18,15 +18,29 @@ Two reference views are scored because they answer different questions:
   does not cover is charged as missed (a metric artifact, reported to show
   why this is not the pipeline's check).
 
-Text is normalized with the same Whisper normalizer as `score.py`. Both
-metrics are corpus-level: summed errors over summed reference length.
+Normalization is symmetric. The task #23 review found the first version
+normalized the reference per row and the hypothesis per word, so Whisper's
+cross-word rules (number merging, the `T_V_` acronym join) acted on one side
+only. Here both sides are normalized before meeteval sees them: the reference
+per row, the hypothesis per contiguous run (words no more than `--run-gap`
+seconds apart), which is the same unit a speaker would speak. `normalizer=None`
+tells meeteval the text is already normalized.
+
+No UEM is used: hypothesis words outside the annotated regions count as
+insertions for every stream, which is acceptable for relative comparison. The
+merged reference still contains both sides of every overlap (9.7 % of ES2004b
+meeting time), so its absolute value is not reachable by a single stream; it
+is comparable across streams.
+
+Both metrics are corpus-level: summed errors over summed reference length.
 
 Usage:
   score-meeteval.py --rows ROWS --oracle "M=path,..." --pipeline "M=path,..." \
-                    --label fp32-default [--out summary.json]
+                    --label requant-default [--out summary.json]
 """
 
 import argparse
+import difflib
 import importlib.util
 import json
 import os
@@ -50,17 +64,13 @@ score = score_module()
 from meeteval.io import SegLST  # noqa: E402  (after the path set-up above)
 from meeteval.wer import cpwer, tcpwer  # noqa: E402
 
+COLLARS = (5.0, 1.0)
+RUN_GAP_SECONDS = 1.0
 
-def normalize(segment):
-    """The per-utterance scorer's text form, applied to one segment.
 
-    meeteval's `normalizer` takes a segment dict (it normalizes the `words`
-    field), not a string, so this is the same Whisper normalizer as `score.py`
-    wrapped for that shape.
-    """
-    segment = dict(segment)
-    segment["words"] = " ".join(score.whisper_tokens(segment["words"]))
-    return segment
+def normalized(text):
+    """The shared Whisper normalizer, applied to one piece of text."""
+    return " ".join(score.whisper_tokens(text))
 
 
 def reference_segments(rows, merged):
@@ -70,7 +80,7 @@ def reference_segments(rows, merged):
             "speaker": "ALL" if merged else row["speaker"],
             "start_time": float(row["begin"]),
             "end_time": float(row["end"]),
-            "words": row["text"],
+            "words": normalized(row["text"]),
         }
         for row in rows
     ]
@@ -80,30 +90,101 @@ def oracle_per_turn_segments(rows, oracle, merged):
     """The dataset's own turn decodes, re-timed to the meeting clock."""
     segments = []
     for row in rows:
-        for word in oracle.get(row["id"], {}).get("words", []):
+        for segment in run_token_segments(
+            row["meeting"],
+            oracle.get(row["id"], {}).get("words", []),
+            "ALL" if merged else row["speaker"],
+            offset=float(row["begin"]),
+        ):
+            segments.append(segment)
+    return segments
+
+
+def word_runs(words, gap=RUN_GAP_SECONDS):
+    """Group words into contiguous runs, so cross-word rules act on both sides."""
+    runs = []
+    current = []
+    for word in sorted(words, key=lambda item: item["start"]):
+        if current and word["start"] - current[-1]["end"] > gap:
+            runs.append(current)
+            current = []
+        current.append(word)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def run_token_segments(meeting, words, speaker, offset=0.0):
+    """Normalize each run, then put the tokens back on word-level times.
+
+    A run is the unit the Whisper normalizer sees, so cross-word rules (number
+    merging, `T V` -> `tv`) act on the hypothesis exactly as they act on the
+    reference. The tokens are then re-timed: one per word when the count is
+    unchanged (the usual case), and proportionally across the run when a merge
+    or split changed the count. Keeping one segment per token, rather than one
+    per run, is what makes the 1 s collar meaningful.
+    """
+    segments = []
+    for run in word_runs(words):
+        for token, start, end in run_token_times(run):
             segments.append(
                 {
-                    "session_id": row["meeting"],
-                    "speaker": "ALL" if merged else row["speaker"],
-                    "start_time": float(row["begin"] + word["start"]),
-                    "end_time": float(row["begin"] + word["end"]),
-                    "words": word["text"],
+                    "session_id": meeting,
+                    "speaker": speaker,
+                    "start_time": float(offset + start),
+                    "end_time": float(offset + end),
+                    "words": token,
                 }
             )
     return segments
 
 
+def run_token_times(run):
+    """The run's normalized tokens, each on the time of the word it came from.
+
+    Normalizing the run gives the cross-word rules; normalizing each word alone
+    gives a token-to-word map. Aligning the two lists (difflib) keeps the exact
+    word time for every token that survived unchanged, and spans the words a
+    merged token replaced. Without the alignment, one split word ("cannot" ->
+    "can not") would re-space the whole run and destroy the 1 s collar.
+    """
+    per_word = [score.whisper_tokens(word["text"]) for word in run]
+    flat = [(index, token) for index, tokens in enumerate(per_word) for token in tokens]
+    tokens = score.whisper_tokens(" ".join(word["text"] for word in run))
+    out = []
+    matcher = difflib.SequenceMatcher(
+        a=[token for _, token in flat], b=tokens, autojunk=False
+    )
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for step in range(i2 - i1):
+                word = run[flat[i1 + step][0]]
+                out.append((tokens[j1 + step], word["start"], word["end"]))
+            continue
+        if tag == "delete":
+            continue
+        # "replace" or "insert": the tokens cover the words flat[i1..i2].
+        if i2 > i1:
+            start, end = run[flat[i1][0]]["start"], run[flat[i2 - 1][0]]["end"]
+        elif i1 < len(flat):
+            start = end = run[flat[i1][0]]["start"]
+        else:
+            start = end = run[-1]["end"]
+        count = j2 - j1
+        span = end - start
+        for step in range(count):
+            out.append(
+                (
+                    tokens[j1 + step],
+                    start + span * step / count,
+                    start + span * (step + 1) / count,
+                )
+            )
+    return out
+
+
 def word_segments(meeting, words, speaker):
-    return [
-        {
-            "session_id": meeting,
-            "speaker": speaker,
-            "start_time": float(word["start"]),
-            "end_time": float(word["end"]),
-            "words": word["text"],
-        }
-        for word in words
-    ]
+    return run_token_segments(meeting, words, speaker)
 
 
 def summarise(result):
@@ -126,27 +207,35 @@ def summarise(result):
     }
 
 
-def evaluate(reference, streams, collar):
-    """tcpWER and cpWER of each stream against one reference view."""
+def evaluate(reference, streams):
+    """tcpWER at every collar and cpWER of each stream against one reference."""
     output = {}
     for name, segments in streams.items():
         hypothesis = SegLST(segments)
-        tcp = summarise(tcpwer(reference, hypothesis, collar=collar, normalizer=normalize))
-        cp = summarise(cpwer(reference, hypothesis, normalizer=normalize))
-        output[name] = {"tcpwer": tcp, "cpwer": cp}
+        collars = {
+            f"collar_{collar:g}": summarise(
+                tcpwer(reference, hypothesis, collar=collar, normalizer=None)
+            )
+            for collar in COLLARS
+        }
+        output[name] = {
+            "tcpwer": collars,
+            "cpwer": summarise(cpwer(reference, hypothesis, normalizer=None)),
+        }
     return output
 
 
 def print_table(title, results):
+    header = " | ".join(f"tcpWER {collar:g} s" for collar in COLLARS)
     print(f"\n{title}\n")
-    print("| Stream | tcpWER | cpWER | tcp errors / ref words | cp errors / ref words |")
-    print("|---|---|---|---|---|")
+    print(f"| Stream | {header} | cpWER |")
+    print("|---|---|---|---|")
     for name, metrics in results.items():
-        tcp, cp = metrics["tcpwer"], metrics["cpwer"]
-        print(
-            f"| {name} | {100 * tcp['wer']:.1f}% | {100 * cp['wer']:.1f}% | "
-            f"{tcp['errors']} / {tcp['length']} | {cp['errors']} / {cp['length']} |"
+        cells = " | ".join(
+            f"{100 * metrics['tcpwer'][f'collar_{collar:g}']['wer']:.1f}%"
+            for collar in COLLARS
         )
+        print(f"| {name} | {cells} | {100 * metrics['cpwer']['wer']:.1f}% |")
 
 
 def main():
@@ -155,7 +244,6 @@ def main():
     parser.add_argument("--oracle", required=True, help="meeting=jsonl,...")
     parser.add_argument("--pipeline", required=True, help="meeting=json,...")
     parser.add_argument("--label", default="pipeline")
-    parser.add_argument("--collar", type=float, default=5.0)
     parser.add_argument("--out")
     args = parser.parse_args()
 
@@ -193,19 +281,20 @@ def main():
     merged_reference = SegLST(reference_segments(rows, merged=True))
     speaker_reference = SegLST(reference_segments(rows, merged=False))
 
-    print(f"\n### {args.label} - meeteval, tcpWER collar {args.collar:g} s\n")
-    merged = evaluate(merged_reference, merged_streams, args.collar)
+    print(f"\n### {args.label} - meeteval, hypothesis and reference normalized alike\n")
+    merged = evaluate(merged_reference, merged_streams)
     print_table("Merged reference (one speaker; word accuracy only)", merged)
     print("\nPipeline per meeting (merged reference):\n")
-    print("| Meeting | tcpWER | cpWER | tcp errors / ref words |")
+    print("| Meeting | tcpWER 5 s | tcpWER 1 s | cpWER |")
     print("|---|---|---|---|")
-    for meeting, item in merged["pipeline"]["tcpwer"]["per_session"].items():
-        cp_item = merged["pipeline"]["cpwer"]["per_session"][meeting]
-        print(
-            f"| {meeting} | {100 * item['wer']:.1f}% | {100 * cp_item['wer']:.1f}% | "
-            f"{item['errors']} / {item['length']} |"
+    for meeting in merged["pipeline"]["tcpwer"]["collar_5"]["per_session"]:
+        cells = " | ".join(
+            f"{100 * merged['pipeline']['tcpwer'][f'collar_{collar:g}']['per_session'][meeting]['wer']:.1f}%"
+            for collar in COLLARS
         )
-    speaker = evaluate(speaker_reference, speaker_streams, args.collar)
+        cp = merged["pipeline"]["cpwer"]["per_session"][meeting]["wer"]
+        print(f"| {meeting} | {cells} | {100 * cp:.1f}% |")
+    speaker = evaluate(speaker_reference, speaker_streams)
     print_table(
         "Speaker reference (tcpWER also scores speaker attribution; a "
         "single-stream hypothesis is charged for every speaker it does not cover)",
@@ -215,25 +304,34 @@ def main():
         pipeline = results["pipeline"]
         for oracle in ("oracle_per_turn", "oracle_single_stream"):
             pipeline[f"delta_vs_{oracle}"] = {
-                "tcpwer": pipeline["tcpwer"]["wer"] - results[oracle]["tcpwer"]["wer"],
-                "cpwer": pipeline["cpwer"]["wer"] - results[oracle]["cpwer"]["wer"],
+                f"collar_{collar:g}": (
+                    pipeline["tcpwer"][f"collar_{collar:g}"]["wer"]
+                    - results[oracle]["tcpwer"][f"collar_{collar:g}"]["wer"]
+                )
+                for collar in COLLARS
             }
+            pipeline[f"delta_vs_{oracle}"]["cpwer"] = (
+                pipeline["cpwer"]["wer"] - results[oracle]["cpwer"]["wer"]
+            )
         bound = results["oracle_single_stream"]
-        print(
-            f"\n{view} reference: pipeline - single-stream oracle is "
-            f"{100 * (pipeline['tcpwer']['wer'] - bound['tcpwer']['wer']):+.1f} "
-            f"points tcpWER and "
-            f"{100 * (pipeline['cpwer']['wer'] - bound['cpwer']['wer']):+.1f} "
-            "points cpWER."
-        )
+        for collar in COLLARS:
+            print(
+                f"\n{view} reference, collar {collar:g} s: pipeline - single-stream "
+                f"oracle is "
+                f"{100 * (pipeline['tcpwer'][f'collar_{collar:g}']['wer'] - bound['tcpwer'][f'collar_{collar:g}']['wer']):+.1f} "
+                "points tcpWER."
+            )
     result = {
         "label": args.label,
-        "collar": args.collar,
+        "collars": list(COLLARS),
+        "run_gap_seconds": RUN_GAP_SECONDS,
+        "normalization": "whisper per reference row and per hypothesis run; meeteval normalizer=None",
+        "uem": "none; hypothesis words outside annotated regions count as insertions",
         "merged_reference": merged,
         "speaker_reference": speaker,
     }
     if args.out:
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
         with open(args.out, "w") as handle:
             json.dump(result, handle, indent=1)
     return 0

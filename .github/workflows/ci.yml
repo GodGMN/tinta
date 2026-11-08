@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    # Decides whether the ASR portability matrix has to run. A manual run
+    # always runs it; a PR or push only when a file it depends on changed. `dorny/paths-filter` needs the PR diff.
+    runs-on: ubuntu-latest
+    outputs:
+      asr: ${{ steps.decide.outputs.asr }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        with:
+          filters: |
+            asr:
+              - 'crates/tinta-engine-rs/assets/models.json'
+              - 'crates/tinta-engine-rs/examples/decode-clip.rs'
+              - 'crates/tinta-engine-rs/tests/fixtures/es2004b-235.4-248.8.*'
+              - 'scripts/fork/segmentation/requantize-encoder.py'
+              - 'scripts/fork/segmentation/requirements-quant.txt'
+              - 'scripts/fork/segmentation/fetch-model-fp32.py'
+              - 'scripts/fork/segmentation/verify-requant.py'
+              - 'scripts/fork/segmentation/check-clip.py'
+              - 'scripts/fork/segmentation/requant-digest.json'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+      - id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "asr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "asr=${{ steps.filter.outputs.asr }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SQLCipher is bundled but compiles against the system OpenSSL.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  engine-macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test --locked -p tinta-engine-rs
+      - name: Clippy engine
+        run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
+
+  core-macos:
+    # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15
+    # minutes and were cancelled twice on 2026-11-06), so this uses the Intel
+    # image. The core crate is architecture independent; move this back to
+    # macos-latest when the arm64 queue recovers.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked -p tinta-core
+      - name: Clippy
+        run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
+
+  tntc-swift-fixture:
+    # CryptoKit is macOS-only, so this job checks both directions: Swift-written
+    # chunks are decrypted by the Rust reader, and Rust-written chunks are
+    # decrypted by the engine's own Swift ChunkReader.
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the Swift fixtures against ChunkStore.swift
+        run: |
+          swiftc -parse-as-library -O -o "$RUNNER_TEMP/make-tntc-fixture" \
+            engine/Sources/TintaEngine/Protocol.swift \
+            engine/Sources/TintaEngine/ChunkStore.swift \
+            engine/scripts/make-tntc-fixture.swift
+          swiftc -parse-as-library -O -o "$RUNNER_TEMP/read-tntc-fixture" \
+            engine/Sources/TintaEngine/Protocol.swift \
+            engine/Sources/TintaEngine/ChunkStore.swift \
+            engine/scripts/read-tntc-fixture.swift
+      - name: Write Swift TNTC fixture
+        run: '"$RUNNER_TEMP/make-tntc-fixture" "$RUNNER_TEMP/tntc-fixture"'
+      - name: Read the Swift fixture from Rust
+        env:
+          TINTA_TNTC_FIXTURE_DIR: ${{ runner.temp }}/tntc-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored reads_swift_cryptokit_chunks
+      - name: Write a Rust TNTC fixture
+        env:
+          TINTA_TNTC_WRITE_FIXTURE_DIR: ${{ runner.temp }}/tntc-rust-fixture
+        run: cargo test --locked -p tinta-core --test tntc_fixture -- --ignored writes_rust_chunks
+      - name: Read the Rust fixture with Swift
+        run: '"$RUNNER_TEMP/read-tntc-fixture" "$RUNNER_TEMP/tntc-rust-fixture"'
+
+  asr-requant-portability:
+    # Task #23 re-review finding 1: `reduce_range=True` is safe by construction,
+    # but only this host's MLAS path (AVX2, no VNNI) was measured. This matrix
+    # rebuilds the pinned encoder with the pinned quantizer on each CPU family,
+    # verifies the output hash, and decodes the committed 13.4 s clip.
+    #
+    # The model is not hosted yet, so a cache miss downloads the pinned fp32
+    # export (2.5 GB) and requantizes it. The cache is keyed on the encoder
+    # sha256, the platform and the quantizer inputs; a warm run downloads
+    # nothing. `windows-11-arm` is a public-preview runner label; if it is not
+    # available to a fork, drop that matrix entry (the other three cover x64
+    # AVX2, x64 VNNI/AVX-512 and ARM NEON/dotprod).
+    name: ASR requant portability (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.asr == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+          - os: windows-latest
+            python: python
+          - os: ubuntu-24.04-arm
+            python: python3
+          - os: windows-11-arm
+            python: python
+    env:
+      REQUANT_SHA256: 23c100540a23ac714ece37ba69c2c59bad9fc70ab1e0bd5b368f98d71a2c336f
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log CPU flags (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          lscpu
+          grep -o -w -E 'avx2|avx512f|avx512_vnni|avx_vnni|asimddp|asimd|dotprod' /proc/cpuinfo | sort -u
+
+      - name: Log CPU flags (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,Architecture,NumberOfCores,NumberOfLogicalProcessors
+          Write-Host "PROCESSOR_IDENTIFIER: $env:PROCESSOR_IDENTIFIER"
+          Write-Host "runner.arch: ${{ runner.arch }}"
+
+      - name: Python
+        run: ${{ matrix.python }} --version
+
+      - name: Install the pinned quantizer
+        run: ${{ matrix.python }} -m pip install --disable-pip-version-check --break-system-packages -r scripts/fork/segmentation/requirements-quant.txt
+
+      - name: Restore the built requantized encoder
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.asr-models/requant-root
+          key: asr-requant-${{ runner.os }}-${{ runner.arch }}-${{ env.REQUANT_SHA256 }}
+
+      - name: Fetch the pinned fp32 export
+        # The CI layout uses the fp32 decoder/joiner from the same pinned export
+        # instead of downloading the int8 archive as well: the re-review measured
+        # that requantized encoder + fp32 decoder/joiner returns the full text
+        # (with `TV` rather than `T V`). The shipping artifact uses the int8
+        # decoder/joiner.
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ${{ matrix.python }} scripts/fork/segmentation/fetch-model-fp32.py --dest .asr-models
+
+      - name: Build the requantized encoder
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ${{ matrix.python }} scripts/fork/segmentation/requantize-encoder.py --input-dir .asr-models/parakeet-tdt-0.6b-v3 --output .asr-models/requant-root/parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx --allow-unpinned-output
+
+      - name: Verify the encoder pin
+        # Primary check: the sha256. If a platform's quantizer rounds
+        # differently, the fallback compares all 1,046 tensors against the
+        # committed digest within the documented tolerance.
+        run: ${{ matrix.python }} scripts/fork/segmentation/verify-requant.py --model .asr-models/requant-root/parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx --expect-sha256 ${{ env.REQUANT_SHA256 }} --digest scripts/fork/segmentation/requant-digest.json
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the clip decoder
+        run: cargo build --locked -p tinta-engine-rs --example decode-clip
+
+      - name: Decode the committed clip
+        run: ${{ matrix.python }} scripts/fork/segmentation/check-clip.py --binary target/debug/examples/decode-clip --models-root .asr-models/requant-root --wav crates/tinta-engine-rs/tests/fixtures/es2004b-235.4-248.8.wav --reference crates/tinta-engine-rs/tests/fixtures/es2004b-235.4-248.8.ref.txt --threads 2

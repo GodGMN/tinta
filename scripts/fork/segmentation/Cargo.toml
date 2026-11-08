@@ -1,0 +1,19 @@
+[package]
+name = "tinta-segmentation"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: this crate is not part of the app workspace. It links the engine
+# crate so the measured path is the engine's own `segment.rs`/`speech.rs` code,
+# not a copy of it.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+sherpa-onnx = { version = "2.0.1", features = ["static"] }
+tinta-engine-rs = { path = "../../../crates/tinta-engine-rs" }
+
+[profile.release]
+debug = false

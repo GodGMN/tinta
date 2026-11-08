@@ -42,12 +42,23 @@ pub fn set_data_dir(dir: &Path) -> Result<()> {
 
 /// The library must stay on this Mac, so cloud-synced folders are not allowed.
 pub fn check_local(dir: &Path) -> Result<()> {
-    let text = dir.to_string_lossy().to_lowercase();
+    let text = comparable_path(dir);
     let synced = ["/library/mobile documents", "/library/cloudstorage", "/dropbox", "/google drive", "/onedrive", "/box sync"];
     if synced.iter().any(|s| text.contains(s)) {
         bail!("This folder is in a cloud-synced location. Select a folder that stays on this Mac.");
     }
     Ok(())
+}
+
+/// The path in lowercase, with `/` separators so that Windows paths match too.
+/// Absolute paths on macOS already start with `/` and are returned unchanged.
+fn comparable_path(dir: &Path) -> String {
+    let text = dir.to_string_lossy().to_lowercase();
+    if text.starts_with('/') {
+        text
+    } else {
+        text.replace('\\', "/")
+    }
 }
 
 pub fn database_path() -> PathBuf {
@@ -65,4 +76,42 @@ pub fn audio_dir(meeting_id: &str) -> PathBuf {
 /// The Unix socket that the MCP binary and the Chrome native host use.
 pub fn socket_path() -> PathBuf {
     base_dir().join("tinta.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocked(path: &str) -> bool {
+        check_local(Path::new(path)).is_err()
+    }
+
+    #[test]
+    fn blocks_cloud_folders_on_macos() {
+        assert!(blocked("/Users/me/Library/CloudStorage/Dropbox/Tinta"));
+        assert!(blocked("/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Tinta"));
+        assert!(blocked("/Users/me/Dropbox/Meetings"));
+        assert!(blocked("/Users/me/Google Drive/Tinta"));
+        assert!(blocked("/Users/me/Box Sync/Tinta"));
+    }
+
+    #[test]
+    fn allows_local_folders_on_macos() {
+        assert!(!blocked("/Users/me/Documents/Tinta"));
+        assert!(!blocked("/Volumes/External/Tinta"));
+    }
+
+    #[test]
+    fn blocks_cloud_folders_on_windows() {
+        assert!(blocked(r"C:\Users\me\Dropbox\Tinta"));
+        assert!(blocked(r"C:\Users\me\OneDrive\Tinta"));
+        assert!(blocked(r"C:\Users\me\Google Drive\Tinta"));
+        assert!(blocked(r"\\server\Box Sync\Tinta"));
+    }
+
+    #[test]
+    fn allows_local_folders_on_windows() {
+        assert!(!blocked(r"C:\Users\me\Documents\Tinta"));
+        assert!(!blocked(r"\\server\share\Tinta"));
+    }
 }

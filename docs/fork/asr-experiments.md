@@ -139,7 +139,8 @@ Windows arm64, verifies the output hash (falling back to a per-tensor digest if
 a platform rounds differently) and decodes the committed 13.4 s clip, asserting
 at least 28 words and at most 10 % normalized WER against the fp32 reference.
 It runs when the manifest, the script, the quantizer pins, `Cargo.lock` or the
-fixture change, and weekly.
+fixture change, and on a manual run (`gh workflow run CI`). There is no weekly
+schedule: GitHub disables workflows on forks that run on a schedule.
 
 ## The failing window
 

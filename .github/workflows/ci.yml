@@ -4,10 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  # The requantized encoder is built from a pinned fp32 download; re-check it
-  # weekly so a sherpa-onnx / ONNX Runtime change cannot rot it silently.
-  schedule:
-    - cron: "23 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -20,9 +16,8 @@ concurrency:
 
 jobs:
   changes:
-    # Decides whether the ASR portability matrix has to run. The weekly
-    # schedule always runs it; a PR or push only when a file it depends on
-    # changed. `dorny/paths-filter` needs the PR diff.
+    # Decides whether the ASR portability matrix has to run. A manual run
+    # always runs it; a PR or push only when a file it depends on changed. `dorny/paths-filter` needs the PR diff.
     runs-on: ubuntu-latest
     outputs:
       asr: ${{ steps.decide.outputs.asr }}
@@ -47,14 +42,13 @@ jobs:
               - '.github/workflows/ci.yml'
       - id: decide
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "asr=true" >> "$GITHUB_OUTPUT"
           else
             echo "asr=${{ steps.filter.outputs.asr }}" >> "$GITHUB_OUTPUT"
           fi
 
   core-linux:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +66,6 @@ jobs:
         run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
 
   engine-windows:
-    if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +76,6 @@ jobs:
         run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
 
   engine-macos:
-    if: github.event_name != 'schedule'
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -94,7 +86,6 @@ jobs:
         run: cargo clippy --locked -p tinta-engine-rs --all-targets -- -D warnings
 
   core-macos:
-    if: github.event_name != 'schedule'
     # GitHub's arm64 macOS runners are capacity constrained (jobs queued over 15
     # minutes and were cancelled twice on 2026-11-06), so this uses the Intel
     # image. The core crate is architecture independent; move this back to
@@ -109,7 +100,6 @@ jobs:
         run: cargo clippy --locked -p tinta-core --all-targets -- -D warnings
 
   tntc-swift-fixture:
-    if: github.event_name != 'schedule'
     # CryptoKit is macOS-only, so this job checks both directions: Swift-written
     # chunks are decrypted by the Rust reader, and Rust-written chunks are
     # decrypted by the engine's own Swift ChunkReader.
